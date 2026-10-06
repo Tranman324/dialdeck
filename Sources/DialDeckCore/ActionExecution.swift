@@ -408,7 +408,13 @@ public actor HostActionExecutor {
                 case .modeChanged(let modeID): outcome = .modeChanged(profileID: profileID, modeID: modeID)
                 case .ignored: outcome = .ignored
                 case .failure(let failure, let completed):
-                    if Task.isCancelled || failure == .cancelled {
+                    if failure == .sequenceDeadlineExceeded {
+                        if completed > 0 {
+                            outcome = .partialFailure(completedSteps: completed, failure: failure)
+                        } else {
+                            outcome = .failed(failure)
+                        }
+                    } else if Task.isCancelled || failure == .cancelled {
                         outcome = .cancelled
                     } else if completed > 0 {
                         outcome = .partialFailure(completedSteps: completed, failure: failure)
@@ -487,7 +493,13 @@ public actor HostActionExecutor {
             case .modeChanged(let modeID): outcome = .modeChanged(profileID: profileID, modeID: modeID)
             case .ignored: outcome = .ignored
             case .failure(let failure, let completed):
-                if Task.isCancelled || failure == .cancelled {
+                if failure == .sequenceDeadlineExceeded {
+                    if completed > 0 {
+                        outcome = .partialFailure(completedSteps: completed, failure: failure)
+                    } else {
+                        outcome = .failed(failure)
+                    }
+                } else if Task.isCancelled || failure == .cancelled {
                     outcome = .cancelled
                 } else if completed > 0 {
                     outcome = .partialFailure(completedSteps: completed, failure: failure)
@@ -653,6 +665,9 @@ public actor HostActionExecutor {
 
         let cleanup = await release(owner)
         if failure == nil, let cleanupFailure = cleanup.first { failure = cleanupFailure }
+        if failure != nil, let stop = SequenceStopClassifier.failure(deadline: deadline) {
+            failure = stop
+        }
         if let failure { return .failure(failure, completed: completedSteps) }
         if let changedModeID, !executedHostAction { return .modeChanged(changedModeID) }
         return .success

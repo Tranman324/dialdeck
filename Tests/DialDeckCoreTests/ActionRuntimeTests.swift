@@ -394,6 +394,70 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertFalse(intents.contains(.zoom(.in, steps: 1, application: nil)))
     }
 
+    func testCleanupCrossingDeadlineReclassifiesPendingSequenceFailure() async throws {
+        let keyCode = try XCTUnwrap(MacVirtualKeyCode(8))
+        let target = try XCTUnwrap(ApplicationBundleIdentifier("com.example.failing-step"))
+        let sequence = try ActionSequence(steps: [
+            .action(.holdKeys(KeyboardChord(key: keyCode, modifiers: []))),
+            .action(.openApplication(target)),
+        ])
+        let cleanupGate = CancellationGate()
+        let service = GatedCleanupActionService(gate: cleanupGate, failingApplication: target)
+        let limits = ActionExecutionLimits(
+            perActionTimeout: .seconds(2),
+            sequenceDeadline: .milliseconds(250)
+        )
+        let executor = HostActionExecutor(service: service, limits: limits)
+        let startedAt = ContinuousClock.now
+        let action = Task {
+            await executor.executeDialAction(
+                .sequence(sequence),
+                profileID: ProfileID(),
+                dialMagnitude: 1,
+                advanceMode: noModeChange,
+                admissionRevision: 0
+            )
+        }
+
+        let cleanupStarted = await cleanupGate.waitUntilEntered()
+        XCTAssertTrue(cleanupStarted, "The earlier failed step should enter held-key cleanup")
+        guard cleanupStarted else {
+            await cleanupGate.release()
+            _ = await action.value
+            return
+        }
+        XCTAssertLessThan(
+            startedAt.duration(to: .now),
+            limits.sequenceDeadline,
+            "The failed action should enter cleanup before the sequence deadline"
+        )
+        let remaining = ContinuousClock.now.duration(to: startedAt.advanced(by: limits.sequenceDeadline))
+        if remaining > .zero { try await Task.sleep(for: remaining + .milliseconds(20)) }
+        XCTAssertGreaterThanOrEqual(
+            startedAt.duration(to: .now),
+            limits.sequenceDeadline,
+            "The gated cleanup should remain pending until after the sequence deadline"
+        )
+
+        await cleanupGate.release()
+        let result = await action.value
+        XCTAssertEqual(result.outcome, .partialFailure(
+            completedSteps: 1,
+            failure: .sequenceDeadlineExceeded
+        ))
+    }
+
+    func testExpiredDeadlineSurvivesConcurrentCancellationForBothActionEntryPoints() async throws {
+        let configuredActionResult = try await runSequenceCancelledDuringCleanup(useKeyDown: false)
+        let keyDownResult = try await runSequenceCancelledDuringCleanup(useKeyDown: true)
+        let expected: ActionExecutionOutcome = .partialFailure(
+            completedSteps: 1,
+            failure: .sequenceDeadlineExceeded
+        )
+        XCTAssertEqual(configuredActionResult.outcome, expected)
+        XCTAssertEqual(keyDownResult.outcome, expected)
+    }
+
     func testSequenceDeadlineBoundsServiceCallAndCleansHeldInputs() async throws {
         let application = try XCTUnwrap(ApplicationBundleIdentifier("com.example.slow"))
         let service = RecordingActionService(
@@ -1452,6 +1516,61 @@ final class ActionRuntimeTests: XCTestCase {
         try XCTUnwrap(PhysicalControlID(rawValue: raw, kind: .key))
     }
 
+    private func runSequenceCancelledDuringCleanup(useKeyDown: Bool) async throws -> ActionExecutionResult {
+        let keyCode = try XCTUnwrap(MacVirtualKeyCode(8))
+        let control = try key("fixture-cancelled-deadline-key")
+        let sequence = try ActionSequence(steps: [
+            .action(.holdKeys(KeyboardChord(key: keyCode, modifiers: []))),
+            .pause(milliseconds: 1_000),
+        ])
+        let cleanupGate = CancellationGate()
+        let service = GatedCleanupActionService(gate: cleanupGate)
+        let executor = HostActionExecutor(
+            service: service,
+            limits: ActionExecutionLimits(
+                perActionTimeout: .seconds(2),
+                sequenceDeadline: .milliseconds(70)
+            )
+        )
+        let action: Task<ActionExecutionResult, Never>
+        if useKeyDown {
+            action = Task {
+                await executor.keyDown(
+                    control: control,
+                    generation: SessionGeneration(3),
+                    action: .sequence(sequence),
+                    profileID: ProfileID(),
+                    advanceMode: noModeChange,
+                    admissionRevision: 0
+                )
+            }
+        } else {
+            action = Task {
+                await executor.executeDialAction(
+                    .sequence(sequence),
+                    profileID: ProfileID(),
+                    dialMagnitude: 1,
+                    advanceMode: noModeChange,
+                    admissionRevision: 0
+                )
+            }
+        }
+
+        let cleanupStarted = await cleanupGate.waitUntilEntered()
+        XCTAssertTrue(cleanupStarted, "Deadline failure should reach the gated key-up cleanup")
+        guard cleanupStarted else {
+            await cleanupGate.release()
+            return await action.value
+        }
+        let cleanup = Task { await executor.cancelAndRelease(floor: 1) }
+        let cancellationReachedChild = await cleanupGate.waitUntilCancelled()
+        XCTAssertTrue(cancellationReachedChild, "Explicit cancellation should arrive while the expired sequence is cleaning up")
+        await cleanupGate.release()
+        let result = await action.value
+        _ = await cleanup.value
+        return result
+    }
+
     private func count(_ intent: HostActionIntent, in intents: [HostActionIntent]) -> Int {
         intents.filter { $0 == intent }.count
     }
@@ -1719,6 +1838,29 @@ private actor CancellationGate {
         cancelledContinuation = nil
         cancelledWatchdog = nil
         continuation?.resume(returning: false)
+    }
+}
+
+private actor GatedCleanupActionService: HostActionServicing {
+    private let gate: CancellationGate
+    private let failingApplication: ApplicationBundleIdentifier?
+    private var gateNextKeyUp = true
+
+    init(gate: CancellationGate, failingApplication: ApplicationBundleIdentifier? = nil) {
+        self.gate = gate
+        self.failingApplication = failingApplication
+    }
+
+    func perform(_ intent: HostActionIntent) async -> HostActionServiceResult {
+        if case .keyboard(.up, .key) = intent, gateNextKeyUp {
+            gateNextKeyUp = false
+            await gate.suspend()
+        }
+        if case .launchOrActivateApplication(let bundleID) = intent,
+           bundleID == failingApplication {
+            return .failed(reason: "synthetic fixture failure")
+        }
+        return .acceptedUnverified
     }
 }
 
