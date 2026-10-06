@@ -43,8 +43,8 @@ private final class USBWriteCancellation: @unchecked Sendable {
     deinit { dd_usb_cancel_token_destroy(pointer) }
 }
 
-/// Serializes the entire discovery, descriptor check, write sequence, and teardown.
-/// The blocking USB calls run on a private dispatch queue, never the UI actor.
+/// The C transport serializes discovery through teardown process-wide, including
+/// calls from distinct service instances. Blocking USB calls run off the UI actor.
 public final class KeyboardDeviceProgrammingService: Sendable {
     private let queue = DispatchQueue(label: "DialDeck.deviceProgramming")
 
@@ -78,7 +78,8 @@ public final class KeyboardDeviceProgrammingService: Sendable {
             await withCheckedContinuation { continuation in
                 queue.async {
                     let result = bytes.withUnsafeBufferPointer { buffer in
-                        dd_usb_send_reports(buffer.baseAddress, reports.count, cancellation.pointer)
+                        dd_usb_send_reports(
+                            buffer.baseAddress, reports.count, bytes.count, cancellation.pointer)
                     }
                     let accepted = Int(result.reports_accepted)
                     let outcome: KeyboardDeviceWriteOutcome

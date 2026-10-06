@@ -1,6 +1,8 @@
 #include "DialDeckUSB.h"
 
 #include <dlfcn.h>
+#include <errno.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,6 +68,7 @@ typedef struct {
 } usb_api;
 
 struct DDUSBCancelToken { atomic_int cancelled; };
+static pthread_mutex_t operation_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 DDUSBCancelToken *dd_usb_cancel_token_create(void) {
     DDUSBCancelToken *token = calloc(1, sizeof(*token));
@@ -78,6 +81,17 @@ void dd_usb_cancel(DDUSBCancelToken *token) {
 void dd_usb_cancel_token_destroy(DDUSBCancelToken *token) { free(token); }
 static int cancelled(const DDUSBCancelToken *token) {
     return token && atomic_load(&token->cancelled);
+}
+
+static int lock_for_operation(const DDUSBCancelToken *token) {
+    for (;;) {
+        if (cancelled(token)) return 0;
+        int status = pthread_mutex_trylock(&operation_mutex);
+        if (status == 0) return 1;
+        if (status != EBUSY) return 0;
+        const struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000};
+        nanosleep(&pause, NULL);
+    }
 }
 
 static int load_api(usb_api *api) {
@@ -146,9 +160,11 @@ static int topology_matches(const usb_api *api, libusb_device *device) {
 }
 
 DDUSBResult dd_usb_send_reports(const uint8_t *reports, size_t report_count,
+                                size_t report_bytes_length,
                                 const DDUSBCancelToken *token) {
     DDUSBResult result = {DDUSB_UNAVAILABLE, 0};
-    if (!reports || !token || report_count != 4) {
+    if (!reports || !token || report_count != 4 ||
+        report_bytes_length != report_count * 65) {
         result.status = DDUSB_TARGET_MISMATCH; return result;
     }
     uint8_t expected_reports[4][65] = {{0}};
@@ -164,8 +180,20 @@ DDUSBResult dd_usb_send_reports(const uint8_t *reports, size_t report_count,
         result.status = DDUSB_TARGET_MISMATCH; return result;
     }
     if (cancelled(token)) { result.status = DDUSB_CANCELLED; return result; }
+    if (!lock_for_operation(token)) {
+        result.status = cancelled(token) ? DDUSB_CANCELLED : DDUSB_ACCESS_FAILED;
+        return result;
+    }
+    if (cancelled(token)) {
+        pthread_mutex_unlock(&operation_mutex);
+        result.status = DDUSB_CANCELLED;
+        return result;
+    }
     usb_api api = {0};
-    if (!load_api(&api)) return result;
+    if (!load_api(&api)) {
+        pthread_mutex_unlock(&operation_mutex);
+        return result;
+    }
     libusb_context *context = NULL;
     libusb_device **devices = NULL;
     libusb_device_handle *handle = NULL;
@@ -227,5 +255,6 @@ cleanup:
     if (devices) api.free_device_list(devices, 1);
     if (context) api.exit(context);
     dlclose(api.library);
+    pthread_mutex_unlock(&operation_mutex);
     return result;
 }
