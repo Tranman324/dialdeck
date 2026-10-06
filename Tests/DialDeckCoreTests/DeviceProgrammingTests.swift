@@ -103,6 +103,34 @@ final class DeviceProgrammingTests: XCTestCase {
         XCTAssertEqual(recorder.lastReportCount, 4)
     }
 
+    func testLightingModeRequiresExplicitOverwriteAndSendsOnlyModeTwoVector() async throws {
+        let recorder = TransportCallRecorder()
+        let service = KeyboardDeviceProgrammingService { bytes, count, _ in
+            recorder.record(bytes: bytes, count: count)
+            return DDUSBResult(status: DDUSB_SENT_UNVERIFIED, reports_accepted: 3)
+        }
+        let deniedID = UUID()
+        let denied = await service.programLighting(.init(
+            id: deniedID, mode: .mode2, acceptsPersistentOverwrite: false))
+        XCTAssertEqual(denied.id, deniedID)
+        XCTAssertEqual(denied.outcome, .failed(
+            reason: "Persistent overwrite was not accepted", reportsAccepted: 0))
+        XCTAssertEqual(recorder.count, 0)
+
+        let acceptedID = UUID()
+        let accepted = await service.programLighting(.init(
+            id: acceptedID, mode: .mode2, acceptsPersistentOverwrite: true))
+        XCTAssertEqual(accepted.id, acceptedID)
+        XCTAssertEqual(accepted.outcome, .sentUnverified(reportsAccepted: 3))
+        XCTAssertEqual(recorder.count, 1)
+        XCTAssertEqual(recorder.lastReportCount, 3)
+        XCTAssertEqual(recorder.lastBytes, [
+            padded([0x03, 0xa1, 0x01]),
+            padded([0x03, 0xb0, 0x18, 0x02]),
+            padded([0x03, 0xaa, 0xa1])
+        ].flatMap { $0 })
+    }
+
     func testServiceKeepsFailureAndCancellationDistinctFromHostAcceptance() async throws {
         let x = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: 0x1b))
         let request = KeyboardDeviceWriteRequest(
@@ -137,6 +165,38 @@ final class DeviceProgrammingTests: XCTestCase {
             dd_usb_reports_permitted(buffer.baseAddress, 4, unobservedPair.count)
         }
         XCTAssertEqual(permitted, 0)
+    }
+
+    func testPureValidatorAcceptsOnlyTheBoundedModeTwoLightingSave() throws {
+        let modeTwo = [
+            padded([0x03, 0xa1, 0x01]),
+            padded([0x03, 0xb0, 0x18, 0x02]),
+            padded([0x03, 0xaa, 0xa1])
+        ].flatMap { $0 }
+        let permitted = modeTwo.withUnsafeBufferPointer { buffer in
+            dd_usb_reports_permitted(buffer.baseAddress, 3, modeTwo.count)
+        }
+        XCTAssertEqual(permitted, 1)
+
+        let invalidMutations: [(Int, UInt8)] = [
+            (68, 0x01),  // mode 1
+            (67, 0x28),  // layer 2 in the mode report
+            (132, 0xaa), // ordinary save instead of LED save
+            (2, 0x02)    // layer 2 in the layer-select report
+        ]
+        for (index, replacement) in invalidMutations {
+            var invalid = modeTwo
+            invalid[index] = replacement
+            let result = invalid.withUnsafeBufferPointer { buffer in
+                dd_usb_reports_permitted(buffer.baseAddress, 3, invalid.count)
+            }
+            XCTAssertEqual(result, 0)
+        }
+        let missingLayerSelect = Array(modeTwo.dropFirst(65))
+        let missingLayerResult = missingLayerSelect.withUnsafeBufferPointer { buffer in
+            dd_usb_reports_permitted(buffer.baseAddress, 2, missingLayerSelect.count)
+        }
+        XCTAssertEqual(missingLayerResult, 0)
     }
 
     func testServiceLabelsInjectedFailureAndShortTransferAtEveryPosition() async throws {
@@ -217,6 +277,7 @@ private final class TransportCallRecorder: @unchecked Sendable {
     private var calls = 0
     private var byteCount = 0
     private var reportCount = 0
+    private var bytes: [UInt8] = []
 
     func record(bytes: [UInt8], count: Int) {
         lock.lock()
@@ -224,9 +285,11 @@ private final class TransportCallRecorder: @unchecked Sendable {
         calls += 1
         byteCount = bytes.count
         reportCount = count
+        self.bytes = bytes
     }
 
     var count: Int { lock.withLock { calls } }
     var lastByteCount: Int { lock.withLock { byteCount } }
     var lastReportCount: Int { lock.withLock { reportCount } }
+    var lastBytes: [UInt8] { lock.withLock { bytes } }
 }

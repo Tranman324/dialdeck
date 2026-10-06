@@ -22,16 +22,42 @@ public struct KeyboardDeviceWriteRequest: Sendable {
     }
 }
 
-public enum KeyboardDeviceWriteOutcome: Equatable, Sendable {
+/// The vendor guide labels mode 2 as a color gradient. The effect has not yet
+/// been observed on this connected keypad; the narrow candidate exists for a
+/// bounded validation write only.
+public enum DeviceLightingModeCandidate: UInt8, Sendable {
+    case mode2 = 2
+}
+
+public struct DeviceLightingModeRequest: Sendable {
+    public let id: UUID
+    public let mode: DeviceLightingModeCandidate
+    public let acceptsPersistentOverwrite: Bool
+
+    public init(
+        id: UUID = UUID(),
+        mode: DeviceLightingModeCandidate,
+        acceptsPersistentOverwrite: Bool
+    ) {
+        self.id = id
+        self.mode = mode
+        self.acceptsPersistentOverwrite = acceptsPersistentOverwrite
+    }
+}
+
+public enum DeviceProgrammingWriteOutcome: Equatable, Sendable {
     case sentUnverified(reportsAccepted: Int)
     case failed(reason: String, reportsAccepted: Int)
     case cancelled(reportsAccepted: Int)
 }
 
-public struct KeyboardDeviceWriteResult: Equatable, Sendable {
+public struct DeviceProgrammingWriteResult: Equatable, Sendable {
     public let id: UUID
-    public let outcome: KeyboardDeviceWriteOutcome
+    public let outcome: DeviceProgrammingWriteOutcome
 }
+
+public typealias KeyboardDeviceWriteOutcome = DeviceProgrammingWriteOutcome
+public typealias KeyboardDeviceWriteResult = DeviceProgrammingWriteResult
 
 private final class USBWriteCancellation: @unchecked Sendable {
     let pointer: OpaquePointer
@@ -69,7 +95,7 @@ public final class KeyboardDeviceProgrammingService: Sendable {
         self.transport = transport
     }
 
-    public func program(_ request: KeyboardDeviceWriteRequest) async -> KeyboardDeviceWriteResult {
+    public func program(_ request: KeyboardDeviceWriteRequest) async -> DeviceProgrammingWriteResult {
         guard request.acceptsPersistentOverwrite else {
             return .init(id: request.id, outcome: .failed(
                 reason: "Persistent overwrite was not accepted", reportsAccepted: 0))
@@ -90,8 +116,21 @@ public final class KeyboardDeviceProgrammingService: Sendable {
             return .init(id: request.id, outcome: .failed(
                 reason: "Unsupported keyboard assignment", reportsAccepted: 0))
         }
-        guard let cancellation = USBWriteCancellation() else {
+        return await send(reports, requestID: request.id)
+    }
+
+    public func programLighting(_ request: DeviceLightingModeRequest) async -> DeviceProgrammingWriteResult {
+        guard request.acceptsPersistentOverwrite else {
             return .init(id: request.id, outcome: .failed(
+                reason: "Persistent overwrite was not accepted", reportsAccepted: 0))
+        }
+        let reports = Self.reports(for: request.mode)
+        return await send(reports, requestID: request.id)
+    }
+
+    private func send(_ reports: [[UInt8]], requestID: UUID) async -> DeviceProgrammingWriteResult {
+        guard let cancellation = USBWriteCancellation() else {
+            return .init(id: requestID, outcome: .failed(
                 reason: "Unable to allocate cancellation state", reportsAccepted: 0))
         }
         let bytes = reports.flatMap { $0 }
@@ -101,7 +140,7 @@ public final class KeyboardDeviceProgrammingService: Sendable {
                 queue.async {
                     let result = transport(bytes, reports.count, cancellation.pointer)
                     let accepted = Int(result.reports_accepted)
-                    let outcome: KeyboardDeviceWriteOutcome
+                    let outcome: DeviceProgrammingWriteOutcome
                     switch result.status {
                     case DDUSB_SENT_UNVERIFIED:
                         outcome = .sentUnverified(reportsAccepted: accepted)
@@ -118,11 +157,24 @@ public final class KeyboardDeviceProgrammingService: Sendable {
                     default:
                         outcome = .failed(reason: "Unknown USB failure", reportsAccepted: accepted)
                     }
-                    continuation.resume(returning: .init(id: request.id, outcome: outcome))
+                    continuation.resume(returning: .init(id: requestID, outcome: outcome))
                 }
             }
         } onCancel: {
             cancellation.cancel()
         }
+    }
+
+    private static func reports(for mode: DeviceLightingModeCandidate) -> [[UInt8]] {
+        [report([0xa1, 0x01]), report([0xb0, 0x18, mode.rawValue]), report([0xaa, 0xa1])]
+    }
+
+    private static func report(_ payload: [UInt8]) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: 65)
+        bytes[0] = 3
+        for (index, byte) in payload.enumerated() {
+            bytes[index + 1] = byte
+        }
+        return bytes
     }
 }
