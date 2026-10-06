@@ -2,7 +2,7 @@
 
 ## Toolchain and target
 
-The native foundation uses Swift Package Manager and the SwiftUI framework shipped with Xcode. The project requires Xcode command line tools with a macOS SDK. The verified development host for this foundation was an Apple M5 Mac (`arm64`) running macOS 26.6.2 (25G83), with Xcode 27.0, Swift 6.4, and the macOS 27.0 SDK. Builds are explicitly requested for `arm64`.
+The native foundation uses Swift Package Manager and the SwiftUI framework shipped with Xcode. The project requires Xcode command line tools with a macOS SDK. The verified development host for this foundation was a `Mac17,3` with Apple M5, 24 GB RAM, and `arm64`, running macOS 26.6.2 (25G83), with Xcode 27.0, Swift 6.4, and the macOS 27.0 SDK. Builds are explicitly requested for `arm64`.
 
 The package deployment target and app bundle minimum system version are macOS 14.0. The current host is macOS 26.6.2, so it is within the declared deployment range. This target is a foundation baseline and can be raised if later product APIs require it.
 
