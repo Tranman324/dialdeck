@@ -22,9 +22,10 @@ public struct KeyboardDeviceWriteRequest: Sendable {
     }
 }
 
-/// The connected keypad was observed running a six-color sequence for mode 2,
-/// retained after one reconnect. Other lighting modes remain unverified.
+/// Mode 2 was observed running a six-color sequence, retained after one reconnect.
+/// Mode 1 is a source-derived candidate for a separate bounded physical check.
 public enum DeviceLightingModeCandidate: UInt8, Sendable {
+    case mode1 = 1
     case mode2 = 2
 }
 

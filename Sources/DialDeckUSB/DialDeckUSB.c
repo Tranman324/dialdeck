@@ -166,12 +166,18 @@ int dd_usb_reports_permitted(const uint8_t *reports, size_t report_count,
     }
 
     if (report_count == 3) {
+        static const uint8_t mode_one[3][65] = {
+            {0x03, 0xa1, 0x01},
+            {0x03, 0xb0, 0x18, 0x01},
+            {0x03, 0xaa, 0xa1}
+        };
         static const uint8_t mode_two[3][65] = {
             {0x03, 0xa1, 0x01},
             {0x03, 0xb0, 0x18, 0x02},
             {0x03, 0xaa, 0xa1}
         };
-        return memcmp(reports, mode_two, sizeof(mode_two)) == 0;
+        return memcmp(reports, mode_one, sizeof(mode_one)) == 0 ||
+               memcmp(reports, mode_two, sizeof(mode_two)) == 0;
     }
     static const uint8_t observed_slots[9] = {1,2,3,4,5,6,13,14,15};
     static const uint8_t observed_usages[9] = {

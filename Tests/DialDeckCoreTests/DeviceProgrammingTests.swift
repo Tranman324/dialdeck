@@ -167,7 +167,7 @@ final class DeviceProgrammingTests: XCTestCase {
         XCTAssertEqual(permitted, 0)
     }
 
-    func testPureValidatorAcceptsOnlyTheBoundedModeTwoLightingSave() throws {
+    func testPureValidatorAcceptsBoundedModeTwoLightingSave() throws {
         let modeTwo = [
             padded([0x03, 0xa1, 0x01]),
             padded([0x03, 0xb0, 0x18, 0x02]),
@@ -179,7 +179,7 @@ final class DeviceProgrammingTests: XCTestCase {
         XCTAssertEqual(permitted, 1)
 
         let invalidMutations: [(Int, UInt8)] = [
-            (68, 0x01),  // mode 1
+            (68, 0x00),  // mode 0 remains unavailable
             (67, 0x28),  // layer 2 in the mode report
             (132, 0xaa), // ordinary save instead of LED save
             (2, 0x02)    // layer 2 in the layer-select report
@@ -197,6 +197,40 @@ final class DeviceProgrammingTests: XCTestCase {
             dd_usb_reports_permitted(buffer.baseAddress, 2, missingLayerSelect.count)
         }
         XCTAssertEqual(missingLayerResult, 0)
+    }
+
+    func testModeOneCandidateUsesOnlyTheFixedLayerOneLEDVector() async {
+        let recorder = TransportCallRecorder()
+        let service = KeyboardDeviceProgrammingService { bytes, count, _ in
+            recorder.record(bytes: bytes, count: count)
+            return DDUSBResult(status: DDUSB_SENT_UNVERIFIED, reports_accepted: 3)
+        }
+        let denied = await service.programLighting(.init(
+            mode: .mode1, acceptsPersistentOverwrite: false))
+        XCTAssertEqual(denied.outcome, .failed(
+            reason: "Persistent overwrite was not accepted", reportsAccepted: 0))
+        XCTAssertEqual(recorder.count, 0)
+
+        let accepted = await service.programLighting(.init(
+            mode: .mode1, acceptsPersistentOverwrite: true))
+        XCTAssertEqual(accepted.outcome, .sentUnverified(reportsAccepted: 3))
+        let expected = [
+            padded([0x03, 0xa1, 0x01]),
+            padded([0x03, 0xb0, 0x18, 0x01]),
+            padded([0x03, 0xaa, 0xa1])
+        ].flatMap { $0 }
+        XCTAssertEqual(recorder.lastBytes, expected)
+        let permitted = expected.withUnsafeBufferPointer { buffer in
+            dd_usb_reports_permitted(buffer.baseAddress, 3, expected.count)
+        }
+        XCTAssertEqual(permitted, 1)
+
+        var offMode = expected
+        offMode[68] = 0
+        let offPermitted = offMode.withUnsafeBufferPointer { buffer in
+            dd_usb_reports_permitted(buffer.baseAddress, 3, offMode.count)
+        }
+        XCTAssertEqual(offPermitted, 0)
     }
 
     func testServiceLabelsInjectedFailureAndShortTransferAtEveryPosition() async throws {
