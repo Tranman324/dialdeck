@@ -248,7 +248,8 @@ public actor HostActionExecutor {
         action: ConfiguredAction,
         profileID: ProfileID,
         application: ApplicationBundleIdentifier? = nil,
-        advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult
+        advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult,
+        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)? = nil
     ) async -> ActionExecutionResult {
         await submit { executor in
             await executor.performKeyDown(
@@ -257,7 +258,8 @@ public actor HostActionExecutor {
                 action: action,
                 profileID: profileID,
                 application: application,
-                advanceMode: advanceMode
+                advanceMode: advanceMode,
+                sequenceAdvanceMode: sequenceAdvanceMode
             )
         }
     }
@@ -276,7 +278,8 @@ public actor HostActionExecutor {
         profileID: ProfileID,
         dialMagnitude: Int,
         application: ApplicationBundleIdentifier? = nil,
-        advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult
+        advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult,
+        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)? = nil
     ) async -> ActionExecutionResult {
         await submit { executor in
             await executor.performConfiguredAction(
@@ -284,7 +287,8 @@ public actor HostActionExecutor {
                 profileID: profileID,
                 dialMagnitude: dialMagnitude,
                 application: application,
-                advanceMode: advanceMode
+                advanceMode: advanceMode,
+                sequenceAdvanceMode: sequenceAdvanceMode
             )
         }
     }
@@ -318,7 +322,8 @@ public actor HostActionExecutor {
         action: ConfiguredAction,
         profileID: ProfileID,
         application: ApplicationBundleIdentifier?,
-        advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult
+        advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult,
+        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)?
     ) async -> ActionExecutionResult {
         await gate.acquire()
         let outcome: ActionExecutionOutcome
@@ -345,6 +350,7 @@ public actor HostActionExecutor {
                     profileID: profileID,
                     dialMagnitude: 1,
                     application: application,
+                    sequenceAdvanceMode: sequenceAdvanceMode,
                     advanceMode: advanceMode
                 ) {
                 case .success: outcome = .acceptedUnverified
@@ -397,7 +403,8 @@ public actor HostActionExecutor {
         profileID: ProfileID,
         dialMagnitude: Int,
         application: ApplicationBundleIdentifier?,
-        advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult
+        advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult,
+        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)?
     ) async -> ActionExecutionResult {
         let magnitudeLimit = limits.maximumDialMagnitude
         await gate.acquire()
@@ -412,6 +419,7 @@ public actor HostActionExecutor {
                 profileID: profileID,
                 dialMagnitude: dialMagnitude,
                 application: application,
+                sequenceAdvanceMode: sequenceAdvanceMode,
                 advanceMode: advanceMode
             ) {
             case .success: outcome = .acceptedUnverified
@@ -443,6 +451,7 @@ public actor HostActionExecutor {
         profileID: ProfileID,
         dialMagnitude: Int,
         application: ApplicationBundleIdentifier?,
+        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)?,
         advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult
     ) async -> RunResult {
         switch action {
@@ -476,6 +485,7 @@ public actor HostActionExecutor {
                 profileID: profileID,
                 dialMagnitude: dialMagnitude,
                 application: application,
+                sequenceAdvanceMode: sequenceAdvanceMode,
                 advanceMode: advanceMode
             )
         }
@@ -486,6 +496,7 @@ public actor HostActionExecutor {
         profileID: ProfileID,
         dialMagnitude: Int,
         application: ApplicationBundleIdentifier?,
+        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)?,
         advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult
     ) async -> RunResult {
         let start = ContinuousClock.now
@@ -527,11 +538,20 @@ public actor HostActionExecutor {
                     continue
                 }
                 if case .nextDialMode = primitive {
-                    switch await advanceMode(profileID) {
-                    case .advanced(let modeID):
+                    switch await boundedModeAdvance(
+                        profileID,
+                        deadline: deadline,
+                        advanceMode: advanceMode,
+                        sequenceAdvanceMode: sequenceAdvanceMode
+                    ) {
+                    case .timedOut:
+                        failure = .sequenceDeadlineExceeded
+                    case .cancelled:
+                        failure = .cancelled
+                    case .value(.advanced(let modeID)):
                         changedModeID = modeID
                         completedSteps += 1
-                    case .failed(let advanceFailure):
+                    case .value(.failed(let advanceFailure)):
                         failure = advanceFailure
                     }
                     if failure != nil { break }
@@ -567,6 +587,32 @@ public actor HostActionExecutor {
         if let failure { return .failure(failure, completed: completedSteps) }
         if let changedModeID, !executedHostAction { return .modeChanged(changedModeID) }
         return .success
+    }
+
+    private func boundedModeAdvance(
+        _ profileID: ProfileID,
+        deadline: ContinuousClock.Instant,
+        advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult,
+        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)?
+    ) async -> TimedValue<DialModeAdvanceResult> {
+        let remaining = ContinuousClock.now.duration(to: deadline)
+        guard remaining > .zero else { return .timedOut }
+        let race = TimeoutRace<DialModeAdvanceResult>()
+        let timed: TimedValue<DialModeAdvanceResult> = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                race.begin(continuation)
+                race.start(timeout: remaining) {
+                    if let sequenceAdvanceMode {
+                        return await sequenceAdvanceMode(profileID, deadline)
+                    }
+                    return await advanceMode(profileID)
+                }
+            }
+        } onCancel: {
+            race.cancel()
+        }
+        if case .value = timed, ContinuousClock.now >= deadline { return .timedOut }
+        return timed
     }
 
     private func performPrimitive(

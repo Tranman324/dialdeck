@@ -61,7 +61,9 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     private var selectedDialModeID: DialModeID?
     private var lastActionResult: ActionExecutionResult?
     private let inputGate = AsyncActionGate()
+    private let configurationMutationGate = AsyncActionGate()
     private var routingRevision: UInt64 = 0
+    private var configurationMutationsInProgress = 0
 
     public init(
         inputProducer: any InputEventProducing,
@@ -121,16 +123,32 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     /// Configuration editors should save through this method so a newly
     /// installed snapshot and its remembered modes become active together.
     public func installConfiguration(_ newConfiguration: Configuration) async throws {
-        try await configurationStore.save(newConfiguration)
-        configuration = newConfiguration
-        refreshSelectedModeSnapshot()
+        beginConfigurationMutation()
+        await configurationMutationGate.acquire()
+        do {
+            try await configurationStore.save(newConfiguration)
+            configuration = newConfiguration
+            refreshSelectedModeSnapshot()
+            await finishConfigurationMutation()
+        } catch {
+            await finishConfigurationMutation()
+            throw error
+        }
     }
 
     /// Loads the current stored snapshot. Reconstructing ActionRuntime after an
     /// app restart also restores each profile's remembered mode from the store.
     public func reloadConfiguration() async throws {
-        configuration = try await configurationStore.load()
-        refreshSelectedModeSnapshot()
+        beginConfigurationMutation()
+        await configurationMutationGate.acquire()
+        do {
+            configuration = try await configurationStore.load()
+            refreshSelectedModeSnapshot()
+            await finishConfigurationMutation()
+        } catch {
+            await finishConfigurationMutation()
+            throw error
+        }
     }
 
     public func setConfigurationEditing(_ editing: Bool) async {
@@ -184,7 +202,8 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 profileID: profile.id,
                 dialMagnitude: 1,
                 application: bundleID,
-                advanceMode: modeAdvanceHandler(for: permit)
+                advanceMode: modeAdvanceHandler(for: permit),
+                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit)
             )
             return routeIsCurrent(permit) ? result : ActionExecutionResult(requestID: result.requestID, outcome: .ignored)
         } catch {
@@ -362,7 +381,8 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 action: resolved.action,
                 profileID: profileID,
                 application: bundleID,
-                advanceMode: modeAdvanceHandler(for: permit)
+                advanceMode: modeAdvanceHandler(for: permit),
+                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit)
             )
             setActionResult(result)
         } catch {
@@ -398,7 +418,8 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 profileID: resolved.profileID,
                 dialMagnitude: delta,
                 application: bundleID,
-                advanceMode: modeAdvanceHandler(for: permit)
+                advanceMode: modeAdvanceHandler(for: permit),
+                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit)
             )
             setActionResult(result)
         } catch {
@@ -412,12 +433,15 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
 
     private func advanceDialMode(
         for profileID: ProfileID,
-        permit: RoutePermit
+        permit: RoutePermit,
+        deadline: ContinuousClock.Instant? = nil
     ) async -> DialModeAdvanceResult {
-        guard routeIsCurrent(permit), !Task.isCancelled else { return .failed(.cancelled) }
+        guard routeIsCurrent(permit), !Task.isCancelled,
+              deadline.map({ ContinuousClock.now < $0 }) ?? true else { return .failed(.cancelled) }
         do {
             let config = try await loadConfigurationIfNeeded()
-            guard routeIsCurrent(permit), !Task.isCancelled else { return .failed(.cancelled) }
+            guard routeIsCurrent(permit), !Task.isCancelled,
+                  deadline.map({ ContinuousClock.now < $0 }) ?? true else { return .failed(.cancelled) }
             guard let profile = config.profile(id: profileID), !profile.dialModes.isEmpty else {
                 return .failed(.modePersistenceFailed("The routed profile no longer exists"))
             }
@@ -425,12 +449,27 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             let currentIndex = profile.dialModes.firstIndex { $0.id == currentID } ?? 0
             let nextMode = profile.dialModes[(currentIndex + 1) % profile.dialModes.count]
             let updated = try config.rememberingDialMode(nextMode.id, for: profileID)
-            guard routeIsCurrent(permit), !Task.isCancelled else { return .failed(.cancelled) }
-            try await configurationStore.save(updated)
-            guard routeIsCurrent(permit), !Task.isCancelled else { return .failed(.cancelled) }
-            configuration = updated
-            if activeProfileID == profileID { selectedDialModeID = nextMode.id }
-            return .advanced(nextMode.id)
+            await configurationMutationGate.acquire()
+            do {
+                guard routeIsCurrent(permit), !Task.isCancelled,
+                      deadline.map({ ContinuousClock.now < $0 }) ?? true else {
+                    await configurationMutationGate.release()
+                    return .failed(deadline.map({ ContinuousClock.now >= $0 }) == true ? .sequenceDeadlineExceeded : .cancelled)
+                }
+                try await configurationStore.save(updated)
+                guard routeIsCurrent(permit), !Task.isCancelled,
+                      deadline.map({ ContinuousClock.now < $0 }) ?? true else {
+                    await configurationMutationGate.release()
+                    return .failed(deadline.map({ ContinuousClock.now >= $0 }) == true ? .sequenceDeadlineExceeded : .cancelled)
+                }
+                configuration = updated
+                if activeProfileID == profileID { selectedDialModeID = nextMode.id }
+                await configurationMutationGate.release()
+                return .advanced(nextMode.id)
+            } catch {
+                await configurationMutationGate.release()
+                throw error
+            }
         } catch {
             return .failed(.modePersistenceFailed(RuntimeFailureText.sanitize(String(describing: error))))
         }
@@ -447,11 +486,33 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         }
     }
 
+    private func sequenceModeAdvanceHandler(
+        for permit: RoutePermit
+    ) -> @Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult {
+        { [weak self] profileID, deadline in
+            guard let self else {
+                return .failed(.modePersistenceFailed("Runtime is no longer available"))
+            }
+            return await self.advanceDialMode(for: profileID, permit: permit, deadline: deadline)
+        }
+    }
+
+    private func beginConfigurationMutation() {
+        routingRevision &+= 1
+        configurationMutationsInProgress += 1
+    }
+
+    private func finishConfigurationMutation() async {
+        configurationMutationsInProgress = max(0, configurationMutationsInProgress - 1)
+        await configurationMutationGate.release()
+    }
+
     private func routePermit(for eventGeneration: SessionGeneration) -> RoutePermit? {
         guard generation == eventGeneration,
               case .running(let runningGeneration) = status,
               runningGeneration == eventGeneration,
-              !isEditing else { return nil }
+              !isEditing,
+              configurationMutationsInProgress == 0 else { return nil }
         return RoutePermit(generation: eventGeneration, revision: routingRevision)
     }
 
@@ -459,6 +520,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         routingRevision == permit.revision
             && generation == permit.generation
             && !isEditing
+            && configurationMutationsInProgress == 0
             && status == .running(generation: permit.generation)
     }
 
