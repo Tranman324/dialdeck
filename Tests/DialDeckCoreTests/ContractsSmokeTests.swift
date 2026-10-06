@@ -44,6 +44,16 @@ final class ContractsSmokeTests: XCTestCase {
         XCTAssertNotNil(NormalizedInputEvent.dialRotation(control: dial, delta: 1, generation: generation))
     }
 
+    func testLegacyNormalizedInputConsumerGetsIgnoredDialPressDefault() async throws {
+        let key = try XCTUnwrap(PhysicalControlID(rawValue: "opaque-key-a", kind: .key))
+        let generation = SessionGeneration(6)
+        let consumer: any NormalizedInputConsumer = LegacyNormalizedInputConsumer()
+
+        let result = await consumer.dialPressed(control: key, generation: generation)
+
+        XCTAssertEqual(result.outcome, .ignored)
+    }
+
     func testCapabilityAndProgrammingConsumersPreserveUnverifiedStates() async throws {
         let control = try XCTUnwrap(PhysicalControlID(rawValue: "opaque-dial-a", kind: .dial))
         let request = ProgrammingRequest(assignments: [
@@ -131,6 +141,11 @@ final class ContractsSmokeTests: XCTestCase {
         XCTAssertNotEqual(ProgrammingOutcome.behaviorVerified(evidence), .persistenceVerified(evidence))
         XCTAssertNotEqual(ProgrammingOutcome.failed(.init(reason: "synthetic failure")), .sentUnverified)
     }
+}
+
+private actor LegacyNormalizedInputConsumer: NormalizedInputConsumer {
+    func consume(_ event: NormalizedInputEvent) async {}
+    func sessionLifecycleChanged(_ event: SessionLifecycleEvent) async {}
 }
 
 private actor FakeInputSession: InputSessionHandle {

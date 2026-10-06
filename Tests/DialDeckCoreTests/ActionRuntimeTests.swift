@@ -1525,6 +1525,59 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertTrue(heldPressIntents.isEmpty)
     }
 
+    func testDialPressProtocolDispatchExecutesOnceAndSerializesWithInput() async throws {
+        let shortcut = KeyboardChord(key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: [.command])
+        let fixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            modePress: .primitive(.keyboardShortcut(shortcut))
+        )
+        let service = RecordingActionService()
+        let foreground = GatedForeground(value: nil)
+        let input = ManualInputProducer()
+        let keyControl = try key("fixture-button-1")
+        let runtime = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: service,
+            foreground: foreground,
+            input: input,
+            mapping: [keyControl: .button1]
+        )
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+        let dial = try XCTUnwrap(PhysicalControlID(rawValue: "fixture-dial", kind: .dial))
+        let consumer: any NormalizedInputConsumer = runtime
+
+        await foreground.pauseNext()
+        let keyDown = try XCTUnwrap(NormalizedInputEvent.keyDown(control: keyControl, generation: generation))
+        let keyRouting = Task { await input.emit(keyDown) }
+        await foreground.waitUntilEntered()
+
+        // The normalized key route holds the input gate while the dial callback
+        // is delivered through the consumer existential. Releasing the first
+        // route must allow the callback to complete without reacquiring the gate.
+        let pressing = Task { await consumer.dialPressed(control: dial, generation: generation) }
+        await foreground.resume()
+        await keyRouting.value
+        let result = await pressing.value
+
+        XCTAssertEqual(result.outcome, .acceptedUnverified)
+        let expectedPress = [
+            HostActionIntent.keyboard(.down, .modifier(.command)),
+            .keyboard(.down, .key(try XCTUnwrap(MacVirtualKeyCode(8)))),
+            .keyboard(.up, .key(try XCTUnwrap(MacVirtualKeyCode(8)))),
+            .keyboard(.up, .modifier(.command)),
+        ]
+        let pressIntents = await service.intents
+        XCTAssertEqual(pressIntents, expectedPress)
+
+        let invalidResult = await consumer.dialPressed(control: keyControl, generation: generation)
+        XCTAssertEqual(invalidResult.outcome, .failed(.invalidInput))
+        let intentsAfterInvalidControl = await service.intents
+        XCTAssertEqual(intentsAfterInvalidControl, expectedPress, "A key-kind control must not run the configured dial press")
+    }
+
     func testDialRotationDoesNotPersistModeAfterEditingDuringForegroundLookup() async throws {
         let fixture = try makeConfiguration(
             defaultButton: .primitive(.doNothing),

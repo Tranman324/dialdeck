@@ -95,6 +95,22 @@ public protocol InputSessionHandle: Sendable {
 public protocol NormalizedInputConsumer: Sendable {
     func consume(_ event: NormalizedInputEvent) async
     func sessionLifecycleChanged(_ event: SessionLifecycleEvent) async
+    @discardableResult
+    func dialPressed(
+        control: PhysicalControlID,
+        generation: SessionGeneration
+    ) async -> ActionExecutionResult
+}
+
+public extension NormalizedInputConsumer {
+    /// Legacy consumers ignore dial presses until they opt into handling them.
+    @discardableResult
+    func dialPressed(
+        control: PhysicalControlID,
+        generation: SessionGeneration
+    ) async -> ActionExecutionResult {
+        ActionExecutionResult(outcome: .ignored)
+    }
 }
 
 public protocol InputEventProducing: Sendable {
