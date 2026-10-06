@@ -1,0 +1,463 @@
+import Foundation
+
+public protocol ForegroundApplicationProviding: Sendable {
+    /// Implementations validate bundle identifiers before returning them.
+    func foregroundBundleIdentifier() async -> ApplicationBundleIdentifier?
+}
+
+public protocol PhysicalActionMappingProviding: Sendable {
+    /// A nil result means the control has no configured button assignment.
+    func actionTarget(for control: PhysicalControlID) async -> ActionAssignmentTarget?
+}
+
+public struct ActionRuntimeSnapshot: Equatable, Sendable {
+    public let status: RuntimeStatus
+    public let isEditing: Bool
+    public let foregroundBundleIdentifier: ApplicationBundleIdentifier?
+    public let activeProfileID: ProfileID?
+    public let selectedDialModeID: DialModeID?
+    public let lastActionResult: ActionExecutionResult?
+
+    public init(
+        status: RuntimeStatus,
+        isEditing: Bool,
+        foregroundBundleIdentifier: ApplicationBundleIdentifier?,
+        activeProfileID: ProfileID?,
+        selectedDialModeID: DialModeID?,
+        lastActionResult: ActionExecutionResult?
+    ) {
+        self.status = status
+        self.isEditing = isEditing
+        self.foregroundBundleIdentifier = foregroundBundleIdentifier
+        self.activeProfileID = activeProfileID
+        self.selectedDialModeID = selectedDialModeID
+        self.lastActionResult = lastActionResult
+    }
+}
+
+/// Host-side action router. All input and OS-facing behavior is injected, and
+/// configuration changes are persisted through the accepted store actor.
+public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, RuntimeStatusProviding {
+    private let inputProducer: any InputEventProducing
+    private let capabilities: any DeviceCapabilityProviding
+    private let programmer: any DeviceProgramming
+    private let foregroundApplication: any ForegroundApplicationProviding
+    private let controlMapping: any PhysicalActionMappingProviding
+    private let configurationStore: ConfigurationStore
+    private let executor: HostActionExecutor
+    private var configuration: Configuration?
+    private var session: (any InputSessionHandle)?
+    private var generation: SessionGeneration?
+    private var nextGeneration: UInt64 = 1
+    private var status: RuntimeStatus = .idle
+    private var isEditing = false
+    private var foregroundBundleIdentifier: ApplicationBundleIdentifier?
+    private var activeProfileID: ProfileID?
+    private var selectedDialModeID: DialModeID?
+    private var lastActionResult: ActionExecutionResult?
+    private let inputGate = AsyncActionGate()
+
+    public init(
+        inputProducer: any InputEventProducing,
+        capabilities: any DeviceCapabilityProviding,
+        programmer: any DeviceProgramming,
+        foregroundApplication: any ForegroundApplicationProviding,
+        controlMapping: any PhysicalActionMappingProviding,
+        configurationStore: ConfigurationStore,
+        actionService: any HostActionServicing,
+        executionLimits: ActionExecutionLimits = .init()
+    ) {
+        self.inputProducer = inputProducer
+        self.capabilities = capabilities
+        self.programmer = programmer
+        self.foregroundApplication = foregroundApplication
+        self.controlMapping = controlMapping
+        self.configurationStore = configurationStore
+        self.executor = HostActionExecutor(service: actionService, limits: executionLimits)
+    }
+
+    public func submit(_ command: RuntimeCommand) async -> RuntimeCommandCompletion {
+        switch command {
+        case .start:
+            await startSession()
+            return .noProgrammingResult
+        case .stop:
+            await stopSession()
+            return .noProgrammingResult
+        case .refreshCapabilities:
+            await refreshCapabilities()
+            return .noProgrammingResult
+        case .program(let request):
+            let result = await programmer.program(request)
+            guard result.requestID == request.requestID else {
+                return .programming(ProgrammingResult(
+                    requestID: request.requestID,
+                    outcome: .failed(.init(reason: "Programming service returned a mismatched request ID"))
+                ))
+            }
+            return .programming(result)
+        }
+    }
+
+    public func currentStatus() async -> RuntimeStatus { status }
+
+    public func currentSnapshot() -> ActionRuntimeSnapshot {
+        ActionRuntimeSnapshot(
+            status: status,
+            isEditing: isEditing,
+            foregroundBundleIdentifier: foregroundBundleIdentifier,
+            activeProfileID: activeProfileID,
+            selectedDialModeID: selectedDialModeID,
+            lastActionResult: lastActionResult
+        )
+    }
+
+    /// Configuration editors should save through this method so a newly
+    /// installed snapshot and its remembered modes become active together.
+    public func installConfiguration(_ newConfiguration: Configuration) async throws {
+        try await configurationStore.save(newConfiguration)
+        configuration = newConfiguration
+        refreshSelectedModeSnapshot()
+    }
+
+    /// Loads the current stored snapshot. Reconstructing ActionRuntime after an
+    /// app restart also restores each profile's remembered mode from the store.
+    public func reloadConfiguration() async throws {
+        configuration = try await configurationStore.load()
+        refreshSelectedModeSnapshot()
+    }
+
+    public func setConfigurationEditing(_ editing: Bool) async {
+        isEditing = editing
+        if editing {
+            let failures = await executor.cancelAndRelease()
+            if let failure = failures.first {
+                setActionResult(ActionExecutionResult(outcome: .failed(failure)))
+            }
+        }
+    }
+
+    /// The accepted normalized event contract has no dial-button payload yet.
+    /// Device adapters may call this explicit entry point when they have a
+    /// validated dial-press event; it does not infer a physical mapping.
+    @discardableResult
+    public func dialPressed(
+        control: PhysicalControlID,
+        generation eventGeneration: SessionGeneration
+    ) async -> ActionExecutionResult {
+        await inputGate.acquire()
+        let result = await performDialPressed(control: control, generation: eventGeneration)
+        await inputGate.release()
+        return record(result)
+    }
+
+    private func performDialPressed(
+        control: PhysicalControlID,
+        generation eventGeneration: SessionGeneration
+    ) async -> ActionExecutionResult {
+        guard control.kind == .dial else {
+            return ActionExecutionResult(outcome: .failed(.invalidInput))
+        }
+        guard generation == eventGeneration,
+              case .running(let runningGeneration) = status,
+              runningGeneration == eventGeneration else {
+            return ActionExecutionResult(outcome: .ignored)
+        }
+        guard !isEditing else { return ActionExecutionResult(outcome: .ignored) }
+        do {
+            let config = try await loadConfigurationIfNeeded()
+            let bundleID = await foregroundApplication.foregroundBundleIdentifier()
+            let profile = ProfileActionResolver.profileForRouting(
+                bundleIdentifier: bundleID,
+                in: config
+            )
+            updateRoute(bundleID: bundleID, profile: profile)
+            switch await advanceDialMode(for: profile.id) {
+            case .advanced(let modeID):
+                return ActionExecutionResult(outcome: .modeChanged(profileID: profile.id, modeID: modeID))
+            case .failed(let failure):
+                return ActionExecutionResult(outcome: .failed(failure))
+            }
+        } catch {
+            return ActionExecutionResult(outcome: .failed(.modePersistenceFailed(String(describing: error))))
+        }
+    }
+
+    public func consume(_ event: NormalizedInputEvent) async {
+        await inputGate.acquire()
+        guard event.generation == generation,
+              case .running(let runningGeneration) = status,
+              runningGeneration == event.generation,
+              !isEditing else {
+            await inputGate.release()
+            return
+        }
+
+        switch event.payload {
+        case .keyDown:
+            await routeKeyDown(event)
+        case .keyUp:
+            let result = await executor.keyUp(control: event.control, generation: event.generation)
+            setActionResult(result)
+        case .dialRotation(let delta):
+            await routeDialRotation(event, delta: delta)
+        }
+        await inputGate.release()
+    }
+
+    public func sessionLifecycleChanged(_ event: SessionLifecycleEvent) async {
+        switch event {
+        case .started(let eventGeneration):
+            guard generation == eventGeneration else { return }
+            status = .running(generation: eventGeneration)
+        case .stopping(let eventGeneration):
+            guard generation == eventGeneration else { return }
+            status = .stopping(generation: eventGeneration)
+            let failures = await executor.cancelAndRelease()
+            if let failure = failures.first {
+                status = .failed(.operationFailed(reason: RuntimeFailureText.sanitize("Input cleanup failed: \(failure)")))
+            }
+        case .stopped(let eventGeneration):
+            guard generation == eventGeneration else { return }
+            generation = nil
+            session = nil
+            let failures = await executor.cancelAndRelease()
+            status = failures.first.map {
+                .failed(.operationFailed(reason: RuntimeFailureText.sanitize("Input cleanup failed: \($0)")))
+            } ?? .idle
+        case .failed(let eventGeneration, let reason):
+            guard generation == eventGeneration else { return }
+            generation = nil
+            session = nil
+            let failures = await executor.cancelAndRelease()
+            let suffix = failures.first.map { "; input cleanup failed: \($0)" } ?? ""
+            status = .failed(.operationFailed(reason: RuntimeFailureText.sanitize(reason + suffix)))
+        }
+    }
+
+    private func startSession() async {
+        if generation != nil || session != nil {
+            await stopSession()
+        }
+        do {
+            _ = try await loadConfigurationIfNeeded()
+        } catch {
+            status = .failed(.operationFailed(reason: RuntimeFailureText.sanitize("Configuration unavailable: \(error)")))
+            return
+        }
+
+        let capability = await capabilities.currentCapabilities()
+        if case .denied(let reason) = capability.access {
+            status = .failed(.inputAccessDenied)
+            lastActionResult = ActionExecutionResult(outcome: .failed(.serviceFailed(RuntimeFailureText.sanitize(reason))))
+            return
+        }
+        if case .unavailable(let reason) = capability.access {
+            status = .failed(.operationFailed(reason: RuntimeFailureText.sanitize(reason)))
+            return
+        }
+        if case .unavailable(let reason) = capability.detection {
+            status = .failed(.operationFailed(reason: RuntimeFailureText.sanitize(reason)))
+            return
+        }
+        if case .notDetected = capability.detection {
+            status = .failed(.deviceUnavailable)
+            return
+        }
+
+        let newGeneration = SessionGeneration(nextGeneration)
+        nextGeneration &+= 1
+        generation = newGeneration
+        status = .starting
+        do {
+            let newSession = try await inputProducer.start(generation: newGeneration, consumer: self)
+            guard generation == newGeneration else {
+                await newSession.cancel()
+                return
+            }
+            session = newSession
+            status = .running(generation: newGeneration)
+        } catch {
+            guard generation == newGeneration else { return }
+            generation = nil
+            status = .failed(.operationFailed(reason: RuntimeFailureText.sanitize(String(describing: error))))
+        }
+    }
+
+    private func stopSession() async {
+        let stoppingGeneration = generation
+        let oldSession = session
+        if let stoppingGeneration { status = .stopping(generation: stoppingGeneration) }
+        generation = nil
+        session = nil
+        let failures = await executor.cancelAndRelease()
+        if let oldSession { await oldSession.cancel() }
+        if generation == nil {
+            status = failures.first.map {
+                .failed(.operationFailed(reason: RuntimeFailureText.sanitize("Input cleanup failed: \($0)")))
+            } ?? .idle
+        }
+    }
+
+    private func refreshCapabilities() async {
+        let current = await capabilities.currentCapabilities()
+        if case .denied = current.access {
+            await stopSession()
+            status = .failed(.inputAccessDenied)
+        } else if case .unavailable(let reason) = current.access {
+            await stopSession()
+            status = .failed(.operationFailed(reason: RuntimeFailureText.sanitize(reason)))
+        } else if case .notDetected = current.detection {
+            await stopSession()
+            status = .failed(.deviceUnavailable)
+        } else if case .unavailable(let reason) = current.detection {
+            await stopSession()
+            status = .failed(.operationFailed(reason: RuntimeFailureText.sanitize(reason)))
+        }
+    }
+
+    private func routeKeyDown(_ event: NormalizedInputEvent) async {
+        guard let target = await controlMapping.actionTarget(for: event.control) else {
+            setActionResult(ActionExecutionResult(outcome: .ignored))
+            return
+        }
+        do {
+            let config = try await loadConfigurationIfNeeded()
+            let bundleID = await foregroundApplication.foregroundBundleIdentifier()
+            let resolved = ProfileActionResolver.resolve(
+                bundleIdentifier: bundleID,
+                target: target,
+                in: config
+            )
+            let profileID: ProfileID
+            switch resolved.source {
+            case .applicationOverride(let id), .inheritedDefault(let id), .defaultProfile(let id):
+                profileID = id
+            }
+            let profile = config.profile(id: profileID) ?? config.defaultProfile
+            updateRoute(bundleID: bundleID, profile: profile)
+            let result = await executor.keyDown(
+                control: event.control,
+                generation: event.generation,
+                action: resolved.action,
+                profileID: profileID,
+                application: bundleID,
+                advanceMode: modeAdvanceHandler()
+            )
+            setActionResult(result)
+        } catch {
+            setActionResult(ActionExecutionResult(outcome: .failed(
+                .modePersistenceFailed(RuntimeFailureText.sanitize("Configuration unavailable: \(error)"))
+            )))
+        }
+    }
+
+    private func routeDialRotation(_ event: NormalizedInputEvent, delta: Int) async {
+        guard delta != 0, absSafely(delta) <= 100 else {
+            if delta != 0 { setActionResult(ActionExecutionResult(outcome: .failed(.invalidInput))) }
+            return
+        }
+        do {
+            let config = try await loadConfigurationIfNeeded()
+            let bundleID = await foregroundApplication.foregroundBundleIdentifier()
+            let target: DialModeActionTarget = delta < 0 ? .counterclockwise : .clockwise
+            let resolved = ProfileActionResolver.resolveDialModeAction(
+                bundleIdentifier: bundleID,
+                target: target,
+                in: config
+            )
+            guard let profile = config.profile(id: resolved.profileID) else { return }
+            updateRoute(bundleID: bundleID, profile: profile)
+            let result = await executor.executeDialAction(
+                resolved.action,
+                profileID: resolved.profileID,
+                dialMagnitude: delta,
+                application: bundleID,
+                advanceMode: modeAdvanceHandler()
+            )
+            setActionResult(result)
+        } catch {
+            setActionResult(ActionExecutionResult(outcome: .failed(
+                .modePersistenceFailed(RuntimeFailureText.sanitize("Configuration unavailable: \(error)"))
+            )))
+        }
+        _ = event
+    }
+
+    private func advanceDialMode(for profileID: ProfileID) async -> DialModeAdvanceResult {
+        do {
+            let config = try await loadConfigurationIfNeeded()
+            guard let profile = config.profile(id: profileID), !profile.dialModes.isEmpty else {
+                return .failed(.modePersistenceFailed("The routed profile no longer exists"))
+            }
+            let currentID = profile.selectedDialMode.id
+            let currentIndex = profile.dialModes.firstIndex { $0.id == currentID } ?? 0
+            let nextMode = profile.dialModes[(currentIndex + 1) % profile.dialModes.count]
+            let updated = try config.rememberingDialMode(nextMode.id, for: profileID)
+            try await configurationStore.save(updated)
+            configuration = updated
+            if activeProfileID == profileID { selectedDialModeID = nextMode.id }
+            return .advanced(nextMode.id)
+        } catch {
+            return .failed(.modePersistenceFailed(RuntimeFailureText.sanitize(String(describing: error))))
+        }
+    }
+
+    private func modeAdvanceHandler() -> @Sendable (ProfileID) async -> DialModeAdvanceResult {
+        { [weak self] profileID in
+            guard let self else {
+                return .failed(.modePersistenceFailed("Runtime is no longer available"))
+            }
+            return await self.advanceDialMode(for: profileID)
+        }
+    }
+
+    private func loadConfigurationIfNeeded() async throws -> Configuration {
+        if let configuration { return configuration }
+        let loaded = try await configurationStore.load()
+        configuration = loaded
+        refreshSelectedModeSnapshot()
+        return loaded
+    }
+
+    private func updateRoute(bundleID: ApplicationBundleIdentifier?, profile: Profile) {
+        foregroundBundleIdentifier = bundleID
+        activeProfileID = profile.id
+        selectedDialModeID = profile.selectedDialMode.id
+    }
+
+    private func refreshSelectedModeSnapshot() {
+        guard let configuration, let activeProfileID,
+              let profile = configuration.profile(id: activeProfileID) else {
+            selectedDialModeID = nil
+            return
+        }
+        selectedDialModeID = profile.selectedDialMode.id
+    }
+
+    private func setActionResult(_ result: ActionExecutionResult) {
+        lastActionResult = result
+    }
+
+    private func record(_ result: ActionExecutionResult) -> ActionExecutionResult {
+        lastActionResult = result
+        return result
+    }
+
+    private func absSafely(_ value: Int) -> Int {
+        value == Int.min ? Int.max : abs(value)
+    }
+}
+
+private extension ProfileActionResolver {
+    static func profileForRouting(
+        bundleIdentifier: ApplicationBundleIdentifier?,
+        in configuration: Configuration
+    ) -> Profile {
+        if let bundleIdentifier,
+           let profile = configuration.profiles.first(where: { $0.scope == .application(bundleIdentifier) }) {
+            return profile
+        }
+        return configuration.defaultProfile
+    }
+}
