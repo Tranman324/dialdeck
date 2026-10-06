@@ -79,15 +79,15 @@ private final class USBWriteCancellation: @unchecked Sendable {
 public final class KeyboardDeviceProgrammingService: Sendable {
     private let queue = DispatchQueue(label: "DialDeck.deviceProgramming")
     private let transport: @Sendable ([UInt8], Int, OpaquePointer) -> DDUSBResult
-    private static let observedUsages: [UInt8: UInt8] = [
+    private static let baselineUsages: [UInt8: UInt8] = [
         1: 0x1b, 2: 0x04, 3: 0x05, 4: 0x07, 5: 0x08, 6: 0x09,
         13: 0x0a, 14: 0x0b, 15: 0x0d
     ]
-    // One separately reviewed cross-dock validation candidate: slot 1 plain z.
-    private static let stagedValidationUsages: [UInt8: Set<UInt8>] = [1: [0x1d]]
-    // Fixed F16-F24 proposal vectors. These do not change the observed catalog
-    // or the typed runtime request contract.
-    private static let proposedRemapUsages: [UInt8: UInt8] = [
+    // Retained legacy restore vector: layer-1 slot 1 plain z.
+    private static let restoreUsages: [UInt8: Set<UInt8>] = [1: [0x1d]]
+    // Fixed F16-F24 vectors are observed on the tested unit after reconnect.
+    // They remain separate from the typed runtime request contract.
+    private static let fKeyRemapUsages: [UInt8: UInt8] = [
         1: 0x6b, 2: 0x6c, 3: 0x6d, 4: 0x6e, 5: 0x6f,
         6: 0x70, 13: 0x71, 14: 0x72, 15: 0x73
     ]
@@ -112,9 +112,9 @@ public final class KeyboardDeviceProgrammingService: Sendable {
         }
         guard request.strokes.count == 1,
               request.strokes[0].modifiers == 0,
-              (Self.observedUsages[request.slot] == request.strokes[0].usage ||
-               Self.stagedValidationUsages[request.slot]?.contains(request.strokes[0].usage) == true ||
-               Self.proposedRemapUsages[request.slot] == request.strokes[0].usage) else {
+              (Self.baselineUsages[request.slot] == request.strokes[0].usage ||
+               Self.restoreUsages[request.slot]?.contains(request.strokes[0].usage) == true ||
+               Self.fKeyRemapUsages[request.slot] == request.strokes[0].usage) else {
             return .init(id: request.id, outcome: .failed(
                 reason: "Unsupported slot and plain-usage assignment",
                 reportsAccepted: 0))

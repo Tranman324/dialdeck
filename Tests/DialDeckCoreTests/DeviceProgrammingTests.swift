@@ -4,7 +4,7 @@ import XCTest
 @testable import DialDeckCore
 
 final class DeviceProgrammingTests: XCTestCase {
-    private let observed: [(slot: UInt8, usage: UInt8)] = [
+    private let baseline: [(slot: UInt8, usage: UInt8)] = [
         (1, 0x1b), (2, 0x04), (3, 0x05), (4, 0x07), (5, 0x08), (6, 0x09),
         (13, 0x0a), (14, 0x0b), (15, 0x0d)
     ]
@@ -12,11 +12,11 @@ final class DeviceProgrammingTests: XCTestCase {
     func testReadOnlyCapabilityCatalogContainsOnlyObservedUnitVectors() {
         let capabilities = ObservedDeviceProgrammingCapabilities.observedUnit
         let expected: [(ObservedDeviceControl, UInt8, UInt8)] = [
-            (.topLeftKey, 3, 0x05), (.topRightKey, 6, 0x09),
-            (.middleLeftKey, 2, 0x04), (.middleRightKey, 5, 0x08),
-            (.bottomLeftKey, 1, 0x1b), (.bottomRightKey, 4, 0x07),
-            (.knobClockwise, 15, 0x0d), (.knobCounterclockwise, 13, 0x0a),
-            (.knobPress, 14, 0x0b)
+            (.topLeftKey, 3, 0x6d), (.topRightKey, 6, 0x70),
+            (.middleLeftKey, 2, 0x6c), (.middleRightKey, 5, 0x6f),
+            (.bottomLeftKey, 1, 0x6b), (.bottomRightKey, 4, 0x6e),
+            (.knobClockwise, 15, 0x73), (.knobCounterclockwise, 13, 0x71),
+            (.knobPress, 14, 0x72)
         ]
         XCTAssertEqual(capabilities.plainKeyVectors.count, 9)
         XCTAssertEqual(Set(capabilities.plainKeyVectors.map(\.control)), Set(ObservedDeviceControl.allCases))
@@ -26,16 +26,17 @@ final class DeviceProgrammingTests: XCTestCase {
             }.count, 1)
             XCTAssertTrue(capabilities.containsPlainKeyVector(layer: 1, slot: slot, usage: usage))
         }
-        XCTAssertFalse(capabilities.containsPlainKeyVector(layer: 2, slot: 1, usage: 0x1b))
-        XCTAssertFalse(capabilities.containsPlainKeyVector(layer: 1, slot: 7, usage: 0x1b))
+        XCTAssertFalse(capabilities.containsPlainKeyVector(layer: 2, slot: 1, usage: 0x6b))
+        XCTAssertFalse(capabilities.containsPlainKeyVector(layer: 1, slot: 7, usage: 0x6b))
+        XCTAssertFalse(capabilities.containsPlainKeyVector(layer: 1, slot: 1, usage: 0x1b))
         XCTAssertFalse(capabilities.containsPlainKeyVector(layer: 1, slot: 1, usage: 0x04))
         XCTAssertEqual(capabilities.lightingModes, [.mode1, .mode2])
         XCTAssertTrue(capabilities.containsLightingMode(.mode1))
         XCTAssertTrue(capabilities.containsLightingMode(.mode2))
     }
 
-    func testGoldenReportID3VectorsForNineObservedAssignments() throws {
-        for (slot, usage) in observed {
+    func testGoldenReportID3VectorsForNineBaselineAssignments() throws {
+        for (slot, usage) in baseline {
             let stroke = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: usage))
             let reports = try ReportID3KeyboardEncoder.encode(
                 slot: slot, layer: 1, strokes: [stroke])
@@ -323,8 +324,8 @@ final class DeviceProgrammingTests: XCTestCase {
         }
     }
 
-    func testFKeyProposalAdmitsOnlyTheNineFixedServiceVectors() async throws {
-        let proposed: [(slot: UInt8, usage: UInt8)] = [
+    func testFKeyRemapAdmitsOnlyTheNineFixedServiceVectors() async throws {
+        let fKeyVectors: [(slot: UInt8, usage: UInt8)] = [
             (1, 0x6b), (2, 0x6c), (3, 0x6d), (4, 0x6e), (5, 0x6f),
             (6, 0x70), (13, 0x71), (14, 0x72), (15, 0x73)
         ]
@@ -334,7 +335,7 @@ final class DeviceProgrammingTests: XCTestCase {
             return DDUSBResult(status: DDUSB_SENT_UNVERIFIED, reports_accepted: count)
         }
 
-        for (slot, usage) in proposed {
+        for (slot, usage) in fKeyVectors {
             let stroke = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: usage))
             let request = KeyboardDeviceWriteRequest(
                 slot: slot, strokes: [stroke], acceptsPersistentOverwrite: true)
@@ -354,7 +355,7 @@ final class DeviceProgrammingTests: XCTestCase {
             (1, 0x6c, 0), // valid F17 usage assigned to the wrong slot
             (2, 0x6b, 0), // valid F16 usage assigned to the wrong slot
             (1, 0x6b, 1), // modifier added to an otherwise permitted vector
-            (7, 0x6b, 0), // a proposed usage assigned to an unlisted slot
+            (7, 0x6b, 0), // an F-key usage assigned to an unlisted slot
             (15, 0x74, 0) // usage following the fixed F24 range
         ]
         for (slot, usage, modifiers) in nearMisses {
@@ -439,8 +440,8 @@ final class DeviceProgrammingTests: XCTestCase {
         }
     }
 
-    func testPureValidatorAcceptsExactlyNineObservedPairs() throws {
-        for (slot, usage) in observed {
+    func testPureValidatorAcceptsExactlyNineBaselinePairs() throws {
+        for (slot, usage) in baseline {
             let bytes = try encodedBytes(slot: slot, usage: usage)
             let permitted = bytes.withUnsafeBufferPointer { buffer in
                 dd_usb_reports_permitted(buffer.baseAddress, 4, bytes.count)
@@ -454,12 +455,12 @@ final class DeviceProgrammingTests: XCTestCase {
         XCTAssertEqual(permitted, 0)
     }
 
-    func testPureValidatorAcceptsExactlyTheFKeyProposalPairsAndRejectsMutations() throws {
-        let proposed: [(slot: UInt8, usage: UInt8)] = [
+    func testPureValidatorAcceptsExactlyTheFKeyRemapPairsAndRejectsMutations() throws {
+        let fKeyVectors: [(slot: UInt8, usage: UInt8)] = [
             (1, 0x6b), (2, 0x6c), (3, 0x6d), (4, 0x6e), (5, 0x6f),
             (6, 0x70), (13, 0x71), (14, 0x72), (15, 0x73)
         ]
-        for (slot, usage) in proposed {
+        for (slot, usage) in fKeyVectors {
             let bytes = try encodedBytes(slot: slot, usage: usage)
             let permitted = bytes.withUnsafeBufferPointer { buffer in
                 dd_usb_reports_permitted(buffer.baseAddress, 4, bytes.count)

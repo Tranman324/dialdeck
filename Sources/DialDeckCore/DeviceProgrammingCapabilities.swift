@@ -11,8 +11,9 @@ public enum ObservedDeviceControl: String, CaseIterable, Sendable {
     case knobPress
 }
 
-/// One exact layer-1 plain-key vector demonstrated on the user's keypad.
-/// `usage` is a USB HID keyboard usage, not a macOS virtual key code.
+/// One exact layer-1 unmodified keyboard vector observed on the user's keypad.
+/// `usage` is a USB HID usage, not a macOS virtual key code; F16-F24 are
+/// function-key usages rather than printable characters.
 public struct ObservedPlainKeyVector: Equatable, Sendable {
     public let control: ObservedDeviceControl
     public let layer: UInt8
@@ -38,15 +39,15 @@ public struct ObservedDeviceProgrammingCapabilities: Equatable, Sendable {
 
     private init() {
         plainKeyVectors = [
-            .init(control: .topLeftKey, slot: 3, usage: 0x05),
-            .init(control: .topRightKey, slot: 6, usage: 0x09),
-            .init(control: .middleLeftKey, slot: 2, usage: 0x04),
-            .init(control: .middleRightKey, slot: 5, usage: 0x08),
-            .init(control: .bottomLeftKey, slot: 1, usage: 0x1b),
-            .init(control: .bottomRightKey, slot: 4, usage: 0x07),
-            .init(control: .knobClockwise, slot: 15, usage: 0x0d),
-            .init(control: .knobCounterclockwise, slot: 13, usage: 0x0a),
-            .init(control: .knobPress, slot: 14, usage: 0x0b)
+            .init(control: .topLeftKey, slot: 3, usage: 0x6d),
+            .init(control: .topRightKey, slot: 6, usage: 0x70),
+            .init(control: .middleLeftKey, slot: 2, usage: 0x6c),
+            .init(control: .middleRightKey, slot: 5, usage: 0x6f),
+            .init(control: .bottomLeftKey, slot: 1, usage: 0x6b),
+            .init(control: .bottomRightKey, slot: 4, usage: 0x6e),
+            .init(control: .knobClockwise, slot: 15, usage: 0x73),
+            .init(control: .knobCounterclockwise, slot: 13, usage: 0x71),
+            .init(control: .knobPress, slot: 14, usage: 0x72)
         ]
         lightingModes = [.mode1, .mode2]
     }
