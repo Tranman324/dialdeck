@@ -190,7 +190,7 @@ final class DeviceProgrammingTests: XCTestCase {
             layer: 1,
             buttons: ReportID3MouseButtons(rawValue: 0x08)
         )) { error in
-            XCTAssertEqual(error as? ReportID3EncodingError, .invalidMouseButtons)
+            XCTAssertEqual(error as? ReportID3MouseEncodingError, .invalidMouseButtons)
         }
         XCTAssertThrowsError(try ReportID3KeyboardEncoder.encodeMouse(
             slot: 1,
@@ -198,7 +198,7 @@ final class DeviceProgrammingTests: XCTestCase {
             buttons: .left,
             modifiers: ReportID3MouseModifiers(rawValue: 0x08)
         )) { error in
-            XCTAssertEqual(error as? ReportID3EncodingError, .invalidMouseModifiers)
+            XCTAssertEqual(error as? ReportID3MouseEncodingError, .invalidMouseModifiers)
         }
         XCTAssertThrowsError(try ReportID3KeyboardEncoder.encodeMouse(
             slot: 1,
@@ -206,8 +206,14 @@ final class DeviceProgrammingTests: XCTestCase {
             buttons: [],
             modifiers: .control
         )) { error in
-            XCTAssertEqual(error as? ReportID3EncodingError, .emptyMouseOperation)
+            XCTAssertEqual(error as? ReportID3MouseEncodingError, .emptyMouseOperation)
         }
+    }
+
+    func testReportID3EncodingErrorRetainsItsOriginalExhaustiveCases() {
+        XCTAssertEqual(legacyEncodingErrorDescription(.unsupportedSlot), "slot")
+        XCTAssertEqual(legacyEncodingErrorDescription(.unsupportedLayer), "layer")
+        XCTAssertEqual(legacyEncodingErrorDescription(.invalidSequenceLength), "sequence")
     }
 
     func testEncoderOnlyFamiliesAndLayersRemainOutsideTransportAllowlist() async throws {
@@ -654,6 +660,17 @@ final class DeviceProgrammingTests: XCTestCase {
             padded([0x03, slot, 0x11, 0x01, 0x01, 0x00, usage]),
             padded([0x03, 0xaa, 0xaa])
         ].flatMap { $0 }
+    }
+
+    private func legacyEncodingErrorDescription(_ error: ReportID3EncodingError) -> String {
+        switch error {
+        case .unsupportedSlot:
+            "slot"
+        case .unsupportedLayer:
+            "layer"
+        case .invalidSequenceLength:
+            "sequence"
+        }
     }
 
     private func padded(_ prefix: [UInt8]) -> [UInt8] {

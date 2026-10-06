@@ -55,6 +55,9 @@ public enum ReportID3EncodingError: Error, Equatable, Sendable {
     case unsupportedSlot
     case unsupportedLayer
     case invalidSequenceLength
+}
+
+public enum ReportID3MouseEncodingError: Error, Equatable, Sendable {
     case invalidMouseButtons
     case invalidMouseModifiers
     case emptyMouseOperation
@@ -109,13 +112,13 @@ public enum ReportID3KeyboardEncoder {
     ) throws -> [[UInt8]] {
         try validate(slot: slot, layer: layer)
         guard buttons.rawValue & ~UInt8(0x07) == 0 else {
-            throw ReportID3EncodingError.invalidMouseButtons
+            throw ReportID3MouseEncodingError.invalidMouseButtons
         }
         guard modifiers.rawValue & ~UInt8(0x07) == 0 else {
-            throw ReportID3EncodingError.invalidMouseModifiers
+            throw ReportID3MouseEncodingError.invalidMouseModifiers
         }
         guard !buttons.isEmpty || wheel != nil else {
-            throw ReportID3EncodingError.emptyMouseOperation
+            throw ReportID3MouseEncodingError.emptyMouseOperation
         }
 
         return [
