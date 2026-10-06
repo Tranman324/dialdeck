@@ -378,19 +378,16 @@ public enum RuntimeCommand: Equatable, Sendable {
     case stop
     case refreshCapabilities
     case program(ProgrammingRequest)
-    case programKeyAssignment(KeyAssignmentProgrammingRequest)
     case programLighting(LightingProgrammingRequest)
 }
 
 /// Completion returned to the UI-facing caller of `RuntimeCommandHandling`.
-/// A `.program` command returns `.programming` with the same request ID and its
-/// transmission/verification outcome. Typed assignment and lighting commands
-/// return their corresponding correlated result; other commands return
+/// Programming commands return their corresponding result with the request ID
+/// and transmission/verification outcome; lifecycle commands return
 /// `.noProgrammingResult`.
 public enum RuntimeCommandCompletion: Equatable, Sendable {
     case noProgrammingResult
     case programming(ProgrammingResult)
-    case keyAssignmentProgramming(KeyAssignmentProgrammingResult)
     case lightingProgramming(LightingProgrammingResult)
 }
 
@@ -409,10 +406,26 @@ public enum RuntimeStatus: Equatable, Sendable {
 }
 
 public protocol RuntimeCommandHandling: Sendable {
-    /// Awaits command completion. For `.program(request)`, the result's
-    /// `requestID` must equal `request.requestID`. Typed assignment and
-    /// lighting completions preserve the same correlation requirement.
+    /// Awaits command completion. Programming command results preserve the
+    /// request ID from their request.
     func submit(_ command: RuntimeCommand) async -> RuntimeCommandCompletion
+
+    /// Submits the separate typed key-assignment operation. The default
+    /// implementation fails closed so existing conformers remain source
+    /// compatible; the result preserves the request identity.
+    func programKeyAssignment(_ request: KeyAssignmentProgrammingRequest) async -> KeyAssignmentProgrammingResult
+}
+
+public extension RuntimeCommandHandling {
+    func programKeyAssignment(_ request: KeyAssignmentProgrammingRequest) async -> KeyAssignmentProgrammingResult {
+        KeyAssignmentProgrammingResult(
+            requestID: request.requestID,
+            outcome: .failed(
+                reason: "This runtime does not support typed key assignment",
+                reportsAccepted: 0
+            )
+        )
+    }
 }
 
 public protocol RuntimeStatusProviding: Sendable {

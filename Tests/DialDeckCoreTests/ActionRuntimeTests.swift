@@ -432,7 +432,7 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertNil(RuntimeKeyAssignmentCandidate(slot: 99, usage: 0x05), "An unsupported slot must be rejected")
     }
 
-    func testTypedKeyAssignmentCommandPreservesCandidateConsentIdentityAndUnverifiedCount() async throws {
+    func testTypedKeyAssignmentMethodPreservesCandidateConsentIdentityAndUnverifiedCount() async throws {
         let fixture = try makeConfiguration(defaultButton: .primitive(.doNothing), appButton: .inherit)
         let programmer = RecordingKeyAssignmentProgrammer(outcome: .sentUnverified(reportsAccepted: 4))
         let runtime = try await makeRuntime(
@@ -449,12 +449,13 @@ final class ActionRuntimeTests: XCTestCase {
             acceptsPersistentOverwrite: true
         )
 
-        let completion = await runtime.submit(.programKeyAssignment(request))
+        let handler: any RuntimeCommandHandling = runtime
+        let result = await handler.programKeyAssignment(request)
 
-        XCTAssertEqual(completion, .keyAssignmentProgramming(.init(
+        XCTAssertEqual(result, .init(
             requestID: request.requestID,
             outcome: .sentUnverified(reportsAccepted: 4)
-        )))
+        ))
         let captured = await programmer.requests
         XCTAssertEqual(captured, [request])
     }
@@ -475,12 +476,13 @@ final class ActionRuntimeTests: XCTestCase {
             acceptsPersistentOverwrite: false
         )
 
-        let deniedCompletion = await runtime.submit(.programKeyAssignment(denied))
+        let handler: any RuntimeCommandHandling = runtime
+        let deniedResult = await handler.programKeyAssignment(denied)
 
-        XCTAssertEqual(deniedCompletion, .keyAssignmentProgramming(.init(
+        XCTAssertEqual(deniedResult, .init(
             requestID: denied.requestID,
             outcome: .failed(reason: "Persistent overwrite was not accepted", reportsAccepted: 0)
-        )))
+        ))
         XCTAssertNil(RuntimeKeyAssignmentCandidate(slot: 1, usage: 0x04))
         let captured = await programmer.requests
         XCTAssertTrue(captured.isEmpty, "Unaccepted or unsupported assignment input must not reach the programmer")
@@ -500,15 +502,16 @@ final class ActionRuntimeTests: XCTestCase {
             acceptsPersistentOverwrite: true
         )
 
-        let completion = await runtime.submit(.programKeyAssignment(request))
+        let handler: any RuntimeCommandHandling = runtime
+        let result = await handler.programKeyAssignment(request)
 
-        XCTAssertEqual(completion, .keyAssignmentProgramming(.init(
+        XCTAssertEqual(result, .init(
             requestID: request.requestID,
             outcome: .failed(
                 reason: "No supported key assignment programmer is configured",
                 reportsAccepted: 0
             )
-        )))
+        ))
     }
 
     func testTypedKeyAssignmentRejectsMismatchedResultIdentityAndPreservesAcceptedCount() async throws {
@@ -529,15 +532,16 @@ final class ActionRuntimeTests: XCTestCase {
             acceptsPersistentOverwrite: true
         )
 
-        let completion = await runtime.submit(.programKeyAssignment(request))
+        let handler: any RuntimeCommandHandling = runtime
+        let result = await handler.programKeyAssignment(request)
 
-        XCTAssertEqual(completion, .keyAssignmentProgramming(.init(
+        XCTAssertEqual(result, .init(
             requestID: request.requestID,
             outcome: .failed(
                 reason: "Key assignment service returned a mismatched request ID",
                 reportsAccepted: 2
             )
-        )))
+        ))
     }
 
     func testLightingCommandPreservesTypedRequestIdentityAndAcceptedCount() async throws {

@@ -111,37 +111,6 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 ))
             }
             return .programming(result)
-        case .programKeyAssignment(let request):
-            guard request.acceptsPersistentOverwrite else {
-                return .keyAssignmentProgramming(.init(
-                    requestID: request.requestID,
-                    outcome: .failed(reason: "Persistent overwrite was not accepted", reportsAccepted: 0)
-                ))
-            }
-            guard let keyAssignmentProgrammer else {
-                return .keyAssignmentProgramming(.init(
-                    requestID: request.requestID,
-                    outcome: .failed(reason: "No supported key assignment programmer is configured", reportsAccepted: 0)
-                ))
-            }
-            let result = await keyAssignmentProgrammer.programKeyAssignment(request)
-            guard result.requestID == request.requestID else {
-                let accepted: Int
-                switch result.outcome {
-                case .sentUnverified(let reportsAccepted),
-                     .failed(_, let reportsAccepted),
-                     .cancelled(let reportsAccepted):
-                    accepted = reportsAccepted
-                }
-                return .keyAssignmentProgramming(.init(
-                    requestID: request.requestID,
-                    outcome: .failed(
-                        reason: "Key assignment service returned a mismatched request ID",
-                        reportsAccepted: accepted
-                    )
-                ))
-            }
-            return .keyAssignmentProgramming(result)
         case .programLighting(let request):
             guard request.acceptsPersistentOverwrite else {
                 return .lightingProgramming(.init(
@@ -174,6 +143,41 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             }
             return .lightingProgramming(result)
         }
+    }
+
+    public func programKeyAssignment(
+        _ request: KeyAssignmentProgrammingRequest
+    ) async -> KeyAssignmentProgrammingResult {
+        guard request.acceptsPersistentOverwrite else {
+            return .init(
+                requestID: request.requestID,
+                outcome: .failed(reason: "Persistent overwrite was not accepted", reportsAccepted: 0)
+            )
+        }
+        guard let keyAssignmentProgrammer else {
+            return .init(
+                requestID: request.requestID,
+                outcome: .failed(reason: "No supported key assignment programmer is configured", reportsAccepted: 0)
+            )
+        }
+        let result = await keyAssignmentProgrammer.programKeyAssignment(request)
+        guard result.requestID == request.requestID else {
+            let accepted: Int
+            switch result.outcome {
+            case .sentUnverified(let reportsAccepted),
+                 .failed(_, let reportsAccepted),
+                 .cancelled(let reportsAccepted):
+                accepted = reportsAccepted
+            }
+            return .init(
+                requestID: request.requestID,
+                outcome: .failed(
+                    reason: "Key assignment service returned a mismatched request ID",
+                    reportsAccepted: accepted
+                )
+            )
+        }
+        return result
     }
 
     public func currentStatus() async -> RuntimeStatus { status }
