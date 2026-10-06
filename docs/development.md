@@ -20,6 +20,8 @@ open -g -n .build/DialDeck.app
 
 The first command builds the `arm64` SwiftUI executable and assembles `.build/DialDeck.app`. The second runs the reusable core's contract smoke tests. The last command launches the app without asking macOS to bring it to the foreground. The package test target compiles fake producers and consumers for the input, capability, programming, and runtime command/status contracts.
 
+UI-facing code submits commands through `RuntimeCommandHandling.submit(_:)`. A `.program(request)` command completes with `.programming(result)`, where `result.requestID` matches the request and `result.outcome` preserves sent-unverified, failed, behavior-verified, or persistence-verified status. Lifecycle and capability commands complete with `.noProgrammingResult`. Create normalized input through `NormalizedInputEvent` factories; key factories reject dial IDs, and the dial-rotation factory rejects key IDs.
+
 ## Ownership boundaries
 
 - Runtime owns `Package.swift`, build scripts, core models, shared contracts, and action/runtime modules.

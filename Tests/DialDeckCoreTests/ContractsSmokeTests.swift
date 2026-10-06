@@ -8,15 +8,16 @@ final class ContractsSmokeTests: XCTestCase {
         let generation = SessionGeneration(4)
         let consumer = FakeInputConsumer()
         let producer = FakeInputProducer(control: control, dial: dial)
+        let expectedEvents = [
+            try XCTUnwrap(NormalizedInputEvent.keyDown(control: control, generation: generation)),
+            try XCTUnwrap(NormalizedInputEvent.keyUp(control: control, generation: generation)),
+            try XCTUnwrap(NormalizedInputEvent.dialRotation(control: dial, delta: 1, generation: generation)),
+            try XCTUnwrap(NormalizedInputEvent.keyDown(control: control, generation: generation)),
+        ]
 
         let session = try await producer.start(generation: generation, consumer: consumer)
         let events = await consumer.events
-        XCTAssertEqual(events, [
-            .keyDown(control: control, generation: generation),
-            .keyUp(control: control, generation: generation),
-            .dialRotation(control: dial, delta: 1, generation: generation),
-            .keyDown(control: control, generation: generation),
-        ])
+        XCTAssertEqual(events, expectedEvents)
         XCTAssertEqual(session.generation, generation)
         let heldBeforeCancellation = await consumer.heldControls
         XCTAssertEqual(heldBeforeCancellation, [control])
@@ -28,6 +29,19 @@ final class ContractsSmokeTests: XCTestCase {
         XCTAssertTrue(wasCancelled)
         XCTAssertTrue(heldAfterCancellation.isEmpty)
         XCTAssertEqual(lifecycleEvents, [.started(generation), .stopping(generation), .stopped(generation)])
+    }
+
+    func testNormalizedInputFactoriesRejectMismatchedControlKinds() throws {
+        let key = try XCTUnwrap(PhysicalControlID(rawValue: "opaque-key-a", kind: .key))
+        let dial = try XCTUnwrap(PhysicalControlID(rawValue: "opaque-dial-a", kind: .dial))
+        let generation = SessionGeneration(5)
+
+        XCTAssertNil(NormalizedInputEvent.keyDown(control: dial, generation: generation))
+        XCTAssertNil(NormalizedInputEvent.keyUp(control: dial, generation: generation))
+        XCTAssertNil(NormalizedInputEvent.dialRotation(control: key, delta: 1, generation: generation))
+        XCTAssertNotNil(NormalizedInputEvent.keyDown(control: key, generation: generation))
+        XCTAssertNotNil(NormalizedInputEvent.keyUp(control: key, generation: generation))
+        XCTAssertNotNil(NormalizedInputEvent.dialRotation(control: dial, delta: 1, generation: generation))
     }
 
     func testCapabilityAndProgrammingConsumersPreserveUnverifiedStates() async throws {
@@ -50,13 +64,42 @@ final class ContractsSmokeTests: XCTestCase {
     func testRuntimeCommandConsumerExposesLifecycleStatus() async {
         let runtime = FakeRuntime()
 
-        await runtime.submit(.start)
+        let startCompletion = await runtime.submit(.start)
         let runningStatus = await runtime.currentStatus()
-        await runtime.submit(.stop)
+        let stopCompletion = await runtime.submit(.stop)
         let finalStatus = await runtime.currentStatus()
 
+        XCTAssertEqual(startCompletion, .noProgrammingResult)
+        XCTAssertEqual(stopCompletion, .noProgrammingResult)
         XCTAssertEqual(runningStatus, .running(generation: SessionGeneration(1)))
         XCTAssertEqual(finalStatus, .idle)
+    }
+
+    func testProgramCommandReturnsCorrelatedResultAtEveryOutcomeLevel() async throws {
+        let control = try XCTUnwrap(PhysicalControlID(rawValue: "opaque-key-a", kind: .key))
+        let outcomes: [ProgrammingOutcome] = [
+            .sentUnverified,
+            .behaviorVerified(.init(summary: "synthetic behavior evidence")),
+            .persistenceVerified(.init(summary: "synthetic persistence evidence")),
+            .failed(.init(reason: "synthetic programming failure")),
+        ]
+        for expectedOutcome in outcomes {
+            let runtime = FakeRuntime(programmer: FakeProgrammer(outcome: expectedOutcome))
+            let uiConsumer = FakeRuntimeConsumer(runtime: runtime)
+            let request = ProgrammingRequest(assignments: [
+                .init(control: control, actionIdentifier: "example.action")
+            ])
+
+            let completion = await uiConsumer.submit(.program(request))
+
+            switch completion {
+            case let .programming(result):
+                XCTAssertEqual(result.requestID, request.requestID)
+                XCTAssertEqual(result.outcome, expectedOutcome)
+            case .noProgrammingResult:
+                XCTFail("A programming command must return its correlated result")
+            }
+        }
     }
 
     func testAllProgrammingOutcomeLevelsRemainDistinct() {
@@ -102,11 +145,11 @@ private actor FakeInputConsumer: NormalizedInputConsumer {
 
     func consume(_ event: NormalizedInputEvent) async {
         events.append(event)
-        switch event {
-        case let .keyDown(control, _):
-            heldControls.insert(control)
-        case let .keyUp(control, _):
-            heldControls.remove(control)
+        switch event.payload {
+        case .keyDown:
+            heldControls.insert(event.control)
+        case .keyUp:
+            heldControls.remove(event.control)
         case .dialRotation:
             break
         }
@@ -132,10 +175,15 @@ private struct FakeInputProducer: InputEventProducing {
         consumer: any NormalizedInputConsumer
     ) async throws -> any InputSessionHandle {
         await consumer.sessionLifecycleChanged(.started(generation))
-        await consumer.consume(.keyDown(control: control, generation: generation))
-        await consumer.consume(.keyUp(control: control, generation: generation))
-        await consumer.consume(.dialRotation(control: dial, delta: 1, generation: generation))
-        await consumer.consume(.keyDown(control: control, generation: generation))
+        let events = [
+            try XCTUnwrap(NormalizedInputEvent.keyDown(control: control, generation: generation)),
+            try XCTUnwrap(NormalizedInputEvent.keyUp(control: control, generation: generation)),
+            try XCTUnwrap(NormalizedInputEvent.dialRotation(control: dial, delta: 1, generation: generation)),
+            try XCTUnwrap(NormalizedInputEvent.keyDown(control: control, generation: generation)),
+        ]
+        for event in events {
+            await consumer.consume(event)
+        }
         return FakeInputSession(generation: generation, consumer: consumer)
     }
 }
@@ -160,19 +208,36 @@ private actor FakeProgrammer: DeviceProgramming {
     }
 }
 
+private struct FakeRuntimeConsumer: Sendable {
+    let runtime: any RuntimeCommandHandling
+
+    func submit(_ command: RuntimeCommand) async -> RuntimeCommandCompletion {
+        await runtime.submit(command)
+    }
+}
+
 private actor FakeRuntime: RuntimeCommandHandling, RuntimeStatusProviding {
     private var status: RuntimeStatus = .idle
     private var nextGeneration: UInt64 = 1
+    private let programmer: any DeviceProgramming
 
-    func submit(_ command: RuntimeCommand) async {
+    init(programmer: any DeviceProgramming = FakeProgrammer(outcome: .sentUnverified)) {
+        self.programmer = programmer
+    }
+
+    func submit(_ command: RuntimeCommand) async -> RuntimeCommandCompletion {
         switch command {
         case .start:
             status = .running(generation: SessionGeneration(nextGeneration))
             nextGeneration += 1
+            return .noProgrammingResult
         case .stop:
             status = .idle
-        case .refreshCapabilities, .program:
-            break
+            return .noProgrammingResult
+        case .refreshCapabilities:
+            return .noProgrammingResult
+        case let .program(request):
+            return .programming(await programmer.program(request))
         }
     }
 

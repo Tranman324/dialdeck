@@ -29,25 +29,50 @@ public struct SessionGeneration: Hashable, Sendable {
 }
 
 /// Normalized input independent of any device's protocol or physical mapping.
-public enum NormalizedInputEvent: Equatable, Sendable {
-    case keyDown(control: PhysicalControlID, generation: SessionGeneration)
-    case keyUp(control: PhysicalControlID, generation: SessionGeneration)
-    /// Signed detent delta after adapter normalization. Its sign does not claim a
-    /// verified clockwise/counterclockwise mapping for any particular device.
-    case dialRotation(control: PhysicalControlID, delta: Int, generation: SessionGeneration)
-
-    public var control: PhysicalControlID {
-        switch self {
-        case let .keyDown(control, _), let .keyUp(control, _), let .dialRotation(control, _, _):
-            control
-        }
+/// Use the validated factories so key events can only carry key IDs and rotation
+/// events can only carry dial IDs.
+public struct NormalizedInputEvent: Equatable, Sendable {
+    public enum Payload: Equatable, Sendable {
+        case keyDown
+        case keyUp
+        /// Signed detent delta after adapter normalization. Its sign does not
+        /// claim a verified direction mapping for any particular device.
+        case dialRotation(delta: Int)
     }
 
-    public var generation: SessionGeneration {
-        switch self {
-        case let .keyDown(_, generation), let .keyUp(_, generation), let .dialRotation(_, _, generation):
-            generation
-        }
+    public let control: PhysicalControlID
+    public let generation: SessionGeneration
+    public let payload: Payload
+
+    private init(control: PhysicalControlID, generation: SessionGeneration, payload: Payload) {
+        self.control = control
+        self.generation = generation
+        self.payload = payload
+    }
+
+    public static func keyDown(
+        control: PhysicalControlID,
+        generation: SessionGeneration
+    ) -> Self? {
+        guard control.kind == .key else { return nil }
+        return Self(control: control, generation: generation, payload: .keyDown)
+    }
+
+    public static func keyUp(
+        control: PhysicalControlID,
+        generation: SessionGeneration
+    ) -> Self? {
+        guard control.kind == .key else { return nil }
+        return Self(control: control, generation: generation, payload: .keyUp)
+    }
+
+    public static func dialRotation(
+        control: PhysicalControlID,
+        delta: Int,
+        generation: SessionGeneration
+    ) -> Self? {
+        guard control.kind == .dial else { return nil }
+        return Self(control: control, generation: generation, payload: .dialRotation(delta: delta))
     }
 }
 
@@ -198,6 +223,14 @@ public enum RuntimeCommand: Equatable, Sendable {
     case program(ProgrammingRequest)
 }
 
+/// Completion returned to the UI-facing caller of `RuntimeCommandHandling`.
+/// A `.program` command returns `.programming` with the same request ID and its
+/// transmission/verification outcome; other commands return `.noProgrammingResult`.
+public enum RuntimeCommandCompletion: Equatable, Sendable {
+    case noProgrammingResult
+    case programming(ProgrammingResult)
+}
+
 public enum RuntimeFailure: Equatable, Sendable {
     case inputAccessDenied
     case deviceUnavailable
@@ -213,7 +246,9 @@ public enum RuntimeStatus: Equatable, Sendable {
 }
 
 public protocol RuntimeCommandHandling: Sendable {
-    func submit(_ command: RuntimeCommand) async
+    /// Awaits command completion. For `.program(request)`, the result's
+    /// `requestID` must equal `request.requestID`.
+    func submit(_ command: RuntimeCommand) async -> RuntimeCommandCompletion
 }
 
 public protocol RuntimeStatusProviding: Sendable {
