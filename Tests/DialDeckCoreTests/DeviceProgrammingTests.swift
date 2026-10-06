@@ -57,7 +57,7 @@ final class DeviceProgrammingTests: XCTestCase {
                 XCTAssertEqual(error as? ReportID3EncodingError, .unsupportedSlot)
             }
         }
-        for layer: UInt8 in [0, 2] {
+        for layer: UInt8 in [0, 4] {
             XCTAssertThrowsError(try ReportID3KeyboardEncoder.encode(
                 slot: 1, layer: layer, strokes: [plain])) { error in
                 XCTAssertEqual(error as? ReportID3EncodingError, .unsupportedLayer)
@@ -71,6 +71,178 @@ final class DeviceProgrammingTests: XCTestCase {
         }
         XCTAssertNil(USBKeyboardStroke(modifiers: 0x10, usage: 0x1b))
         XCTAssertNil(USBKeyboardStroke(modifiers: 0, usage: 0))
+    }
+
+    func testKeyboardMacroGoldenPacketsCoverBoundaryCountsAndAllSourceLayers() throws {
+        let strokes = [
+            try XCTUnwrap(USBKeyboardStroke(modifiers: 0x05, usage: 0x04)),
+            try XCTUnwrap(USBKeyboardStroke(modifiers: 0x02, usage: 0x05)),
+            try XCTUnwrap(USBKeyboardStroke(modifiers: 0x08, usage: 0x06)),
+            try XCTUnwrap(USBKeyboardStroke(modifiers: 0x01, usage: 0x07)),
+            try XCTUnwrap(USBKeyboardStroke(modifiers: 0x04, usage: 0x08))
+        ]
+
+        for layer: UInt8 in 1...3 {
+            for count in [1, 5] {
+                let slot: UInt8 = 3
+                let selectedStrokes = Array(strokes.prefix(count))
+                let header: [UInt8] = [slot, (layer << 4) | 1, UInt8(count)]
+                let expected = [padded([0x03, 0xa1, layer])]
+                    + [padded([0x03] + header + [0, selectedStrokes[0].modifiers, 0])]
+                    + selectedStrokes.enumerated().map { index, stroke in
+                        padded([0x03] + header + [UInt8(index + 1), stroke.modifiers, stroke.usage])
+                    }
+                    + [padded([0x03, 0xaa, 0xaa])]
+
+                let reports = try ReportID3KeyboardEncoder.encode(
+                    slot: slot, layer: layer, strokes: selectedStrokes)
+
+                XCTAssertEqual(reports, expected, "layer \(layer), count \(count)")
+                XCTAssertEqual(reports.count, count + 3)
+                XCTAssertTrue(reports.allSatisfy { $0.count == 65 })
+            }
+        }
+    }
+
+    func testConsumerControlGoldenPacketsCoverEveryCodeAndSourceLayer() throws {
+        XCTAssertNil(ReportID3ConsumerControlCode(rawValue: 0x00))
+        XCTAssertNil(ReportID3ConsumerControlCode(rawValue: 0xff))
+
+        for layer: UInt8 in 1...3 {
+            for code in ReportID3ConsumerControlCode.allCases {
+                let reports = try ReportID3KeyboardEncoder.encodeConsumerControl(
+                    slot: 14, layer: layer, code: code)
+                XCTAssertEqual(reports, [
+                    padded([0x03, 0xa1, layer]),
+                    padded([0x03, 14, (layer << 4) | 2, code.rawValue, 0]),
+                    padded([0x03, 0xaa, 0xaa])
+                ], "layer \(layer), code \(code)")
+                XCTAssertEqual(reports.count, 3)
+                XCTAssertTrue(reports.allSatisfy { $0.count == 65 })
+            }
+        }
+    }
+
+    func testMouseGoldenPacketsCoverButtonsWheelModifiersAndSourceLayers() throws {
+        XCTAssertNil(ReportID3MouseWheelDirection(rawValue: 0x00))
+        XCTAssertNil(ReportID3MouseWheelDirection(rawValue: 0x02))
+        let wheelDirections: [ReportID3MouseWheelDirection?] = [nil, .up, .down]
+
+        for layer: UInt8 in 1...3 {
+            for buttonMask: UInt8 in 0...7 {
+                for wheel in wheelDirections {
+                    if buttonMask == 0 && wheel == nil { continue }
+                    for modifierMask: UInt8 in 0...7 {
+                        let buttons = ReportID3MouseButtons(rawValue: buttonMask)
+                        let modifiers = ReportID3MouseModifiers(rawValue: modifierMask)
+                        let reports = try ReportID3KeyboardEncoder.encodeMouse(
+                            slot: 15,
+                            layer: layer,
+                            buttons: buttons,
+                            wheel: wheel,
+                            modifiers: modifiers
+                        )
+                        XCTAssertEqual(reports, [
+                            padded([0x03, 0xa1, layer]),
+                            padded([
+                                0x03, 15, (layer << 4) | 3,
+                                buttonMask, 0, 0, wheel?.rawValue ?? 0, modifierMask
+                            ]),
+                            padded([0x03, 0xaa, 0xaa])
+                        ], "layer \(layer), buttons \(buttonMask), wheel \(String(describing: wheel)), modifiers \(modifierMask)")
+                        XCTAssertEqual(reports.count, 3)
+                        XCTAssertTrue(reports.allSatisfy { $0.count == 65 })
+                    }
+                }
+            }
+        }
+    }
+
+    func testEncoderRejectsInvalidFamilyBoundsAndMalformedMouseState() throws {
+        let plain = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: 0x04))
+        for layer: UInt8 in [0, 4] {
+            XCTAssertThrowsError(try ReportID3KeyboardEncoder.encode(
+                slot: 1, layer: layer, strokes: [plain])) { error in
+                XCTAssertEqual(error as? ReportID3EncodingError, .unsupportedLayer)
+            }
+            XCTAssertThrowsError(try ReportID3KeyboardEncoder.encodeConsumerControl(
+                slot: 1, layer: layer, code: .playPause)) { error in
+                XCTAssertEqual(error as? ReportID3EncodingError, .unsupportedLayer)
+            }
+            XCTAssertThrowsError(try ReportID3KeyboardEncoder.encodeMouse(
+                slot: 1, layer: layer, buttons: .left)) { error in
+                XCTAssertEqual(error as? ReportID3EncodingError, .unsupportedLayer)
+            }
+        }
+        for slot: UInt8 in [0, 7, 12, 16] {
+            XCTAssertThrowsError(try ReportID3KeyboardEncoder.encodeConsumerControl(
+                slot: slot, layer: 1, code: .playPause)) { error in
+                XCTAssertEqual(error as? ReportID3EncodingError, .unsupportedSlot)
+            }
+            XCTAssertThrowsError(try ReportID3KeyboardEncoder.encodeMouse(
+                slot: slot, layer: 1, buttons: .left)) { error in
+                XCTAssertEqual(error as? ReportID3EncodingError, .unsupportedSlot)
+            }
+        }
+
+        XCTAssertThrowsError(try ReportID3KeyboardEncoder.encodeMouse(
+            slot: 1,
+            layer: 1,
+            buttons: ReportID3MouseButtons(rawValue: 0x08)
+        )) { error in
+            XCTAssertEqual(error as? ReportID3EncodingError, .invalidMouseButtons)
+        }
+        XCTAssertThrowsError(try ReportID3KeyboardEncoder.encodeMouse(
+            slot: 1,
+            layer: 1,
+            buttons: .left,
+            modifiers: ReportID3MouseModifiers(rawValue: 0x08)
+        )) { error in
+            XCTAssertEqual(error as? ReportID3EncodingError, .invalidMouseModifiers)
+        }
+        XCTAssertThrowsError(try ReportID3KeyboardEncoder.encodeMouse(
+            slot: 1,
+            layer: 1,
+            buttons: [],
+            modifiers: .control
+        )) { error in
+            XCTAssertEqual(error as? ReportID3EncodingError, .emptyMouseOperation)
+        }
+    }
+
+    func testEncoderOnlyFamiliesAndLayersRemainOutsideTransportAllowlist() async throws {
+        let plain = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: 0x1b))
+        let encoderOnlyVectors = [
+            try ReportID3KeyboardEncoder.encodeConsumerControl(
+                slot: 1, layer: 1, code: .playPause),
+            try ReportID3KeyboardEncoder.encodeMouse(slot: 1, layer: 1, buttons: .left),
+            try ReportID3KeyboardEncoder.encode(slot: 1, layer: 2, strokes: [plain]),
+            try ReportID3KeyboardEncoder.encode(slot: 1, layer: 3, strokes: [plain])
+        ]
+        for reports in encoderOnlyVectors {
+            let bytes = reports.flatMap { $0 }
+            // The production C transport invokes this checked allowlist before USB discovery.
+            let permitted = bytes.withUnsafeBufferPointer { buffer in
+                dd_usb_reports_permitted(buffer.baseAddress, reports.count, bytes.count)
+            }
+            XCTAssertEqual(permitted, 0)
+        }
+
+        // The service accepts typed keyboard requests only; treating a media
+        // code as a keyboard usage still fails its unchanged plain-key allowlist.
+        let recorder = TransportCallRecorder()
+        let service = KeyboardDeviceProgrammingService { bytes, count, _ in
+            recorder.record(bytes: bytes, count: count)
+            return DDUSBResult(status: DDUSB_SENT_UNVERIFIED, reports_accepted: count)
+        }
+        let mediaCodeAsKeyboardUsage = try XCTUnwrap(
+            USBKeyboardStroke(modifiers: 0, usage: ReportID3ConsumerControlCode.playPause.rawValue))
+        let result = await service.program(.init(
+            slot: 1, strokes: [mediaCodeAsKeyboardUsage], acceptsPersistentOverwrite: true))
+
+        XCTAssertEqual(result.outcome, .failed(
+            reason: "Unsupported slot and plain-usage assignment", reportsAccepted: 0))
+        XCTAssertEqual(recorder.count, 0)
     }
 
     func testEncoderKeepsModifierStateSeparateWithinBoundedSequence() throws {
