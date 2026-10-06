@@ -261,18 +261,61 @@ final class ActionRuntimeTests: XCTestCase {
             limits: ActionExecutionLimits(perActionTimeout: .seconds(1), sequenceDeadline: .milliseconds(20))
         )
         let sequence = try ActionSequence(steps: [
-            .pause(milliseconds: 100),
+            .action(.holdKeys(KeyboardChord(
+                key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: [.control, .option]
+            ))),
+            .pause(milliseconds: 1_000),
             .action(.zoom(.in)),
         ])
+        let startedAt = ContinuousClock.now
         let result = await executor.executeDialAction(
             .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange
         )
+        let elapsed = startedAt.duration(to: .now)
         XCTAssertEqual(result.outcome, .partialFailure(
             completedSteps: 1,
             failure: .sequenceDeadlineExceeded
         ))
+        XCTAssertLessThan(elapsed, .milliseconds(300), "Pause should stop at the sequence deadline")
         let intents = await service.intents
-        XCTAssertTrue(intents.isEmpty)
+        XCTAssertTrue(intents.contains(.keyboard(.up, .key(try XCTUnwrap(MacVirtualKeyCode(8))))))
+        XCTAssertTrue(intents.contains(.keyboard(.up, .modifier(.control))))
+        XCTAssertTrue(intents.contains(.keyboard(.up, .modifier(.option))))
+        XCTAssertFalse(intents.contains(.zoom(.in, steps: 1, application: nil)))
+    }
+
+    func testSequenceDeadlineBoundsServiceCallAndCleansHeldInputs() async throws {
+        let application = try XCTUnwrap(ApplicationBundleIdentifier("com.example.slow"))
+        let service = RecordingActionService(
+            delay: .seconds(1),
+            delayedIntent: .launchOrActivateApplication(application)
+        )
+        let executor = HostActionExecutor(
+            service: service,
+            limits: ActionExecutionLimits(perActionTimeout: .seconds(2), sequenceDeadline: .milliseconds(30))
+        )
+        let sequence = try ActionSequence(steps: [
+            .action(.holdKeys(KeyboardChord(
+                key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: [.control, .option]
+            ))),
+            .action(.openApplication(application)),
+        ])
+        let startedAt = ContinuousClock.now
+        let result = await executor.executeDialAction(
+            .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange
+        )
+        let elapsed = startedAt.duration(to: .now)
+
+        XCTAssertEqual(result.outcome, .partialFailure(
+            completedSteps: 1,
+            failure: .sequenceDeadlineExceeded
+        ))
+        XCTAssertLessThan(elapsed, .milliseconds(300), "Service action should be capped by remaining sequence time")
+        let intents = await service.intents
+        XCTAssertFalse(intents.contains(.launchOrActivateApplication(application)))
+        XCTAssertTrue(intents.contains(.keyboard(.up, .key(try XCTUnwrap(MacVirtualKeyCode(8))))))
+        XCTAssertTrue(intents.contains(.keyboard(.up, .modifier(.control))))
+        XCTAssertTrue(intents.contains(.keyboard(.up, .modifier(.option))))
     }
 
     func testRuntimeRoutesByForegroundButKeyUpUsesOriginalHeldAssignment() async throws {
@@ -280,7 +323,8 @@ final class ActionRuntimeTests: XCTestCase {
         let appChord = KeyboardChord(key: try XCTUnwrap(MacVirtualKeyCode(9)), modifiers: [.control, .option])
         let fixture = try makeConfiguration(
             defaultButton: .primitive(.holdKeys(defaultChord)),
-            appButton: .set(.primitive(.holdKeys(appChord)))
+            appButton: .set(.primitive(.holdKeys(appChord))),
+            modePress: .primitive(.nextDialMode)
         )
         let service = RecordingActionService()
         let foreground = MutableForeground()
@@ -317,6 +361,51 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertTrue(intents.contains(.keyboard(.up, .modifier(.option))))
         XCTAssertTrue(intents.contains(.keyboard(.down, .key(try XCTUnwrap(MacVirtualKeyCode(9))))))
         XCTAssertTrue(intents.contains(.keyboard(.up, .key(try XCTUnwrap(MacVirtualKeyCode(9))))))
+    }
+
+    func testStaleKeyRouteAfterStopDoesNotDispatchAndCleansPreviouslyOwnedInput() async throws {
+        let chord = KeyboardChord(key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: [.command])
+        let fixture = try makeConfiguration(defaultButton: .primitive(.holdKeys(chord)), appButton: .inherit)
+        let service = RecordingActionService()
+        let foreground = GatedForeground(value: nil)
+        let input = ManualInputProducer()
+        let firstKey = try key("fixture-button-1")
+        let pendingKey = try key("fixture-button-2")
+        let url = URL(fileURLWithPath: "/virtual/stale-route-\(UUID().uuidString).json")
+        let store = ConfigurationStore(primaryURL: url, fileAccess: MemoryConfigurationFiles())
+        try await store.save(fixture.configuration)
+        let runtime = ActionRuntime(
+            inputProducer: input,
+            capabilities: FixtureCapabilities(),
+            programmer: FixtureProgrammer(),
+            foregroundApplication: foreground,
+            controlMapping: FixtureMapping([firstKey: .button1, pendingKey: .button1]),
+            configurationStore: store,
+            actionService: service
+        )
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+        let down = try XCTUnwrap(NormalizedInputEvent.keyDown(control: firstKey, generation: generation))
+        await input.emit(down)
+        await foreground.pauseNext()
+
+        let pendingDown = try XCTUnwrap(NormalizedInputEvent.keyDown(control: pendingKey, generation: generation))
+        let routing = Task { await input.emit(pendingDown) }
+        await foreground.waitUntilEntered()
+        _ = await runtime.submit(.stop)
+        await foreground.resume()
+        await routing.value
+
+        let intents = await service.intents
+        let heldKey = try XCTUnwrap(MacVirtualKeyCode(8))
+        XCTAssertEqual(intents.filter { $0 == .keyboard(.down, .key(heldKey)) }.count, 1)
+        XCTAssertEqual(intents.filter { $0 == .keyboard(.up, .key(heldKey)) }.count, 1)
+        XCTAssertEqual(intents.filter { $0 == .keyboard(.down, .modifier(.command)) }.count, 1)
+        XCTAssertEqual(intents.filter { $0 == .keyboard(.up, .modifier(.command)) }.count, 1)
+        XCTAssertFalse(intents.contains(.keyboard(.down, .key(try XCTUnwrap(MacVirtualKeyCode(9))))))
+        let status = await runtime.currentStatus()
+        XCTAssertEqual(status, .idle)
     }
 
     func testInheritedApplicationButtonUsesDefaultAssignmentAndZoomTarget() async throws {
@@ -359,7 +448,11 @@ final class ActionRuntimeTests: XCTestCase {
     }
 
     func testDialPressPersistsOrderedModeAndRestoresAfterStoreReload() async throws {
-        let fixture = try makeConfiguration(defaultButton: .primitive(.doNothing), appButton: .inherit)
+        let fixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            modePress: .primitive(.nextDialMode)
+        )
         let files = MemoryConfigurationFiles()
         let url = URL(fileURLWithPath: "/virtual/action-runtime-\(UUID().uuidString).json")
         let store = ConfigurationStore(primaryURL: url, fileAccess: files)
@@ -396,6 +489,166 @@ final class ActionRuntimeTests: XCTestCase {
         try await runtime.installConfiguration(deletedSelection)
         let fallbackSnapshot = await runtime.currentSnapshot()
         XCTAssertEqual(fallbackSnapshot.selectedDialModeID, fixture.firstModeID)
+    }
+
+    func testDialPressExecutesSelectedModePressAction() async throws {
+        let shortcut = KeyboardChord(key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: [.command])
+        let actionFixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            modePress: .primitive(.keyboardShortcut(shortcut))
+        )
+        let service = RecordingActionService()
+        let input = ManualInputProducer()
+        let runtime = try await makeRuntime(
+            configuration: actionFixture.configuration,
+            service: service,
+            foreground: MutableForeground(),
+            input: input,
+            mapping: [:]
+        )
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+        let dial = try XCTUnwrap(PhysicalControlID(rawValue: "fixture-dial", kind: .dial))
+
+        let result = await runtime.dialPressed(control: dial, generation: generation)
+        XCTAssertEqual(result.outcome, .acceptedUnverified)
+        let actionSnapshot = await runtime.currentSnapshot()
+        XCTAssertEqual(actionSnapshot.selectedDialModeID, actionFixture.firstModeID)
+        let actionIntents = await service.intents
+        XCTAssertEqual(actionIntents, [
+            .keyboard(.down, .modifier(.command)),
+            .keyboard(.down, .key(try XCTUnwrap(MacVirtualKeyCode(8)))),
+            .keyboard(.up, .key(try XCTUnwrap(MacVirtualKeyCode(8)))),
+            .keyboard(.up, .modifier(.command)),
+        ])
+
+        let doNothingFixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            modePress: .primitive(.doNothing)
+        )
+        let noActionService = RecordingActionService()
+        let noActionInput = ManualInputProducer()
+        let noActionRuntime = try await makeRuntime(
+            configuration: doNothingFixture.configuration,
+            service: noActionService,
+            foreground: MutableForeground(),
+            input: noActionInput,
+            mapping: [:]
+        )
+        _ = await noActionRuntime.submit(.start)
+        let noActionGenerationValue = await noActionInput.currentGeneration
+        let noActionGeneration = try XCTUnwrap(noActionGenerationValue)
+        let noActionResult = await noActionRuntime.dialPressed(control: dial, generation: noActionGeneration)
+        XCTAssertEqual(noActionResult.outcome, .ignored)
+        let noActionIntents = await noActionService.intents
+        XCTAssertTrue(noActionIntents.isEmpty)
+
+        let heldPressFixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            modePress: .primitive(.holdKeys(shortcut))
+        )
+        let heldPressService = RecordingActionService()
+        let heldPressInput = ManualInputProducer()
+        let heldPressRuntime = try await makeRuntime(
+            configuration: heldPressFixture.configuration,
+            service: heldPressService,
+            foreground: MutableForeground(),
+            input: heldPressInput,
+            mapping: [:]
+        )
+        _ = await heldPressRuntime.submit(.start)
+        let heldPressGenerationValue = await heldPressInput.currentGeneration
+        let heldPressGeneration = try XCTUnwrap(heldPressGenerationValue)
+        let heldPressResult = await heldPressRuntime.dialPressed(control: dial, generation: heldPressGeneration)
+        XCTAssertEqual(heldPressResult.outcome, .failed(.unsupportedAction("Hold Keys requires a physical key press")))
+        let heldPressIntents = await heldPressService.intents
+        XCTAssertTrue(heldPressIntents.isEmpty)
+    }
+
+    func testDialRotationDoesNotPersistModeAfterEditingDuringForegroundLookup() async throws {
+        let fixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            clockwiseAction: .primitive(.nextDialMode)
+        )
+        let files = MemoryConfigurationFiles()
+        let url = URL(fileURLWithPath: "/virtual/stale-rotation-\(UUID().uuidString).json")
+        let store = ConfigurationStore(primaryURL: url, fileAccess: files)
+        try await store.save(fixture.configuration)
+        let foreground = GatedForeground(value: nil)
+        let input = ManualInputProducer()
+        let service = RecordingActionService()
+        let runtime = ActionRuntime(
+            inputProducer: input,
+            capabilities: FixtureCapabilities(),
+            programmer: FixtureProgrammer(),
+            foregroundApplication: foreground,
+            controlMapping: FixtureMapping([:]),
+            configurationStore: store,
+            actionService: service
+        )
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+        let dial = try XCTUnwrap(PhysicalControlID(rawValue: "fixture-dial", kind: .dial))
+        let rotation = try XCTUnwrap(NormalizedInputEvent.dialRotation(control: dial, delta: 1, generation: generation))
+        await foreground.pauseNext()
+
+        let routing = Task { await input.emit(rotation) }
+        await foreground.waitUntilEntered()
+        await runtime.setConfigurationEditing(true)
+        await foreground.resume()
+        await routing.value
+
+        let reloaded = try await ConfigurationStore(primaryURL: url, fileAccess: files).load()
+        XCTAssertEqual(reloaded.defaultProfile.selectedDialMode.id, fixture.firstModeID)
+        let intents = await service.intents
+        XCTAssertTrue(intents.isEmpty)
+    }
+
+    func testDialPressDoesNotPersistModeAfterStopDuringForegroundLookup() async throws {
+        let fixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            modePress: .primitive(.nextDialMode)
+        )
+        let files = MemoryConfigurationFiles()
+        let url = URL(fileURLWithPath: "/virtual/stale-dial-press-\(UUID().uuidString).json")
+        let store = ConfigurationStore(primaryURL: url, fileAccess: files)
+        try await store.save(fixture.configuration)
+        let foreground = GatedForeground(value: nil)
+        let input = ManualInputProducer()
+        let service = RecordingActionService()
+        let runtime = ActionRuntime(
+            inputProducer: input,
+            capabilities: FixtureCapabilities(),
+            programmer: FixtureProgrammer(),
+            foregroundApplication: foreground,
+            controlMapping: FixtureMapping([:]),
+            configurationStore: store,
+            actionService: service
+        )
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+        let dial = try XCTUnwrap(PhysicalControlID(rawValue: "fixture-dial", kind: .dial))
+        await foreground.pauseNext()
+
+        let pressing = Task { await runtime.dialPressed(control: dial, generation: generation) }
+        await foreground.waitUntilEntered()
+        _ = await runtime.submit(.stop)
+        await foreground.resume()
+        let result = await pressing.value
+
+        XCTAssertEqual(result.outcome, .ignored)
+        let reloaded = try await ConfigurationStore(primaryURL: url, fileAccess: files).load()
+        XCTAssertEqual(reloaded.defaultProfile.selectedDialMode.id, fixture.firstModeID)
+        let intents = await service.intents
+        XCTAssertTrue(intents.isEmpty)
     }
 
     func testPermissionLossStopsSessionAndReleasesHeldInputs() async throws {
@@ -517,7 +770,7 @@ final class ActionRuntimeTests: XCTestCase {
     private func makeRuntime(
         configuration: Configuration,
         service: RecordingActionService,
-        foreground: MutableForeground,
+        foreground: any ForegroundApplicationProviding,
         input: ManualInputProducer,
         mapping: [PhysicalControlID: ActionAssignmentTarget],
         capabilities: any DeviceCapabilityProviding = FixtureCapabilities()
@@ -539,7 +792,10 @@ final class ActionRuntimeTests: XCTestCase {
 
     private func makeConfiguration(
         defaultButton: ConfiguredAction,
-        appButton: ActionOverride
+        appButton: ActionOverride,
+        modePress: ConfiguredAction = .primitive(.doNothing),
+        clockwiseAction: ConfiguredAction = .primitive(.zoom(.in)),
+        counterclockwiseAction: ConfiguredAction = .primitive(.zoom(.out))
     ) throws -> (configuration: Configuration, firstModeID: DialModeID, secondModeID: DialModeID, appSecondModeID: DialModeID) {
         let defaultID = ProfileID()
         let appID = ProfileID()
@@ -551,9 +807,9 @@ final class ActionRuntimeTests: XCTestCase {
             DialMode(
                 id: id,
                 name: DisplayName(name)!,
-                counterclockwise: .primitive(.zoom(.out)),
-                clockwise: .primitive(.zoom(.in)),
-                press: .primitive(.doNothing)
+                counterclockwise: counterclockwiseAction,
+                clockwise: clockwiseAction,
+                press: modePress
             )
         }
         let defaultProfile = try Profile(
@@ -598,14 +854,20 @@ private actor RecordingActionService: HostActionServicing {
     private(set) var timestamps: [ContinuousClock.Instant] = []
     private let result: HostActionServiceResult
     private let delay: Duration
+    private let delayedIntent: HostActionIntent?
 
-    init(result: HostActionServiceResult = .acceptedUnverified, delay: Duration = .zero) {
+    init(
+        result: HostActionServiceResult = .acceptedUnverified,
+        delay: Duration = .zero,
+        delayedIntent: HostActionIntent? = nil
+    ) {
         self.result = result
         self.delay = delay
+        self.delayedIntent = delayedIntent
     }
 
     func perform(_ intent: HostActionIntent) async -> HostActionServiceResult {
-        if delay > .zero {
+        if delay > .zero && (delayedIntent == nil || delayedIntent == intent) {
             do { try await Task.sleep(for: delay) } catch { return .failed(reason: "cancelled by timeout fixture") }
         }
         intents.append(intent)
@@ -618,6 +880,45 @@ private actor MutableForeground: ForegroundApplicationProviding {
     private var value: ApplicationBundleIdentifier?
     func foregroundBundleIdentifier() async -> ApplicationBundleIdentifier? { value }
     func set(_ value: ApplicationBundleIdentifier?) { self.value = value }
+}
+
+private actor GatedForeground: ForegroundApplicationProviding {
+    private let value: ApplicationBundleIdentifier?
+    private var pauseNextLookup = false
+    private var lookupIsWaiting = false
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var resumeContinuation: CheckedContinuation<Void, Never>?
+
+    init(value: ApplicationBundleIdentifier?) {
+        self.value = value
+    }
+
+    func pauseNext() {
+        pauseNextLookup = true
+    }
+
+    func waitUntilEntered() async {
+        if lookupIsWaiting { return }
+        await withCheckedContinuation { enteredContinuation = $0 }
+    }
+
+    func resume() {
+        resumeContinuation?.resume()
+        resumeContinuation = nil
+    }
+
+    func foregroundBundleIdentifier() async -> ApplicationBundleIdentifier? {
+        guard pauseNextLookup else { return value }
+        pauseNextLookup = false
+        lookupIsWaiting = true
+        await withCheckedContinuation { continuation in
+            resumeContinuation = continuation
+            enteredContinuation?.resume()
+            enteredContinuation = nil
+        }
+        lookupIsWaiting = false
+        return value
+    }
 }
 
 private actor MutableCapabilities: DeviceCapabilityProviding {

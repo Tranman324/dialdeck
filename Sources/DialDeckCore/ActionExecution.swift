@@ -333,7 +333,7 @@ public actor HostActionExecutor {
             let owner = ActionOwner.physical(control, generation)
             presses[control] = PressState(owner: owner)
             if case let .primitive(.holdKeys(chord)) = action {
-                if let failure = await acquire(chord, owner: owner) {
+                if let failure = await acquire(chord, owner: owner, sequenceDeadline: nil) {
                     let cleanup = await release(owner)
                     outcome = cleanup.first.map(ActionExecutionOutcome.failed) ?? .failed(failure)
                 } else {
@@ -462,6 +462,7 @@ public actor HostActionExecutor {
                 profileID: profileID,
                 dialMagnitude: dialMagnitude,
                 application: application,
+                sequenceDeadline: nil,
                 advanceMode: advanceMode
             )
             if let failure {
@@ -488,6 +489,7 @@ public actor HostActionExecutor {
         advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult
     ) async -> RunResult {
         let start = ContinuousClock.now
+        let deadline = start.advanced(by: limits.sequenceDeadline)
         let owner = ActionOwner.sequence(UUID())
         var completedSteps = 0
         var failure: ActionExecutionFailure?
@@ -498,15 +500,24 @@ public actor HostActionExecutor {
                 failure = .cancelled
                 break
             }
-            guard start.duration(to: .now) < limits.sequenceDeadline else {
+            guard ContinuousClock.now < deadline else {
                 failure = .sequenceDeadlineExceeded
                 break
             }
             switch step {
             case .pause(let milliseconds):
+                let remaining = ContinuousClock.now.duration(to: deadline)
+                guard remaining > .zero else {
+                    failure = .sequenceDeadlineExceeded
+                    break
+                }
                 do {
-                    try await Task.sleep(for: .milliseconds(milliseconds))
-                    completedSteps += 1
+                    try await Task.sleep(for: min(.milliseconds(milliseconds), remaining))
+                    if ContinuousClock.now >= deadline {
+                        failure = .sequenceDeadlineExceeded
+                    } else {
+                        completedSteps += 1
+                    }
                 } catch {
                     failure = .cancelled
                 }
@@ -524,7 +535,7 @@ public actor HostActionExecutor {
                         failure = advanceFailure
                     }
                     if failure != nil { break }
-                    if start.duration(to: .now) >= limits.sequenceDeadline {
+                    if ContinuousClock.now >= deadline {
                         failure = .sequenceDeadlineExceeded
                         break
                     }
@@ -538,13 +549,14 @@ public actor HostActionExecutor {
                     profileID: profileID,
                     dialMagnitude: dialMagnitude,
                     application: application,
+                    sequenceDeadline: deadline,
                     advanceMode: advanceMode
                 )
                 if failure != nil { break }
                 completedSteps += 1
             }
             if failure != nil { break }
-            if start.duration(to: .now) >= limits.sequenceDeadline {
+            if ContinuousClock.now >= deadline {
                 failure = .sequenceDeadlineExceeded
                 break
             }
@@ -564,42 +576,50 @@ public actor HostActionExecutor {
         profileID: ProfileID,
         dialMagnitude: Int,
         application: ApplicationBundleIdentifier?,
+        sequenceDeadline: ContinuousClock.Instant?,
         advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult
     ) async -> ActionExecutionFailure? {
         switch action {
         case .doNothing:
             return nil
         case .keyboardShortcut(let chord):
-            return await tap(chord, owner: ActionOwner.chord(UUID()))
+            return await tap(chord, owner: ActionOwner.chord(UUID()), sequenceDeadline: sequenceDeadline)
         case .holdKeys(let chord):
             guard inSequence else { return .unsupportedAction("Hold Keys requires a physical key press") }
-            return await acquire(chord, owner: owner)
+            return await acquire(chord, owner: owner, sequenceDeadline: sequenceDeadline)
         case .openApplication(let bundleID):
-            return await perform(.launchOrActivateApplication(bundleID))
+            return await perform(.launchOrActivateApplication(bundleID), sequenceDeadline: sequenceDeadline)
         case .runAppleShortcut(let name):
-            return await perform(.runAppleShortcut(name))
+            return await perform(.runAppleShortcut(name), sequenceDeadline: sequenceDeadline)
         case .clipboardManagerShortcut(let chord):
-            return await perform(.clipboardManagerShortcut(chord))
+            return await perform(.clipboardManagerShortcut(chord), sequenceDeadline: sequenceDeadline)
         case .scroll(let axis, let speed):
-            return await perform(.scroll(axis: axis, detents: dialMagnitude, speed: speed))
+            return await perform(
+                .scroll(axis: axis, detents: dialMagnitude, speed: speed),
+                sequenceDeadline: sequenceDeadline
+            )
         case .zoom(let direction):
             return await perform(.zoom(
                 direction,
                 steps: max(1, abs(dialMagnitude)),
                 application: application
-            ))
+            ), sequenceDeadline: sequenceDeadline)
         case .nextDialMode:
             if case .failed(let failure) = await advanceMode(profileID) { return failure }
             return .unsupportedAction("Mode advance must be handled by the router")
         }
     }
 
-    private func tap(_ chord: KeyboardChord, owner: ActionOwner) async -> ActionExecutionFailure? {
-        if let failure = await acquireModifiers(chord.modifiers, owner: owner) {
+    private func tap(
+        _ chord: KeyboardChord,
+        owner: ActionOwner,
+        sequenceDeadline: ContinuousClock.Instant?
+    ) async -> ActionExecutionFailure? {
+        if let failure = await acquireModifiers(chord.modifiers, owner: owner, sequenceDeadline: sequenceDeadline) {
             let cleanup = await release(owner)
             return cleanup.first ?? failure
         }
-        if let failure = await acquireKey(chord.key, owner: owner) {
+        if let failure = await acquireKey(chord.key, owner: owner, sequenceDeadline: sequenceDeadline) {
             let cleanup = await release(owner)
             return cleanup.first ?? failure
         }
@@ -608,20 +628,30 @@ public actor HostActionExecutor {
         return release ?? modifierRelease
     }
 
-    private func acquire(_ chord: KeyboardChord, owner: ActionOwner) async -> ActionExecutionFailure? {
-        if let failure = await acquireModifiers(chord.modifiers, owner: owner) { return failure }
-        return await acquireKey(chord.key, owner: owner)
+    private func acquire(
+        _ chord: KeyboardChord,
+        owner: ActionOwner,
+        sequenceDeadline: ContinuousClock.Instant?
+    ) async -> ActionExecutionFailure? {
+        if let failure = await acquireModifiers(chord.modifiers, owner: owner, sequenceDeadline: sequenceDeadline) {
+            return failure
+        }
+        return await acquireKey(chord.key, owner: owner, sequenceDeadline: sequenceDeadline)
     }
 
     private func acquireModifiers(
         _ modifiers: Set<KeyboardModifier>,
-        owner: ActionOwner
+        owner: ActionOwner,
+        sequenceDeadline: ContinuousClock.Instant?
     ) async -> ActionExecutionFailure? {
         for modifier in modifiers.sorted(by: { $0.rawValue < $1.rawValue }) {
             var owners = modifierOwners[modifier, default: []]
             if owners.contains(owner) { continue }
             if owners.isEmpty {
-                if let failure = await perform(.keyboard(.down, .modifier(modifier))) { return failure }
+                if let failure = await perform(
+                    .keyboard(.down, .modifier(modifier)),
+                    sequenceDeadline: sequenceDeadline
+                ) { return failure }
             }
             owners.insert(owner)
             modifierOwners[modifier] = owners
@@ -629,11 +659,18 @@ public actor HostActionExecutor {
         return nil
     }
 
-    private func acquireKey(_ key: MacVirtualKeyCode, owner: ActionOwner) async -> ActionExecutionFailure? {
+    private func acquireKey(
+        _ key: MacVirtualKeyCode,
+        owner: ActionOwner,
+        sequenceDeadline: ContinuousClock.Instant?
+    ) async -> ActionExecutionFailure? {
         var owners = keyOwners[key, default: []]
         if owners.contains(owner) { return nil }
         if owners.isEmpty {
-            if let failure = await perform(.keyboard(.down, .key(key))) { return failure }
+            if let failure = await perform(
+                .keyboard(.down, .key(key)),
+                sequenceDeadline: sequenceDeadline
+            ) { return failure }
         }
         owners.insert(owner)
         keyOwners[key] = owners
@@ -699,19 +736,32 @@ public actor HostActionExecutor {
         return failures
     }
 
-    private func perform(_ intent: HostActionIntent) async -> ActionExecutionFailure? {
+    private func perform(
+        _ intent: HostActionIntent,
+        sequenceDeadline: ContinuousClock.Instant? = nil
+    ) async -> ActionExecutionFailure? {
+        var timeout = limits.perActionTimeout
+        var timeoutFailure: ActionExecutionFailure = .actionTimedOut
+        if let sequenceDeadline {
+            let remaining = ContinuousClock.now.duration(to: sequenceDeadline)
+            guard remaining > .zero else { return .sequenceDeadlineExceeded }
+            if remaining <= timeout {
+                timeout = remaining
+                timeoutFailure = .sequenceDeadlineExceeded
+            }
+        }
         let race = TimeoutRace<HostActionServiceResult>()
         let timed: TimedValue<HostActionServiceResult> = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 race.begin(continuation)
-                race.start(timeout: limits.perActionTimeout) { await self.service.perform(intent) }
+                race.start(timeout: timeout) { await self.service.perform(intent) }
             }
         } onCancel: {
             race.cancel()
         }
         switch timed {
         case .timedOut:
-            return .actionTimedOut
+            return timeoutFailure
         case .cancelled:
             return .cancelled
         case .value(.acceptedUnverified):

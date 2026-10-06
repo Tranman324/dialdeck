@@ -38,6 +38,11 @@ public struct ActionRuntimeSnapshot: Equatable, Sendable {
 /// Host-side action router. All input and OS-facing behavior is injected, and
 /// configuration changes are persisted through the accepted store actor.
 public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, RuntimeStatusProviding {
+    private struct RoutePermit: Sendable {
+        let generation: SessionGeneration
+        let revision: UInt64
+    }
+
     private let inputProducer: any InputEventProducing
     private let capabilities: any DeviceCapabilityProviding
     private let programmer: any DeviceProgramming
@@ -56,6 +61,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     private var selectedDialModeID: DialModeID?
     private var lastActionResult: ActionExecutionResult?
     private let inputGate = AsyncActionGate()
+    private var routingRevision: UInt64 = 0
 
     public init(
         inputProducer: any InputEventProducing,
@@ -128,6 +134,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     }
 
     public func setConfigurationEditing(_ editing: Bool) async {
+        if isEditing != editing { routingRevision &+= 1 }
         isEditing = editing
         if editing {
             let failures = await executor.cancelAndRelease()
@@ -158,28 +165,31 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         guard control.kind == .dial else {
             return ActionExecutionResult(outcome: .failed(.invalidInput))
         }
-        guard generation == eventGeneration,
-              case .running(let runningGeneration) = status,
-              runningGeneration == eventGeneration else {
+        guard let permit = routePermit(for: eventGeneration) else {
             return ActionExecutionResult(outcome: .ignored)
         }
-        guard !isEditing else { return ActionExecutionResult(outcome: .ignored) }
         do {
             let config = try await loadConfigurationIfNeeded()
+            guard routeIsCurrent(permit) else { return ActionExecutionResult(outcome: .ignored) }
             let bundleID = await foregroundApplication.foregroundBundleIdentifier()
+            guard routeIsCurrent(permit) else { return ActionExecutionResult(outcome: .ignored) }
             let profile = ProfileActionResolver.profileForRouting(
                 bundleIdentifier: bundleID,
                 in: config
             )
             updateRoute(bundleID: bundleID, profile: profile)
-            switch await advanceDialMode(for: profile.id) {
-            case .advanced(let modeID):
-                return ActionExecutionResult(outcome: .modeChanged(profileID: profile.id, modeID: modeID))
-            case .failed(let failure):
-                return ActionExecutionResult(outcome: .failed(failure))
-            }
+            guard routeIsCurrent(permit) else { return ActionExecutionResult(outcome: .ignored) }
+            let result = await executor.executeDialAction(
+                profile.selectedDialMode.press,
+                profileID: profile.id,
+                dialMagnitude: 1,
+                application: bundleID,
+                advanceMode: modeAdvanceHandler(for: permit)
+            )
+            return routeIsCurrent(permit) ? result : ActionExecutionResult(requestID: result.requestID, outcome: .ignored)
         } catch {
-            return ActionExecutionResult(outcome: .failed(.modePersistenceFailed(String(describing: error))))
+            guard routeIsCurrent(permit) else { return ActionExecutionResult(outcome: .ignored) }
+            return ActionExecutionResult(outcome: .failed(.modePersistenceFailed(RuntimeFailureText.sanitize(String(describing: error)))))
         }
     }
 
@@ -212,6 +222,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             status = .running(generation: eventGeneration)
         case .stopping(let eventGeneration):
             guard generation == eventGeneration else { return }
+            routingRevision &+= 1
             status = .stopping(generation: eventGeneration)
             let failures = await executor.cancelAndRelease()
             if let failure = failures.first {
@@ -219,6 +230,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             }
         case .stopped(let eventGeneration):
             guard generation == eventGeneration else { return }
+            routingRevision &+= 1
             generation = nil
             session = nil
             let failures = await executor.cancelAndRelease()
@@ -227,6 +239,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             } ?? .idle
         case .failed(let eventGeneration, let reason):
             guard generation == eventGeneration else { return }
+            routingRevision &+= 1
             generation = nil
             session = nil
             let failures = await executor.cancelAndRelease()
@@ -287,6 +300,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     private func stopSession() async {
         let stoppingGeneration = generation
         let oldSession = session
+        routingRevision &+= 1
         if let stoppingGeneration { status = .stopping(generation: stoppingGeneration) }
         generation = nil
         session = nil
@@ -317,13 +331,18 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     }
 
     private func routeKeyDown(_ event: NormalizedInputEvent) async {
+        guard let permit = routePermit(for: event.generation) else { return }
         guard let target = await controlMapping.actionTarget(for: event.control) else {
+            guard routeIsCurrent(permit) else { return }
             setActionResult(ActionExecutionResult(outcome: .ignored))
             return
         }
+        guard routeIsCurrent(permit) else { return }
         do {
             let config = try await loadConfigurationIfNeeded()
+            guard routeIsCurrent(permit) else { return }
             let bundleID = await foregroundApplication.foregroundBundleIdentifier()
+            guard routeIsCurrent(permit) else { return }
             let resolved = ProfileActionResolver.resolve(
                 bundleIdentifier: bundleID,
                 target: target,
@@ -336,16 +355,18 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             }
             let profile = config.profile(id: profileID) ?? config.defaultProfile
             updateRoute(bundleID: bundleID, profile: profile)
+            guard routeIsCurrent(permit) else { return }
             let result = await executor.keyDown(
                 control: event.control,
                 generation: event.generation,
                 action: resolved.action,
                 profileID: profileID,
                 application: bundleID,
-                advanceMode: modeAdvanceHandler()
+                advanceMode: modeAdvanceHandler(for: permit)
             )
             setActionResult(result)
         } catch {
+            guard routeIsCurrent(permit) else { return }
             setActionResult(ActionExecutionResult(outcome: .failed(
                 .modePersistenceFailed(RuntimeFailureText.sanitize("Configuration unavailable: \(error)"))
             )))
@@ -353,13 +374,16 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     }
 
     private func routeDialRotation(_ event: NormalizedInputEvent, delta: Int) async {
+        guard let permit = routePermit(for: event.generation) else { return }
         guard delta != 0, absSafely(delta) <= 100 else {
             if delta != 0 { setActionResult(ActionExecutionResult(outcome: .failed(.invalidInput))) }
             return
         }
         do {
             let config = try await loadConfigurationIfNeeded()
+            guard routeIsCurrent(permit) else { return }
             let bundleID = await foregroundApplication.foregroundBundleIdentifier()
+            guard routeIsCurrent(permit) else { return }
             let target: DialModeActionTarget = delta < 0 ? .counterclockwise : .clockwise
             let resolved = ProfileActionResolver.resolveDialModeAction(
                 bundleIdentifier: bundleID,
@@ -368,15 +392,17 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             )
             guard let profile = config.profile(id: resolved.profileID) else { return }
             updateRoute(bundleID: bundleID, profile: profile)
+            guard routeIsCurrent(permit) else { return }
             let result = await executor.executeDialAction(
                 resolved.action,
                 profileID: resolved.profileID,
                 dialMagnitude: delta,
                 application: bundleID,
-                advanceMode: modeAdvanceHandler()
+                advanceMode: modeAdvanceHandler(for: permit)
             )
             setActionResult(result)
         } catch {
+            guard routeIsCurrent(permit) else { return }
             setActionResult(ActionExecutionResult(outcome: .failed(
                 .modePersistenceFailed(RuntimeFailureText.sanitize("Configuration unavailable: \(error)"))
             )))
@@ -384,9 +410,14 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         _ = event
     }
 
-    private func advanceDialMode(for profileID: ProfileID) async -> DialModeAdvanceResult {
+    private func advanceDialMode(
+        for profileID: ProfileID,
+        permit: RoutePermit
+    ) async -> DialModeAdvanceResult {
+        guard routeIsCurrent(permit), !Task.isCancelled else { return .failed(.cancelled) }
         do {
             let config = try await loadConfigurationIfNeeded()
+            guard routeIsCurrent(permit), !Task.isCancelled else { return .failed(.cancelled) }
             guard let profile = config.profile(id: profileID), !profile.dialModes.isEmpty else {
                 return .failed(.modePersistenceFailed("The routed profile no longer exists"))
             }
@@ -394,7 +425,9 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             let currentIndex = profile.dialModes.firstIndex { $0.id == currentID } ?? 0
             let nextMode = profile.dialModes[(currentIndex + 1) % profile.dialModes.count]
             let updated = try config.rememberingDialMode(nextMode.id, for: profileID)
+            guard routeIsCurrent(permit), !Task.isCancelled else { return .failed(.cancelled) }
             try await configurationStore.save(updated)
+            guard routeIsCurrent(permit), !Task.isCancelled else { return .failed(.cancelled) }
             configuration = updated
             if activeProfileID == profileID { selectedDialModeID = nextMode.id }
             return .advanced(nextMode.id)
@@ -403,13 +436,30 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         }
     }
 
-    private func modeAdvanceHandler() -> @Sendable (ProfileID) async -> DialModeAdvanceResult {
+    private func modeAdvanceHandler(
+        for permit: RoutePermit
+    ) -> @Sendable (ProfileID) async -> DialModeAdvanceResult {
         { [weak self] profileID in
             guard let self else {
                 return .failed(.modePersistenceFailed("Runtime is no longer available"))
             }
-            return await self.advanceDialMode(for: profileID)
+            return await self.advanceDialMode(for: profileID, permit: permit)
         }
+    }
+
+    private func routePermit(for eventGeneration: SessionGeneration) -> RoutePermit? {
+        guard generation == eventGeneration,
+              case .running(let runningGeneration) = status,
+              runningGeneration == eventGeneration,
+              !isEditing else { return nil }
+        return RoutePermit(generation: eventGeneration, revision: routingRevision)
+    }
+
+    private func routeIsCurrent(_ permit: RoutePermit) -> Bool {
+        routingRevision == permit.revision
+            && generation == permit.generation
+            && !isEditing
+            && status == .running(generation: permit.generation)
     }
 
     private func loadConfigurationIfNeeded() async throws -> Configuration {
