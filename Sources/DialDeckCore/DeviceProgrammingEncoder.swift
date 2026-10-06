@@ -18,15 +18,18 @@ public enum ReportID3EncodingError: Error, Equatable, Sendable {
     case invalidSequenceLength
 }
 
-/// The packet layout is source-derived. Only slot 1, layer 1, one plain `x`
-/// has been observed changing behavior on this particular unit.
+/// The packet layout is source-derived. Its broader stroke sequences are
+/// offline-only; the transport separately restricts callable writes to the
+/// nine observed slot, layer, and plain-usage combinations.
 public enum ReportID3KeyboardEncoder {
     public static func encode(
         slot: UInt8,
         layer: UInt8,
         strokes: [USBKeyboardStroke]
     ) throws -> [[UInt8]] {
-        guard slot == 1 else { throw ReportID3EncodingError.unsupportedSlot }
+        guard (1...6).contains(slot) || (13...15).contains(slot) else {
+            throw ReportID3EncodingError.unsupportedSlot
+        }
         guard layer == 1 else { throw ReportID3EncodingError.unsupportedLayer }
         guard (1...5).contains(strokes.count) else {
             throw ReportID3EncodingError.invalidSequenceLength

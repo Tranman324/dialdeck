@@ -167,16 +167,28 @@ DDUSBResult dd_usb_send_reports(const uint8_t *reports, size_t report_count,
         report_bytes_length != report_count * 65) {
         result.status = DDUSB_TARGET_MISMATCH; return result;
     }
-    uint8_t expected_reports[4][65] = {{0}};
-    for (size_t i = 0; i < 4; ++i) expected_reports[i][0] = 3;
-    expected_reports[0][1] = 0xa1; expected_reports[0][2] = 1;
-    expected_reports[1][1] = 1; expected_reports[1][2] = 0x11;
-    expected_reports[1][3] = 1;
-    expected_reports[2][1] = 1; expected_reports[2][2] = 0x11;
-    expected_reports[2][3] = 1; expected_reports[2][4] = 1;
-    expected_reports[2][6] = 0x1b;
-    expected_reports[3][1] = 0xaa; expected_reports[3][2] = 0xaa;
-    if (memcmp(reports, expected_reports, sizeof(expected_reports)) != 0) {
+    static const uint8_t observed_slots[9] = {1,2,3,4,5,6,13,14,15};
+    static const uint8_t observed_usages[9] = {
+        0x1b,0x04,0x05,0x07,0x08,0x09,0x0a,0x0b,0x0d
+    };
+    int permitted = 0;
+    for (size_t candidate = 0; candidate < 9; ++candidate) {
+        uint8_t expected_reports[4][65] = {{0}};
+        for (size_t i = 0; i < 4; ++i) expected_reports[i][0] = 3;
+        expected_reports[0][1] = 0xa1; expected_reports[0][2] = 1;
+        expected_reports[1][1] = observed_slots[candidate];
+        expected_reports[1][2] = 0x11; expected_reports[1][3] = 1;
+        expected_reports[2][1] = observed_slots[candidate];
+        expected_reports[2][2] = 0x11; expected_reports[2][3] = 1;
+        expected_reports[2][4] = 1;
+        expected_reports[2][6] = observed_usages[candidate];
+        expected_reports[3][1] = 0xaa; expected_reports[3][2] = 0xaa;
+        if (memcmp(reports, expected_reports, sizeof(expected_reports)) == 0) {
+            permitted = 1;
+            break;
+        }
+    }
+    if (!permitted) {
         result.status = DDUSB_TARGET_MISMATCH; return result;
     }
     if (cancelled(token)) { result.status = DDUSB_CANCELLED; return result; }

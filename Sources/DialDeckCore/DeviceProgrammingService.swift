@@ -1,19 +1,22 @@
 import DialDeckUSB
 import Foundation
 
-/// A deliberate flash write to the observed bottom-left control (slot 1, layer 1).
+/// A deliberate layer-1 flash write to one observed protocol slot.
 /// The previous assignment cannot be read back or restored reliably.
 public struct KeyboardDeviceWriteRequest: Sendable {
     public let id: UUID
+    public let slot: UInt8
     public let strokes: [USBKeyboardStroke]
     public let acceptsPersistentOverwrite: Bool
 
     public init(
         id: UUID = UUID(),
+        slot: UInt8,
         strokes: [USBKeyboardStroke],
         acceptsPersistentOverwrite: Bool
     ) {
         self.id = id
+        self.slot = slot
         self.strokes = strokes
         self.acceptsPersistentOverwrite = acceptsPersistentOverwrite
     }
@@ -47,6 +50,10 @@ private final class USBWriteCancellation: @unchecked Sendable {
 /// calls from distinct service instances. Blocking USB calls run off the UI actor.
 public final class KeyboardDeviceProgrammingService: Sendable {
     private let queue = DispatchQueue(label: "DialDeck.deviceProgramming")
+    private static let observedUsages: [UInt8: UInt8] = [
+        1: 0x1b, 2: 0x04, 3: 0x05, 4: 0x07, 5: 0x08, 6: 0x09,
+        13: 0x0a, 14: 0x0b, 15: 0x0d
+    ]
 
     public init() {}
 
@@ -57,14 +64,16 @@ public final class KeyboardDeviceProgrammingService: Sendable {
         }
         guard request.strokes.count == 1,
               request.strokes[0].modifiers == 0,
-              request.strokes[0].usage == 0x1b else {
+              let observedUsage = Self.observedUsages[request.slot],
+              request.strokes[0].usage == observedUsage else {
             return .init(id: request.id, outcome: .failed(
-                reason: "Only the observed plain x assignment is enabled", reportsAccepted: 0))
+                reason: "Only observed slot and plain-usage assignments are enabled",
+                reportsAccepted: 0))
         }
         let reports: [[UInt8]]
         do {
             reports = try ReportID3KeyboardEncoder.encode(
-                slot: 1, layer: 1, strokes: request.strokes)
+                slot: request.slot, layer: 1, strokes: request.strokes)
         } catch {
             return .init(id: request.id, outcome: .failed(
                 reason: "Unsupported keyboard assignment", reportsAccepted: 0))

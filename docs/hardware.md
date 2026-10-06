@@ -4,13 +4,27 @@
 
 The user identified an upright keypad with a single knob above two columns of three keys. The connected USB unit had VID `0x1189`, PID `0x8890`, one configuration, and four interfaces. The configuration interface was interface 1: HID class/subclass/protocol `3/0/0`, one interrupt OUT endpoint `0x02` with a 64-byte max packet, and a 36-byte vendor-page HID descriptor. The descriptor defines Report ID 3 with 64 data bytes in each input and output report. Location ID is connection evidence, not a durable device identity; discovery does not pin a dock or port.
 
-A target-only capture of six keys and three knob actions in the original configuration found the same input pattern for every action. It did not establish independent control mapping. The one user-approved persistent experiment selected layer 1, programmed protocol slot 1 to one plain `x` keystroke, and sent a flash-save report. The USB host accepted four 65-byte reports. The user then reported that the **bottom-left key typed `x`**, and that it still typed `x` after one unplug/reconnect. That establishes this mapping and retention on this unit for that assignment, based on user-observed host behavior. Other slots, layers, knob behavior, lighting, and behavior across docks remain unverified.
+A target-only capture in the original configuration found the same input pattern for all six keys and three knob actions. Separate, explicitly approved writes assigned distinct plain letters to layer-1 protocol slots 1–6 and 13–15; the USB host accepted every report. The user reported the nine outputs persisted after one unplug/reconnect. A later target-only capture recorded a distinct USB keyboard usage with press and release for each of the nine gestures:
+
+| Upright physical control | Layer-1 slot | Plain key | USB keyboard usage |
+| --- | ---: | --- | ---: |
+| Top-left key | 3 | `b` | `0x05` |
+| Top-right key | 6 | `f` | `0x09` |
+| Middle-left key | 2 | `a` | `0x04` |
+| Middle-right key | 5 | `e` | `0x08` |
+| Bottom-left key | 1 | `x` | `0x1b` |
+| Bottom-right key | 4 | `d` | `0x07` |
+| Knob clockwise, one click | 15 | `j` | `0x0d` |
+| Knob counterclockwise, one click | 13 | `g` | `0x0a` |
+| Knob press | 14 | `h` | `0x0b` |
+
+This establishes the listed mappings and down/up transitions for that capture, not hold or burst behavior. Other layers, lighting, and behavior across docks remain unverified.
 
 ## Software boundary
 
-`ReportID3KeyboardEncoder` constructs source-derived Report ID 3 keyboard sequences of 1–5 USB HID keyboard usages. Those bytes are not macOS virtual key codes. Its broader vectors have not been physically verified. The callable USB transport currently accepts **only the exact observed slot-1/layer-1 plain `x` assignment**. Media, mouse, LED, other slots, other layers, other usages, and macros are unavailable through the transport. There is no configuration readback or verified restoration method.
+`ReportID3KeyboardEncoder` constructs source-derived Report ID 3 keyboard sequences of 1–5 USB HID keyboard usages. Those bytes are not macOS virtual key codes. Its broader vectors have not been physically verified. The callable USB transport accepts **only the nine exact slot/layer-1/plain-usage combinations in the table**, one at a time. Media, mouse, LED, other slots, other layers, other usages, and macros are unavailable through the transport. There is no configuration readback or verified restoration method.
 
-`KeyboardDeviceProgrammingService` requires an explicit `acceptsPersistentOverwrite` request field. The earlier user approval covered the completed single experiment; it does **not** authorize later invocations. Any app integration must obtain a fresh, specific user decision before invoking another persistent write. An accepted report sequence returns `sentUnverified`; it never asserts behavior or retention. A rejected/short report stops the sequence before later reports or flash save. A failed or interrupted save leaves persistence unknown. The async caller waits for the synchronous C operation and teardown before receiving a result, even after cancellation. Waiting for the process-wide operation lock and each next report is cancellation-aware. A cancellation signal between the pre-write check and `interrupt_transfer` may still allow that transfer to begin; a completed save is reported as sent if cancellation arrives during that last transfer.
+`KeyboardDeviceProgrammingService` requires an explicit slot and `acceptsPersistentOverwrite` request field. The earlier user approvals covered only the completed experiments; they do **not** authorize later invocations. Any app integration must obtain a fresh, specific user decision before invoking another persistent write. An accepted report sequence returns `sentUnverified`; it never asserts behavior or retention. A rejected/short report stops the sequence before later reports or flash save. A failed or interrupted save leaves persistence unknown. The async caller waits for the synchronous C operation and teardown before receiving a result, even after cancellation. Waiting for the process-wide operation lock and each next report is cancellation-aware. A cancellation signal between the pre-write check and `interrupt_transfer` may still allow that transfer to begin; a completed save is reported as sent if cancellation arrives during that last transfer.
 
 The C transport holds one process-wide lock from discovery through release, so separate service instances cannot interleave report sequences. It rejects a report-buffer length mismatch before reading the buffer, re-enumerates for exactly one matching VID/PID unit, validates its four-interface topology, opens that same device, claims interface 1, and checks the full Report ID 3 descriptor again on the open handle before output. All reports go only to endpoint `0x02`. It never switches to an unobserved fallback route. Same-ID, same-topology replacement hardware without serial identity remains indistinguishable.
 
@@ -18,4 +32,4 @@ The C bridge loads `libusb-1.0.dylib` at runtime from `/opt/homebrew/lib` or `/u
 
 ## Evidence and references
 
-The local sanitized evidence is in `.apm/evidence/hardware/config-interface-2026-10-06.md`, `.apm/evidence/hardware/one-slot-write-proposal-2026-10-06.md`, and `.apm/evidence/hardware/one-slot-write-2026-10-06.md` in the main checkout. Packet structure was informed by the [six-key protocol account](https://github.com/jgt87/Macropad/blob/main/custom/PROTOCOL.md) and a matching public V02.1.1 application release. External material is evidence, not a firmware specification or bundled dependency. The user-supplied executable, recovered source, and raw diagnostics are not included in this repository.
+The local sanitized evidence in the main checkout is `.apm/evidence/hardware/config-interface-2026-10-06.md`, `one-slot-write-2026-10-06.md`, `slots-2-6-write-2026-10-06.md`, `knob-slots-13-15-write-2026-10-06.md`, and `capture-2026-10-06-programmed-map.md`. Packet structure was informed by the [six-key protocol account](https://github.com/jgt87/Macropad/blob/main/custom/PROTOCOL.md) and a matching public V02.1.1 application release. External material is evidence, not a firmware specification or bundled dependency. The user-supplied executable, recovered source, and raw diagnostics are not included in this repository.
