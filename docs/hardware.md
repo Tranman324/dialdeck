@@ -1,48 +1,21 @@
-# Initial hardware findings
+# Hardware evidence and programming limits
 
-## Confirmed
+## Observed unit
 
-A user-identified Sinloon six-button keypad was detected by macOS with:
+The user identified an upright keypad with a single knob above two columns of three keys. The connected USB unit had VID `0x1189`, PID `0x8890`, one configuration, and four interfaces. The configuration interface was interface 1: HID class/subclass/protocol `3/0/0`, one interrupt OUT endpoint `0x02` with a 64-byte max packet, and a 36-byte vendor-page HID descriptor. The descriptor defines Report ID 3 with 64 data bytes in each input and output report. Location ID is connection evidence, not a durable device identity; discovery does not pin a dock or port.
 
-| Property | Observed value |
-| --- | --- |
-| USB vendor ID | `0x1189` |
-| USB product ID | `0x8890` |
-| Visible HID collections | Two keyboard devices and one mouse device |
-| Keyboard usage | Usage page 1, usage 6 |
-| Mouse usage | Usage page 1, usage 2 |
-| Product name | Not reported in the inspected device listing |
+A target-only capture of six keys and three knob actions in the original configuration found the same input pattern for every action. It did not establish independent control mapping. The one user-approved persistent experiment selected layer 1, programmed protocol slot 1 to one plain `x` keystroke, and sent a flash-save report. The USB host accepted four 65-byte reports. The user then reported that the **bottom-left key typed `x`**, and that it still typed `x` after one unplug/reconnect. That establishes this mapping and retention on this unit for that assignment, based on user-observed host behavior. Other slots, layers, knob behavior, lighting, and behavior across docks remain unverified.
 
-Read-only inspection used `ioreg`, `hidutil list`, and HID descriptor enumeration. No device settings were changed.
+## Software boundary
 
-These observations establish that macOS recognizes input interfaces; they do not establish full compatibility with a programming protocol.
+`ReportID3KeyboardEncoder` constructs source-derived Report ID 3 keyboard sequences of 1–5 USB HID keyboard usages. Those bytes are not macOS virtual key codes. Its broader vectors have not been physically verified. The callable USB transport currently accepts **only the exact observed slot-1/layer-1 plain `x` assignment**. Media, mouse, LED, other slots, other layers, other usages, and macros are unavailable through the transport. There is no configuration readback or verified restoration method.
 
-## Protocol investigation
+`KeyboardDeviceProgrammingService` requires an explicit `acceptsPersistentOverwrite` request field. The earlier user approval covered the completed single experiment; it does **not** authorize later invocations. Any app integration must obtain a fresh, specific user decision before invoking another persistent write. An accepted report sequence returns `sentUnverified`; it never asserts behavior or retention. A rejected/short report stops the sequence before later reports or flash save. A failed or interrupted save leaves persistence unknown. Cancellation is checked before each report; a completed save may still be reported as sent if cancellation arrives during that last synchronous transfer.
 
-Local analysis of the user-supplied Windows configuration application identified the same USB IDs and logic for keyboard, media, mouse, layer, and LED assignments. The application includes multiple report-ID paths, so firmware-specific details still require validation.
+The transport re-enumerates for exactly one matching VID/PID unit, validates its four-interface topology, opens that same device, claims interface 1, and checks the full Report ID 3 descriptor again on the open handle before output. All reports go only to endpoint `0x02`. It never switches to an unobserved fallback route. Same-ID, same-topology replacement hardware without serial identity remains indistinguishable.
 
-The vendor application labels controls 1–6 as the first six buttons and controls 13, 14, and 15 as the first dial's left, press, and right actions. These are software labels, not yet verified physical mappings for the connected unit.
+The C bridge loads `libusb-1.0.dylib` at runtime from `/opt/homebrew/lib` or `/usr/local/lib`. If neither exists, programming returns unavailable. The app does not bundle libusb; standalone distribution remains incomplete until the dependency and its license/packaging are addressed. No USB write was executed during implementation or compilation of this module.
 
-Vendor binaries, decompiled code, debug symbols, and extracted resources are intentionally not distributed in this repository. Any future implementation should contain original project code and clearly attributed, appropriately licensed dependencies.
+## Evidence and references
 
-## Remaining validation
-
-- Capture deliberate input from each physical control.
-- Determine whether default assignments are distinguishable.
-- Confirm report sizes, report IDs, and interface access behavior on this unit.
-- Verify whether exclusive capture prevents duplicate system actions.
-- If programming is required, validate a bounded change and persistence after reconnection.
-
-A device reporting the same USB IDs may have a different layout or firmware. USB IDs alone are insufficient to authorize configuration writes to arbitrary devices.
-
-## References
-
-These projects provide independent observations, not a compatibility guarantee or bundled dependencies:
-
-- [MINI-KeyBoard](https://github.com/philiporange/MINI-KeyBoard): describes macOS support for a related 12-key, two-dial variant.
-- [Macropad](https://github.com/jgt87/Macropad): describes a six-key, one-dial controller and configuration protocol.
-
-Relevant Apple APIs:
-
-- [IOHIDDeviceOpen](https://developer.apple.com/documentation/iokit/1588670-iohiddeviceopen): device access and exclusive capture.
-- [CGEvent](https://developer.apple.com/documentation/coregraphics/cgevent): keyboard and scroll event creation.
+The local sanitized evidence is in `.apm/evidence/hardware/config-interface-2026-10-06.md`, `.apm/evidence/hardware/one-slot-write-proposal-2026-10-06.md`, and `.apm/evidence/hardware/one-slot-write-2026-10-06.md` in the main checkout. Packet structure was informed by the [six-key protocol account](https://github.com/jgt87/Macropad/blob/main/custom/PROTOCOL.md) and a matching public V02.1.1 application release. External material is evidence, not a firmware specification or bundled dependency. The user-supplied executable, recovered source, and raw diagnostics are not included in this repository.

@@ -9,7 +9,8 @@ let package = Package(
         .executable(name: "DialDeckApp", targets: ["DialDeckApp"]),
     ],
     targets: [
-        .target(name: "DialDeckCore"),
+        .target(name: "DialDeckUSB", publicHeadersPath: "include"),
+        .target(name: "DialDeckCore", dependencies: ["DialDeckUSB"]),
         .executableTarget(name: "DialDeckApp", dependencies: ["DialDeckCore"]),
         .testTarget(name: "DialDeckCoreTests", dependencies: ["DialDeckCore"]),
     ]
