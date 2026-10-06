@@ -472,6 +472,34 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertNil(captured, "A denied request must not reach the hardware programmer")
     }
 
+    func testLightingCommandRejectsMismatchedResultIDAndPreservesAcceptedCount() async throws {
+        let fixture = try makeConfiguration(defaultButton: .primitive(.doNothing), appButton: .inherit)
+        let wrongID = UUID()
+        let runtime = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: RecordingActionService(),
+            foreground: MutableForeground(),
+            input: ManualInputProducer(),
+            mapping: [:],
+            lightingProgrammer: MismatchedLightingProgrammer(result: .init(
+                requestID: wrongID,
+                outcome: .sentUnverified(reportsAccepted: 2)
+            ))
+        )
+        let request = LightingProgrammingRequest(
+            mode: .mode1, acceptsPersistentOverwrite: true)
+
+        let completion = await runtime.submit(.programLighting(request))
+
+        XCTAssertEqual(completion, .lightingProgramming(.init(
+            requestID: request.requestID,
+            outcome: .failed(
+                reason: "Lighting service returned a mismatched request ID",
+                reportsAccepted: 2
+            )
+        )))
+    }
+
     func testSequenceDeadlineBoundsConfiguredPauses() async throws {
         let service = RecordingActionService()
         let executor = HostActionExecutor(
@@ -2097,6 +2125,14 @@ private actor RecordingLightingProgrammer: DeviceLightingProgramming {
     func programLighting(_ request: LightingProgrammingRequest) async -> LightingProgrammingResult {
         lastRequest = request
         return LightingProgrammingResult(requestID: request.requestID, outcome: outcome)
+    }
+}
+
+private struct MismatchedLightingProgrammer: DeviceLightingProgramming {
+    let result: LightingProgrammingResult
+
+    func programLighting(_ request: LightingProgrammingRequest) async -> LightingProgrammingResult {
+        result
     }
 }
 
