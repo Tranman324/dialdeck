@@ -9,6 +9,31 @@ final class DeviceProgrammingTests: XCTestCase {
         (13, 0x0a), (14, 0x0b), (15, 0x0d)
     ]
 
+    func testReadOnlyCapabilityCatalogContainsOnlyObservedUnitVectors() {
+        let capabilities = ObservedDeviceProgrammingCapabilities.observedUnit
+        let expected: [(ObservedDeviceControl, UInt8, UInt8)] = [
+            (.topLeftKey, 3, 0x05), (.topRightKey, 6, 0x09),
+            (.middleLeftKey, 2, 0x04), (.middleRightKey, 5, 0x08),
+            (.bottomLeftKey, 1, 0x1b), (.bottomRightKey, 4, 0x07),
+            (.knobClockwise, 15, 0x0d), (.knobCounterclockwise, 13, 0x0a),
+            (.knobPress, 14, 0x0b)
+        ]
+        XCTAssertEqual(capabilities.plainKeyVectors.count, 9)
+        XCTAssertEqual(Set(capabilities.plainKeyVectors.map(\.control)), Set(ObservedDeviceControl.allCases))
+        for (control, slot, usage) in expected {
+            XCTAssertEqual(capabilities.plainKeyVectors.filter {
+                $0.control == control && $0.layer == 1 && $0.slot == slot && $0.usage == usage
+            }.count, 1)
+            XCTAssertTrue(capabilities.containsPlainKeyVector(layer: 1, slot: slot, usage: usage))
+        }
+        XCTAssertFalse(capabilities.containsPlainKeyVector(layer: 2, slot: 1, usage: 0x1b))
+        XCTAssertFalse(capabilities.containsPlainKeyVector(layer: 1, slot: 7, usage: 0x1b))
+        XCTAssertFalse(capabilities.containsPlainKeyVector(layer: 1, slot: 1, usage: 0x04))
+        XCTAssertEqual(capabilities.lightingModes, [.mode1, .mode2])
+        XCTAssertTrue(capabilities.containsLightingMode(.mode1))
+        XCTAssertTrue(capabilities.containsLightingMode(.mode2))
+    }
+
     func testGoldenReportID3VectorsForNineObservedAssignments() throws {
         for (slot, usage) in observed {
             let stroke = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: usage))
