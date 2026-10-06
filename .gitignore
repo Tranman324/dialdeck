@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+.AppleDouble
+
+# Swift / Xcode
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Build and distribution artifacts
+build/
+dist/
+*.app/
+*.dmg
+*.pkg
+*.zip
+
+# Vendor artifacts and local analysis
+vendor/
+work/
+private/
+*.exe
+*.dll
+*.pdb
+*.decompiled.cs
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.mobileprovision
+*.log
