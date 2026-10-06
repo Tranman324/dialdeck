@@ -85,6 +85,12 @@ public final class KeyboardDeviceProgrammingService: Sendable {
     ]
     // One separately reviewed cross-dock validation candidate: slot 1 plain z.
     private static let stagedValidationUsages: [UInt8: Set<UInt8>] = [1: [0x1d]]
+    // Fixed F16-F24 proposal vectors. These do not change the observed catalog
+    // or the typed runtime request contract.
+    private static let proposedRemapUsages: [UInt8: UInt8] = [
+        1: 0x6b, 2: 0x6c, 3: 0x6d, 4: 0x6e, 5: 0x6f,
+        6: 0x70, 13: 0x71, 14: 0x72, 15: 0x73
+    ]
 
     public init() {
         transport = { bytes, count, token in
@@ -107,7 +113,8 @@ public final class KeyboardDeviceProgrammingService: Sendable {
         guard request.strokes.count == 1,
               request.strokes[0].modifiers == 0,
               (Self.observedUsages[request.slot] == request.strokes[0].usage ||
-               Self.stagedValidationUsages[request.slot]?.contains(request.strokes[0].usage) == true) else {
+               Self.stagedValidationUsages[request.slot]?.contains(request.strokes[0].usage) == true ||
+               Self.proposedRemapUsages[request.slot] == request.strokes[0].usage) else {
             return .init(id: request.id, outcome: .failed(
                 reason: "Unsupported slot and plain-usage assignment",
                 reportsAccepted: 0))

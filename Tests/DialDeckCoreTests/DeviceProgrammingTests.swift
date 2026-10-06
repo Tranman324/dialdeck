@@ -323,6 +323,56 @@ final class DeviceProgrammingTests: XCTestCase {
         }
     }
 
+    func testFKeyProposalAdmitsOnlyTheNineFixedServiceVectors() async throws {
+        let proposed: [(slot: UInt8, usage: UInt8)] = [
+            (1, 0x6b), (2, 0x6c), (3, 0x6d), (4, 0x6e), (5, 0x6f),
+            (6, 0x70), (13, 0x71), (14, 0x72), (15, 0x73)
+        ]
+        let recorder = TransportCallRecorder()
+        let service = KeyboardDeviceProgrammingService { bytes, count, _ in
+            recorder.record(bytes: bytes, count: count)
+            return DDUSBResult(status: DDUSB_SENT_UNVERIFIED, reports_accepted: count)
+        }
+
+        for (slot, usage) in proposed {
+            let stroke = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: usage))
+            let request = KeyboardDeviceWriteRequest(
+                slot: slot, strokes: [stroke], acceptsPersistentOverwrite: true)
+            let result = await service.program(request)
+            XCTAssertEqual(result.outcome, .sentUnverified(reportsAccepted: 4), "slot \(slot)")
+
+            let expected = expectedPlainAssignmentBytes(slot: slot, usage: usage)
+            XCTAssertEqual(recorder.lastBytes, expected, "slot \(slot)")
+            XCTAssertEqual(recorder.lastReportCount, 4, "slot \(slot)")
+            let permitted = expected.withUnsafeBufferPointer { buffer in
+                dd_usb_reports_permitted(buffer.baseAddress, 4, expected.count)
+            }
+            XCTAssertEqual(permitted, 1, "slot \(slot)")
+        }
+
+        let nearMisses: [(UInt8, UInt8, UInt8)] = [
+            (1, 0x6c, 0), // valid F17 usage assigned to the wrong slot
+            (2, 0x6b, 0), // valid F16 usage assigned to the wrong slot
+            (1, 0x6b, 1), // modifier added to an otherwise permitted vector
+            (7, 0x6b, 0), // a proposed usage assigned to an unlisted slot
+            (15, 0x74, 0) // usage following the fixed F24 range
+        ]
+        for (slot, usage, modifiers) in nearMisses {
+            let stroke = try XCTUnwrap(USBKeyboardStroke(modifiers: modifiers, usage: usage))
+            let result = await service.program(.init(
+                slot: slot, strokes: [stroke], acceptsPersistentOverwrite: true))
+            XCTAssertEqual(result.outcome, .failed(
+                reason: "Unsupported slot and plain-usage assignment", reportsAccepted: 0))
+
+            let encoded = rawAssignmentBytes(slot: slot, usage: usage, modifiers: modifiers)
+            let permitted = encoded.withUnsafeBufferPointer { buffer in
+                dd_usb_reports_permitted(buffer.baseAddress, 4, encoded.count)
+            }
+            XCTAssertEqual(permitted, 0, "slot \(slot), usage \(usage), modifiers \(modifiers)")
+        }
+        XCTAssertEqual(recorder.count, 9)
+    }
+
     func testServicePreservesIdentityAndReportsHostAcceptanceOnly() async throws {
         let recorder = TransportCallRecorder()
         let service = KeyboardDeviceProgrammingService { bytes, count, _ in
@@ -402,6 +452,44 @@ final class DeviceProgrammingTests: XCTestCase {
             dd_usb_reports_permitted(buffer.baseAddress, 4, unobservedPair.count)
         }
         XCTAssertEqual(permitted, 0)
+    }
+
+    func testPureValidatorAcceptsExactlyTheFKeyProposalPairsAndRejectsMutations() throws {
+        let proposed: [(slot: UInt8, usage: UInt8)] = [
+            (1, 0x6b), (2, 0x6c), (3, 0x6d), (4, 0x6e), (5, 0x6f),
+            (6, 0x70), (13, 0x71), (14, 0x72), (15, 0x73)
+        ]
+        for (slot, usage) in proposed {
+            let bytes = try encodedBytes(slot: slot, usage: usage)
+            let permitted = bytes.withUnsafeBufferPointer { buffer in
+                dd_usb_reports_permitted(buffer.baseAddress, 4, bytes.count)
+            }
+            XCTAssertEqual(permitted, 1, "slot \(slot), usage \(usage)")
+        }
+
+        let base = try encodedBytes(slot: 1, usage: 0x6b)
+        for (index, replacement) in [
+            (6, UInt8(0x6c)),   // nonzero layer-select padding
+            (70, UInt8(0x01)),  // nonzero assignment-header modifier
+            (135, UInt8(0x01)), // nonzero stroke modifier
+            (136, UInt8(0x6c)), // wrong usage for slot 1
+            (195, UInt8(0x00))  // malformed save report ID
+        ] {
+            var mutated = base
+            mutated[index] = replacement
+            let permitted = mutated.withUnsafeBufferPointer { buffer in
+                dd_usb_reports_permitted(buffer.baseAddress, 4, mutated.count)
+            }
+            XCTAssertEqual(permitted, 0, "byte offset \(index)")
+        }
+
+        for (slot, usage) in [(UInt8(1), UInt8(0x6c)), (UInt8(15), UInt8(0x74)), (UInt8(7), UInt8(0x6b))] {
+            let bytes = rawAssignmentBytes(slot: slot, usage: usage, modifiers: 0)
+            let permitted = bytes.withUnsafeBufferPointer { buffer in
+                dd_usb_reports_permitted(buffer.baseAddress, 4, bytes.count)
+            }
+            XCTAssertEqual(permitted, 0, "slot \(slot), usage \(usage)")
+        }
     }
 
     func testPureValidatorAcceptsBoundedModeTwoLightingSave() throws {
@@ -658,6 +746,15 @@ final class DeviceProgrammingTests: XCTestCase {
             padded([0x03, 0xa1, 0x01]),
             padded([0x03, slot, 0x11, 0x01, 0x00, 0x00, 0x00]),
             padded([0x03, slot, 0x11, 0x01, 0x01, 0x00, usage]),
+            padded([0x03, 0xaa, 0xaa])
+        ].flatMap { $0 }
+    }
+
+    private func rawAssignmentBytes(slot: UInt8, usage: UInt8, modifiers: UInt8) -> [UInt8] {
+        [
+            padded([0x03, 0xa1, 0x01]),
+            padded([0x03, slot, 0x11, 0x01, 0x00, modifiers, 0x00]),
+            padded([0x03, slot, 0x11, 0x01, 0x01, modifiers, usage]),
             padded([0x03, 0xaa, 0xaa])
         ].flatMap { $0 }
     }

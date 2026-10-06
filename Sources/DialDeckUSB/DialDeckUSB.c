@@ -185,6 +185,10 @@ int dd_usb_reports_permitted(const uint8_t *reports, size_t report_count,
     };
     static const uint8_t candidate_slot = 1;
     static const uint8_t candidate_usage = 0x1d;
+    static const uint8_t proposed_slots[9] = {1,2,3,4,5,6,13,14,15};
+    static const uint8_t proposed_usages[9] = {
+        0x6b,0x6c,0x6d,0x6e,0x6f,0x70,0x71,0x72,0x73
+    };
     for (size_t candidate = 0; candidate < 9; ++candidate) {
         uint8_t expected_reports[4][65] = {{0}};
         for (size_t i = 0; i < 4; ++i) expected_reports[i][0] = 3;
@@ -195,6 +199,19 @@ int dd_usb_reports_permitted(const uint8_t *reports, size_t report_count,
         expected_reports[2][2] = 0x11; expected_reports[2][3] = 1;
         expected_reports[2][4] = 1;
         expected_reports[2][6] = observed_usages[candidate];
+        expected_reports[3][1] = 0xaa; expected_reports[3][2] = 0xaa;
+        if (memcmp(reports, expected_reports, sizeof(expected_reports)) == 0) return 1;
+    }
+    for (size_t candidate = 0; candidate < 9; ++candidate) {
+        uint8_t expected_reports[4][65] = {{0}};
+        for (size_t i = 0; i < 4; ++i) expected_reports[i][0] = 3;
+        expected_reports[0][1] = 0xa1; expected_reports[0][2] = 1;
+        expected_reports[1][1] = proposed_slots[candidate];
+        expected_reports[1][2] = 0x11; expected_reports[1][3] = 1;
+        expected_reports[2][1] = proposed_slots[candidate];
+        expected_reports[2][2] = 0x11; expected_reports[2][3] = 1;
+        expected_reports[2][4] = 1;
+        expected_reports[2][6] = proposed_usages[candidate];
         expected_reports[3][1] = 0xaa; expected_reports[3][2] = 0xaa;
         if (memcmp(reports, expected_reports, sizeof(expected_reports)) == 0) return 1;
     }
