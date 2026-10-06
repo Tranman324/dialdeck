@@ -18,11 +18,11 @@ A target-only capture in the original configuration found the same input pattern
 | Knob counterclockwise, one click | 13 | `g` | `0x0a` |
 | Knob press | 14 | `h` | `0x0b` |
 
-This establishes the listed mappings and down/up transitions for that capture, not hold or burst behavior. Other layers, lighting, and behavior across docks remain unverified.
+This establishes the listed mappings and down/up transitions for that capture, not hold or burst behavior. Other layers and behavior across docks remain unverified. The separate lighting observation below covers only layer-1 mode 2.
 
 ## Software boundary
 
-`ReportID3KeyboardEncoder` constructs source-derived Report ID 3 keyboard sequences of 1–5 USB HID keyboard usages. Those bytes are not macOS virtual key codes. Its broader vectors have not been physically verified. The callable USB transport accepts **only the nine exact slot/layer-1/plain-usage combinations in the table**, one at a time, plus one fixed LED mode-2 candidate sequence. The [manufacturer guide](https://sikaicase.com/blogs/news/before-software-setting) describes LED mode 2 as a color gradient. This keypad's effect and persistence have not been observed; the transport labels acceptance `sentUnverified`. Media, mouse, other LED modes, other slots, other layers, other usages, and macros remain unavailable through the transport. There is no configuration readback or verified restoration method.
+`ReportID3KeyboardEncoder` constructs source-derived Report ID 3 keyboard sequences of 1–5 USB HID keyboard usages. Those bytes are not macOS virtual key codes. Its broader vectors have not been physically verified. The callable USB transport accepts **only the nine exact slot/layer-1/plain-usage combinations in the table**, one at a time, plus one fixed LED mode-2 sequence. The [manufacturer guide](https://sikaicase.com/blogs/news/before-software-setting) describes LED mode 2 as a color gradient. After the fixed mode-2 transfer was accepted, the User observed the keypad cycling green, purple, blue, yellow, red, and teal. Each color lights one key at a time: bottom-left, middle-left, top-left, bottom-right, middle-right, top-right. Pressing keys did not alter the sequence. The User observed the same sequence after one unplug/reconnect. The transport still labels transfer acceptance `sentUnverified`; software cannot itself verify the visible effect. Media, mouse, other LED modes, other slots, other layers, other usages, and macros remain unavailable through the transport. There is no configuration readback or verified restoration method.
 
 Static inspection of the user-supplied Windows app shows that its LED download flow sends a layer-select report before the mode report and the LED-specific save report. The bounded candidate sends exactly three 65-byte Report ID 3 reports on layer 1: `[03 a1 01]`, `[03 b0 18 02]`, and `[03 aa a1]`, with every remaining byte zero. The app source path is protocol evidence, not a physical result for this unit.
 
@@ -30,7 +30,7 @@ Static inspection of the user-supplied Windows app shows that its LED download f
 
 The C transport holds one process-wide lock from discovery through release, so separate service instances cannot interleave report sequences. It rejects a report-buffer length mismatch before reading the buffer, re-enumerates for exactly one matching VID/PID unit, validates its four-interface topology, opens that same device, claims interface 1, and checks the full Report ID 3 descriptor again on the open handle before output. All reports go only to endpoint `0x02`. It never switches to an unobserved fallback route. Same-ID, same-topology replacement hardware without serial identity remains indistinguishable.
 
-The C bridge loads `libusb-1.0.dylib` at runtime from `/opt/homebrew/lib` or `/usr/local/lib`. If neither exists, programming returns unavailable. The app does not bundle libusb; standalone distribution remains incomplete until the dependency and its license/packaging are addressed. No USB write was executed during implementation or compilation of this module.
+The C bridge loads `libusb-1.0.dylib` at runtime from `/opt/homebrew/lib` or `/usr/local/lib`. If neither exists, programming returns unavailable. The app does not bundle libusb; standalone distribution remains incomplete until the dependency and its license/packaging are addressed. The later, separately approved lighting write is recorded in `.apm/evidence/hardware/led-mode2-write-2026-10-06.md`.
 
 ## Evidence and references
 

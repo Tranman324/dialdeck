@@ -22,9 +22,8 @@ public struct KeyboardDeviceWriteRequest: Sendable {
     }
 }
 
-/// The vendor guide labels mode 2 as a color gradient. The effect has not yet
-/// been observed on this connected keypad; the narrow candidate exists for a
-/// bounded validation write only.
+/// The connected keypad was observed running a six-color sequence for mode 2,
+/// retained after one reconnect. Other lighting modes remain unverified.
 public enum DeviceLightingModeCandidate: UInt8, Sendable {
     case mode2 = 2
 }
