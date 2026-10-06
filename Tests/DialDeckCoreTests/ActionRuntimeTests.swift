@@ -16,7 +16,8 @@ final class ActionRuntimeTests: XCTestCase {
                 .primitive(.keyboardShortcut(chord)),
                 profileID: profileID,
                 dialMagnitude: 1,
-                advanceMode: noModeChange
+                advanceMode: noModeChange,
+                admissionRevision: 0
             )
             XCTAssertEqual(result.outcome, .acceptedUnverified)
         }
@@ -48,17 +49,19 @@ final class ActionRuntimeTests: XCTestCase {
             generation: generation,
             action: .primitive(.holdKeys(KeyboardChord(key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: modifiers))),
             profileID: profileID,
-            advanceMode: noModeChange
+            advanceMode: noModeChange,
+            admissionRevision: 0
         )
         _ = await executor.keyDown(
             control: secondControl,
             generation: generation,
             action: .primitive(.holdKeys(KeyboardChord(key: try XCTUnwrap(MacVirtualKeyCode(9)), modifiers: modifiers))),
             profileID: profileID,
-            advanceMode: noModeChange
+            advanceMode: noModeChange,
+            admissionRevision: 0
         )
 
-        let firstRelease = await executor.keyUp(control: firstControl, generation: generation)
+        let firstRelease = await executor.keyUp(control: firstControl, generation: generation, admissionRevision: 0)
         XCTAssertEqual(firstRelease.outcome, .acceptedUnverified)
         var intents = await service.intents
         XCTAssertEqual(count(.keyboard(.down, .modifier(.control)), in: intents), 1)
@@ -66,7 +69,7 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertFalse(intents.contains(.keyboard(.up, .modifier(.control))))
         XCTAssertFalse(intents.contains(.keyboard(.up, .modifier(.option))))
 
-        let secondRelease = await executor.keyUp(control: secondControl, generation: generation)
+        let secondRelease = await executor.keyUp(control: secondControl, generation: generation, admissionRevision: 0)
         XCTAssertEqual(secondRelease.outcome, .acceptedUnverified)
         intents = await service.intents
         XCTAssertEqual(count(.keyboard(.up, .modifier(.control)), in: intents), 1)
@@ -84,15 +87,15 @@ final class ActionRuntimeTests: XCTestCase {
             key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: [.command]
         )))
 
-        _ = await executor.keyDown(control: control, generation: generation, action: action, profileID: ProfileID(), advanceMode: noModeChange)
-        let duplicate = await executor.keyDown(control: control, generation: generation, action: action, profileID: ProfileID(), advanceMode: noModeChange)
+        _ = await executor.keyDown(control: control, generation: generation, action: action, profileID: ProfileID(), advanceMode: noModeChange, admissionRevision: 0)
+        let duplicate = await executor.keyDown(control: control, generation: generation, action: action, profileID: ProfileID(), advanceMode: noModeChange, admissionRevision: 0)
         XCTAssertEqual(duplicate.outcome, .ignored)
-        let staleUp = await executor.keyUp(control: control, generation: SessionGeneration(1))
+        let staleUp = await executor.keyUp(control: control, generation: SessionGeneration(1), admissionRevision: 0)
         XCTAssertEqual(staleUp.outcome, .ignored)
         let heldIntents = await service.intents
         XCTAssertEqual(count(.keyboard(.down, .modifier(.command)), in: heldIntents), 1)
 
-        _ = await executor.keyUp(control: control, generation: generation)
+        _ = await executor.keyUp(control: control, generation: generation, admissionRevision: 0)
         let finalIntents = await service.intents
         XCTAssertEqual(count(.keyboard(.up, .key(try XCTUnwrap(MacVirtualKeyCode(8)))), in: finalIntents), 1)
         XCTAssertEqual(count(.keyboard(.up, .modifier(.command)), in: finalIntents), 1)
@@ -114,7 +117,7 @@ final class ActionRuntimeTests: XCTestCase {
         ])
 
         let result = await executor.executeDialAction(
-            .sequence(sequence), profileID: ProfileID(), dialMagnitude: -2, advanceMode: noModeChange
+            .sequence(sequence), profileID: ProfileID(), dialMagnitude: -2, advanceMode: noModeChange, admissionRevision: 0
         )
         XCTAssertEqual(result.outcome, .acceptedUnverified)
         let intents = await service.intents
@@ -139,7 +142,7 @@ final class ActionRuntimeTests: XCTestCase {
         ])
 
         let result = await executor.executeDialAction(
-            .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange
+            .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange, admissionRevision: 0
         )
         XCTAssertEqual(result.outcome, .acceptedUnverified)
         let intents = await service.intents
@@ -158,11 +161,12 @@ final class ActionRuntimeTests: XCTestCase {
         ])
         let run = Task {
             await executor.executeDialAction(
-                .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange
+                .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1,
+                advanceMode: noModeChange, admissionRevision: 0
             )
         }
         try await Task.sleep(for: .milliseconds(30))
-        let cleanupFailures = await executor.cancelAndRelease()
+        let cleanupFailures = await executor.cancelAndRelease(floor: 0)
         XCTAssertTrue(cleanupFailures.isEmpty)
         let result = await run.value
         XCTAssertEqual(result.outcome, .cancelled)
@@ -173,6 +177,62 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertTrue(intents.contains(.keyboard(.up, .modifier(.option))))
     }
 
+    func testAdmissionFloorRejectsLateOldRevisionWhileCleanupWaitsForExecutorGate() async throws {
+        let service = RecordingActionService()
+        let advanceGate = CancellationHoldingModeAdvance()
+        let executor = HostActionExecutor(service: service)
+        let profileID = ProfileID()
+        let staleTarget = try XCTUnwrap(ApplicationBundleIdentifier("com.example.stale"))
+        let activeRequest = Task {
+            await executor.executeDialAction(
+                .primitive(.nextDialMode),
+                profileID: profileID,
+                dialMagnitude: 1,
+                advanceMode: { _ in await advanceGate.advance() },
+                admissionRevision: 7
+            )
+        }
+        let advanceStarted = await advanceGate.waitUntilStarted()
+        XCTAssertTrue(advanceStarted)
+
+        let cleanupCompleted = AsyncTestFlag()
+        let cleanup = Task {
+            let failures = await executor.cancelAndRelease(floor: 8)
+            await cleanupCompleted.mark()
+            return failures
+        }
+        let cancellationObserved = await advanceGate.waitUntilCancellationObserved()
+        XCTAssertTrue(cancellationObserved)
+
+        let staleCompleted = AsyncTestFlag()
+        let staleRequest = Task {
+            let result = await executor.executeDialAction(
+                .primitive(.openApplication(staleTarget)),
+                profileID: profileID,
+                dialMagnitude: 1,
+                advanceMode: noModeChange,
+                admissionRevision: 7
+            )
+            await staleCompleted.mark()
+            return result
+        }
+        try await Task.sleep(for: .milliseconds(40))
+        let staleWasRejectedBeforeGateRelease = await staleCompleted.isMarked
+        let cleanupReturnedBeforeGateRelease = await cleanupCompleted.isMarked
+
+        await advanceGate.releaseWithCancellation()
+        _ = await activeRequest.value
+        let staleResult = await staleRequest.value
+        let cleanupFailures = await cleanup.value
+        let intents = await service.intents
+
+        XCTAssertTrue(staleWasRejectedBeforeGateRelease, "An old revision must be rejected while cleanup still owns the executor gate")
+        XCTAssertFalse(cleanupReturnedBeforeGateRelease, "Cleanup must wait for the in-flight action to leave the gate")
+        XCTAssertEqual(staleResult.outcome, .ignored)
+        XCTAssertTrue(cleanupFailures.isEmpty)
+        XCTAssertTrue(intents.isEmpty, "The stale request must not call the injected service")
+    }
+
     func testTimedOutServiceReturnsTypedFailure() async throws {
         let service = RecordingActionService(delay: .seconds(1))
         let executor = HostActionExecutor(
@@ -181,7 +241,7 @@ final class ActionRuntimeTests: XCTestCase {
         )
         let result = await executor.executeDialAction(
             .primitive(.openApplication(try XCTUnwrap(ApplicationBundleIdentifier("com.example.timeout")))),
-            profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange
+            profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange, admissionRevision: 0
         )
         XCTAssertEqual(result.outcome, .failed(.actionTimedOut))
     }
@@ -195,7 +255,7 @@ final class ActionRuntimeTests: XCTestCase {
             .action(.openApplication(missingID)),
         ])
         let result = await executor.executeDialAction(
-            .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange
+            .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange, admissionRevision: 0
         )
         XCTAssertEqual(result.outcome, .partialFailure(
             completedSteps: 1,
@@ -208,7 +268,7 @@ final class ActionRuntimeTests: XCTestCase {
         let executor = HostActionExecutor(service: service)
         let result = await executor.executeDialAction(
             .primitive(.runAppleShortcut(try XCTUnwrap(AppleShortcutName("Fixture Shortcut")))),
-            profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange
+            profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange, admissionRevision: 0
         )
         XCTAssertEqual(result.outcome, .failed(.unsupportedAction("The action service does not support this target")))
     }
@@ -222,7 +282,8 @@ final class ActionRuntimeTests: XCTestCase {
             .primitive(.nextDialMode),
             profileID: profileID,
             dialMagnitude: 1,
-            advanceMode: { _ in .advanced(nextModeID) }
+            advanceMode: { _ in .advanced(nextModeID) },
+            admissionRevision: 0
         )
         XCTAssertEqual(result.outcome, .modeChanged(profileID: profileID, modeID: nextModeID))
         let intents = await service.intents
@@ -269,7 +330,7 @@ final class ActionRuntimeTests: XCTestCase {
         ])
         let startedAt = ContinuousClock.now
         let result = await executor.executeDialAction(
-            .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange
+            .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange, admissionRevision: 0
         )
         let elapsed = startedAt.duration(to: .now)
         XCTAssertEqual(result.outcome, .partialFailure(
@@ -302,7 +363,7 @@ final class ActionRuntimeTests: XCTestCase {
         ])
         let startedAt = ContinuousClock.now
         let result = await executor.executeDialAction(
-            .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange
+            .sequence(sequence), profileID: ProfileID(), dialMagnitude: 1, advanceMode: noModeChange, admissionRevision: 0
         )
         let elapsed = startedAt.duration(to: .now)
 
@@ -461,6 +522,89 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertEqual(files.primaryWriteCount, 2)
     }
 
+    func testExplicitStopDuringPrimaryCommitWaitsAndReportsCommittedMode() async throws {
+        let sequence = try ActionSequence(steps: [.action(.nextDialMode)])
+        let fixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            clockwiseAction: .sequence(sequence)
+        )
+        let files = GatedBackupConfigurationFiles()
+        let url = URL(fileURLWithPath: "/virtual/sequence-mode-explicit-cancel-\(UUID().uuidString).json")
+        let store = ConfigurationStore(primaryURL: url, fileAccess: files)
+        try await store.save(fixture.configuration)
+        files.blockNextPrimaryWrite()
+
+        let input = ManualInputProducer()
+        let runtime = ActionRuntime(
+            inputProducer: input,
+            capabilities: FixtureCapabilities(),
+            programmer: FixtureProgrammer(),
+            foregroundApplication: MutableForeground(),
+            controlMapping: FixtureMapping([:]),
+            configurationStore: store,
+            actionService: RecordingActionService(),
+            executionLimits: ActionExecutionLimits(
+                perActionTimeout: .seconds(1),
+                sequenceDeadline: .seconds(5)
+            )
+        )
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+        let dial = try XCTUnwrap(PhysicalControlID(rawValue: "fixture-dial", kind: .dial))
+        let rotation = try XCTUnwrap(NormalizedInputEvent.dialRotation(
+            control: dial,
+            delta: 1,
+            generation: generation
+        ))
+        let routeCompleted = AsyncTestFlag()
+        let routing = Task {
+            await input.emit(rotation)
+            await routeCompleted.mark()
+        }
+
+        guard files.waitForBlockedPrimaryWrite() else {
+            files.releaseBlockedPrimaryWrite()
+            XCTFail("Mode persistence should enter the gated primary replacement")
+            return
+        }
+
+        let stopCompleted = AsyncTestFlag()
+        let stopping = Task {
+            _ = await runtime.submit(.stop)
+            await stopCompleted.mark()
+        }
+        var observedStopping = false
+        for _ in 0..<100 {
+            if await runtime.currentStatus() == .stopping(generation: generation) {
+                observedStopping = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let stopReturnedBeforePrimaryRelease = await stopCompleted.isMarked
+        let routeReturnedBeforePrimaryRelease = await routeCompleted.isMarked
+        XCTAssertTrue(observedStopping, "Stop should reach executor cleanup while the primary write is gated")
+        XCTAssertFalse(stopReturnedBeforePrimaryRelease, "Cancellation cleanup must join the committed store write")
+        XCTAssertFalse(routeReturnedBeforePrimaryRelease, "The route must await the actual mode-advance result")
+
+        files.releaseBlockedPrimaryWrite()
+        await routing.value
+        await stopping.value
+        XCTAssertTrue(files.waitForBlockedPrimaryWriteToFinish())
+
+        let snapshot = await runtime.currentSnapshot()
+        XCTAssertEqual(snapshot.lastActionResult?.outcome, .modeChanged(
+            profileID: fixture.configuration.defaultProfileID,
+            modeID: fixture.secondModeID
+        ))
+        XCTAssertEqual(snapshot.selectedDialModeID, fixture.secondModeID)
+        let reloaded = try await ConfigurationStore(primaryURL: url, fileAccess: files).load()
+        XCTAssertEqual(reloaded.defaultProfile.selectedDialMode.id, fixture.secondModeID)
+        XCTAssertEqual(files.primaryWriteCount, 2)
+    }
+
     func testInstallConfigurationCancelsExecutorSequenceAndReleasesInputsBeforeReturning() async throws {
         try await assertConfigurationReplacementCancelsExecutorWork(reload: false)
     }
@@ -562,6 +706,52 @@ final class ActionRuntimeTests: XCTestCase {
 
     func testReloadConfigurationInvalidatesRouteWaitingForForeground() async throws {
         try await assertConfigurationReplacementInvalidatesRoute(reload: true)
+    }
+
+    func testInstallConfigurationRejectsKeyRoutePausedAfterPermitCheckBeforeExecutorAdmission() async throws {
+        let oldTarget = try XCTUnwrap(ApplicationBundleIdentifier("com.example.pre-replacement"))
+        let oldFixture = try makeConfiguration(
+            defaultButton: .primitive(.openApplication(oldTarget)),
+            appButton: .inherit
+        )
+        let newFixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit
+        )
+        let files = MemoryConfigurationFiles()
+        let store = ConfigurationStore(
+            primaryURL: URL(fileURLWithPath: "/virtual/route-admission-floor-\(UUID().uuidString).json"),
+            fileAccess: files
+        )
+        try await store.save(oldFixture.configuration)
+        let foreground = GatedForeground(value: nil)
+        let input = ManualInputProducer()
+        let service = RecordingActionService()
+        let key = try XCTUnwrap(PhysicalControlID(rawValue: "fixture-key-admission", kind: .key))
+        let runtime = ActionRuntime(
+            inputProducer: input,
+            capabilities: FixtureCapabilities(),
+            programmer: FixtureProgrammer(),
+            foregroundApplication: foreground,
+            controlMapping: FixtureMapping([key: .button1]),
+            configurationStore: store,
+            actionService: service
+        )
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+        let event = try XCTUnwrap(NormalizedInputEvent.keyDown(control: key, generation: generation))
+
+        await foreground.pauseNext()
+        let routing = Task { await runtime.consume(event) }
+        await foreground.waitUntilEntered()
+
+        try await runtime.installConfiguration(newFixture.configuration)
+        await foreground.resume()
+        await routing.value
+
+        let intents = await service.intents
+        XCTAssertTrue(intents.isEmpty, "A key route paused after its current-route check must not be admitted after replacement returns")
     }
 
     private func assertConfigurationReplacementInvalidatesRoute(reload: Bool) async throws {
@@ -1183,6 +1373,82 @@ private actor RecordingActionService: HostActionServicing {
         intents.append(intent)
         timestamps.append(.now)
         return result
+    }
+}
+
+private actor CancellationHoldingModeAdvance {
+    private var advanceContinuation: CheckedContinuation<DialModeAdvanceResult, Never>?
+    private var startedContinuation: CheckedContinuation<Bool, Never>?
+    private var cancellationContinuation: CheckedContinuation<Bool, Never>?
+    private var startedWatchdog: Task<Void, Never>?
+    private var cancellationWatchdog: Task<Void, Never>?
+    private var didStart = false
+    private var didObserveCancellation = false
+
+    func waitUntilStarted() async -> Bool {
+        if didStart { return true }
+        return await withCheckedContinuation { continuation in
+            startedContinuation = continuation
+            startedWatchdog = Task {
+                try? await Task.sleep(for: .seconds(3))
+                self.expireStartedWait()
+            }
+        }
+    }
+
+    func waitUntilCancellationObserved() async -> Bool {
+        if didObserveCancellation { return true }
+        return await withCheckedContinuation { continuation in
+            cancellationContinuation = continuation
+            cancellationWatchdog = Task {
+                try? await Task.sleep(for: .seconds(3))
+                self.expireCancellationWait()
+            }
+        }
+    }
+
+    func advance() async -> DialModeAdvanceResult {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                advanceContinuation = continuation
+                didStart = true
+                startedWatchdog?.cancel()
+                startedWatchdog = nil
+                startedContinuation?.resume(returning: true)
+                startedContinuation = nil
+            }
+        } onCancel: {
+            Task { await self.noteCancellation() }
+        }
+    }
+
+    func releaseWithCancellation() {
+        let continuation = advanceContinuation
+        advanceContinuation = nil
+        continuation?.resume(returning: .failed(.cancelled))
+    }
+
+    private func noteCancellation() {
+        didObserveCancellation = true
+        cancellationWatchdog?.cancel()
+        cancellationWatchdog = nil
+        let continuation = cancellationContinuation
+        cancellationContinuation = nil
+        continuation?.resume(returning: true)
+    }
+
+    private func expireStartedWait() {
+        let continuation = startedContinuation
+        startedContinuation = nil
+        startedWatchdog = nil
+        continuation?.resume(returning: false)
+    }
+
+    private func expireCancellationWait() {
+        let continuation = cancellationContinuation
+        cancellationContinuation = nil
+        cancellationWatchdog = nil
+        continuation?.resume(returning: false)
     }
 }
 

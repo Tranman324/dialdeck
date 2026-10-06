@@ -238,6 +238,7 @@ public actor HostActionExecutor {
     private let limits: ActionExecutionLimits
     private let gate = AsyncActionGate()
     private var activeOperations: [UUID: Task<ActionExecutionResult, Never>] = [:]
+    private var admissionFloor: UInt64 = 0
     private var presses: [PhysicalControlID: PressState] = [:]
     private var modifierOwners: [KeyboardModifier: Set<ActionOwner>] = [:]
     private var keyOwners: [MacVirtualKeyCode: Set<ActionOwner>] = [:]
@@ -254,9 +255,10 @@ public actor HostActionExecutor {
         profileID: ProfileID,
         application: ApplicationBundleIdentifier? = nil,
         advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult,
-        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)? = nil
+        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)? = nil,
+        admissionRevision: UInt64
     ) async -> ActionExecutionResult {
-        await submit { executor in
+        await submit(admissionRevision: admissionRevision) { executor in
             await executor.performKeyDown(
                 control: control,
                 generation: generation,
@@ -264,17 +266,23 @@ public actor HostActionExecutor {
                 profileID: profileID,
                 application: application,
                 advanceMode: advanceMode,
-                sequenceAdvanceMode: sequenceAdvanceMode
+                sequenceAdvanceMode: sequenceAdvanceMode,
+                admissionRevision: admissionRevision
             )
         }
     }
 
     public func keyUp(
         control: PhysicalControlID,
-        generation: SessionGeneration
+        generation: SessionGeneration,
+        admissionRevision: UInt64
     ) async -> ActionExecutionResult {
-        await submit { executor in
-            await executor.performKeyUp(control: control, generation: generation)
+        await submit(admissionRevision: admissionRevision) { executor in
+            await executor.performKeyUp(
+                control: control,
+                generation: generation,
+                admissionRevision: admissionRevision
+            )
         }
     }
 
@@ -284,16 +292,18 @@ public actor HostActionExecutor {
         dialMagnitude: Int,
         application: ApplicationBundleIdentifier? = nil,
         advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult,
-        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)? = nil
+        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)? = nil,
+        admissionRevision: UInt64
     ) async -> ActionExecutionResult {
-        await submit { executor in
+        await submit(admissionRevision: admissionRevision) { executor in
             await executor.performConfiguredAction(
                 action,
                 profileID: profileID,
                 dialMagnitude: dialMagnitude,
                 application: application,
                 advanceMode: advanceMode,
-                sequenceAdvanceMode: sequenceAdvanceMode
+                sequenceAdvanceMode: sequenceAdvanceMode,
+                admissionRevision: admissionRevision
             )
         }
     }
@@ -301,7 +311,8 @@ public actor HostActionExecutor {
     /// Cancels queued/in-flight work, then releases all remaining owned inputs.
     /// Cleanup is best effort and its typed failures are returned to the caller.
     @discardableResult
-    public func cancelAndRelease() async -> [ActionExecutionFailure] {
+    public func cancelAndRelease(floor: UInt64) async -> [ActionExecutionFailure] {
+        admissionFloor = max(admissionFloor, floor)
         for task in activeOperations.values { task.cancel() }
         await gate.acquire()
         let failures = await releaseAllOwnedInputs()
@@ -311,8 +322,12 @@ public actor HostActionExecutor {
     }
 
     private func submit(
+        admissionRevision: UInt64,
         operation: @escaping @Sendable (HostActionExecutor) async -> ActionExecutionResult
     ) async -> ActionExecutionResult {
+        guard admissionRevision >= admissionFloor else {
+            return ActionExecutionResult(outcome: .ignored)
+        }
         let requestID = UUID()
         let task = Task { await operation(self) }
         activeOperations[requestID] = task
@@ -328,9 +343,14 @@ public actor HostActionExecutor {
         profileID: ProfileID,
         application: ApplicationBundleIdentifier?,
         advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult,
-        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)?
+        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)?,
+        admissionRevision: UInt64
     ) async -> ActionExecutionResult {
         await gate.acquire()
+        guard admissionRevision >= admissionFloor else {
+            await gate.release()
+            return ActionExecutionResult(outcome: .ignored)
+        }
         let outcome: ActionExecutionOutcome
         if Task.isCancelled {
             outcome = .cancelled
@@ -378,9 +398,14 @@ public actor HostActionExecutor {
 
     private func performKeyUp(
         control: PhysicalControlID,
-        generation: SessionGeneration
+        generation: SessionGeneration,
+        admissionRevision: UInt64
     ) async -> ActionExecutionResult {
         await gate.acquire()
+        guard admissionRevision >= admissionFloor else {
+            await gate.release()
+            return ActionExecutionResult(outcome: .ignored)
+        }
         let outcome: ActionExecutionOutcome
         if Task.isCancelled {
             outcome = .cancelled
@@ -409,10 +434,15 @@ public actor HostActionExecutor {
         dialMagnitude: Int,
         application: ApplicationBundleIdentifier?,
         advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult,
-        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)?
+        sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)?,
+        admissionRevision: UInt64
     ) async -> ActionExecutionResult {
         let magnitudeLimit = limits.maximumDialMagnitude
         await gate.acquire()
+        guard admissionRevision >= admissionFloor else {
+            await gate.release()
+            return ActionExecutionResult(outcome: .ignored)
+        }
         let outcome: ActionExecutionOutcome
         if Task.isCancelled {
             outcome = .cancelled
@@ -617,10 +647,10 @@ public actor HostActionExecutor {
             race.cancel()
         }
         switch timed {
-        case .timedOut:
-            guard let operationTask else { return .timedOut }
+        case .timedOut, .cancelled:
+            guard let operationTask else { return timed }
             return .value(await operationTask.value)
-        case .value(_), .cancelled:
+        case .value(_):
             return timed
         }
     }

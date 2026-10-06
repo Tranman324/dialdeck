@@ -202,7 +202,8 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 dialMagnitude: 1,
                 application: bundleID,
                 advanceMode: modeAdvanceHandler(for: permit),
-                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit)
+                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit),
+                admissionRevision: permit.revision
             )
             return routeIsCurrent(permit) ? result : ActionExecutionResult(requestID: result.requestID, outcome: .ignored)
         } catch {
@@ -225,7 +226,11 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         case .keyDown:
             await routeKeyDown(event)
         case .keyUp:
-            let result = await executor.keyUp(control: event.control, generation: event.generation)
+            let result = await executor.keyUp(
+                control: event.control,
+                generation: event.generation,
+                admissionRevision: routingRevision
+            )
             setActionResult(result)
         case .dialRotation(let delta):
             await routeDialRotation(event, delta: delta)
@@ -242,7 +247,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             guard generation == eventGeneration else { return }
             routingRevision &+= 1
             status = .stopping(generation: eventGeneration)
-            let failures = await executor.cancelAndRelease()
+            let failures = await executor.cancelAndRelease(floor: routingRevision)
             if let failure = failures.first {
                 status = .failed(.operationFailed(reason: RuntimeFailureText.sanitize("Input cleanup failed: \(failure)")))
             }
@@ -251,7 +256,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             routingRevision &+= 1
             generation = nil
             session = nil
-            let failures = await executor.cancelAndRelease()
+            let failures = await executor.cancelAndRelease(floor: routingRevision)
             status = failures.first.map {
                 .failed(.operationFailed(reason: RuntimeFailureText.sanitize("Input cleanup failed: \($0)")))
             } ?? .idle
@@ -260,7 +265,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             routingRevision &+= 1
             generation = nil
             session = nil
-            let failures = await executor.cancelAndRelease()
+            let failures = await executor.cancelAndRelease(floor: routingRevision)
             let suffix = failures.first.map { "; input cleanup failed: \($0)" } ?? ""
             status = .failed(.operationFailed(reason: RuntimeFailureText.sanitize(reason + suffix)))
         }
@@ -322,7 +327,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         if let stoppingGeneration { status = .stopping(generation: stoppingGeneration) }
         generation = nil
         session = nil
-        let failures = await executor.cancelAndRelease()
+        let failures = await executor.cancelAndRelease(floor: routingRevision)
         if let oldSession { await oldSession.cancel() }
         if generation == nil {
             status = failures.first.map {
@@ -381,7 +386,8 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 profileID: profileID,
                 application: bundleID,
                 advanceMode: modeAdvanceHandler(for: permit),
-                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit)
+                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit),
+                admissionRevision: permit.revision
             )
             setActionResult(result)
         } catch {
@@ -418,7 +424,8 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 dialMagnitude: delta,
                 application: bundleID,
                 advanceMode: modeAdvanceHandler(for: permit),
-                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit)
+                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit),
+                admissionRevision: permit.revision
             )
             setActionResult(result)
         } catch {
@@ -511,7 +518,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     }
 
     private func cancelExecutorAndRecordCleanupFailure() async {
-        let failures = await executor.cancelAndRelease()
+        let failures = await executor.cancelAndRelease(floor: routingRevision)
         if let failure = failures.first {
             setActionResult(ActionExecutionResult(outcome: .failed(failure)))
         }
