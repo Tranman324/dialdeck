@@ -4,7 +4,7 @@
 
 The user identified an upright keypad with a single knob above two columns of three keys. The connected USB unit had VID `0x1189`, PID `0x8890`, one configuration, and four interfaces. The configuration interface was interface 1: HID class/subclass/protocol `3/0/0`, one interrupt OUT endpoint `0x02` with a 64-byte max packet, and a 36-byte vendor-page HID descriptor. The descriptor defines Report ID 3 with 64 data bytes in each input and output report. Location ID is connection evidence, not a durable device identity; discovery does not pin a dock or port.
 
-A target-only capture in the original configuration found the same input pattern for all six keys and three knob actions. Separate, explicitly approved writes assigned distinct plain letters to layer-1 protocol slots 1–6 and 13–15; the USB host accepted every report. The user reported the nine outputs persisted after one unplug/reconnect. A later target-only capture recorded a distinct USB keyboard usage with press and release for each of the nine gestures:
+A target-only capture in the original configuration found the same input pattern for all six keys and three knob actions. Separate, explicitly approved writes assigned distinct plain letters to layer-1 protocol slots 1–6 and 13–15; the USB host accepted every report. The user reported that the six-key sequence `bfaexd` remained after one reconnect following the key-slot writes. After the separate knob-slot writes and a separate reconnect, the user reported the same knob sequence `j`, `g`, `h`. A later target-only capture recorded a distinct USB keyboard usage with press and release for each of the nine gestures:
 
 | Upright physical control | Layer-1 slot | Plain key | USB keyboard usage |
 | --- | ---: | --- | ---: |
