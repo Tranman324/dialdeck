@@ -311,6 +311,103 @@ final class DeviceProgrammingTests: XCTestCase {
         XCTAssertEqual(recorder.lastReportCount, 3)
     }
 
+    func testRuntimeKeyAssignmentAdapterSendsOnlyTheTenBoundedCandidateVectors() async {
+        let recorder = TransportCallRecorder()
+        let service = KeyboardDeviceProgrammingService { bytes, count, _ in
+            recorder.record(bytes: bytes, count: count)
+            return DDUSBResult(status: DDUSB_SENT_UNVERIFIED, reports_accepted: 4)
+        }
+        let programmer = KeyboardDeviceKeyAssignmentProgrammer(service: service)
+        let candidates: [(RuntimeKeyAssignmentCandidate, UInt8, UInt8)] = [
+            (.topLeftUsage05, 3, 0x05),
+            (.topRightUsage09, 6, 0x09),
+            (.middleLeftUsage04, 2, 0x04),
+            (.middleRightUsage08, 5, 0x08),
+            (.bottomLeftUsage1B, 1, 0x1b),
+            (.bottomLeftUsage1D, 1, 0x1d),
+            (.bottomRightUsage07, 4, 0x07),
+            (.clockwiseKnobUsage0D, 15, 0x0d),
+            (.counterclockwiseKnobUsage0A, 13, 0x0a),
+            (.knobPressUsage0B, 14, 0x0b)
+        ]
+
+        for (index, (candidate, slot, usage)) in candidates.enumerated() {
+            let requestID = UUID()
+            let request = KeyAssignmentProgrammingRequest(
+                requestID: requestID,
+                candidate: candidate,
+                acceptsPersistentOverwrite: true
+            )
+
+            let result = await programmer.programKeyAssignment(request)
+
+            XCTAssertEqual(candidate.slot, slot)
+            XCTAssertEqual(candidate.usage, usage)
+            XCTAssertEqual(result, .init(
+                requestID: requestID,
+                outcome: .sentUnverified(reportsAccepted: 4)
+            ))
+            XCTAssertEqual(recorder.count, index + 1)
+            XCTAssertEqual(recorder.lastReportCount, 4)
+            XCTAssertEqual(recorder.lastByteCount, 260)
+            XCTAssertEqual(recorder.lastBytes, expectedPlainAssignmentBytes(slot: slot, usage: usage))
+        }
+    }
+
+    func testRuntimeKeyAssignmentAdapterDeniesOverwriteBeforeTransport() async {
+        let recorder = TransportCallRecorder()
+        let service = KeyboardDeviceProgrammingService { bytes, count, _ in
+            recorder.record(bytes: bytes, count: count)
+            return DDUSBResult(status: DDUSB_SENT_UNVERIFIED, reports_accepted: 4)
+        }
+        let programmer = KeyboardDeviceKeyAssignmentProgrammer(service: service)
+        let requestID = UUID()
+        let request = KeyAssignmentProgrammingRequest(
+            requestID: requestID,
+            candidate: .bottomLeftUsage1D,
+            acceptsPersistentOverwrite: false
+        )
+
+        let result = await programmer.programKeyAssignment(request)
+
+        XCTAssertEqual(result, .init(
+            requestID: requestID,
+            outcome: .failed(reason: "Persistent overwrite was not accepted", reportsAccepted: 0)
+        ))
+        XCTAssertEqual(recorder.count, 0)
+    }
+
+    func testRuntimeKeyAssignmentAdapterPreservesAcceptedFailedAndCancelledCounts() async {
+        let requestID = UUID()
+        let request = KeyAssignmentProgrammingRequest(
+            requestID: requestID,
+            candidate: .knobPressUsage0B,
+            acceptsPersistentOverwrite: true
+        )
+        let cases: [(DDUSBStatus, Int, KeyAssignmentProgrammingOutcome)] = [
+            (DDUSB_SENT_UNVERIFIED, 4, .sentUnverified(reportsAccepted: 4)),
+            (DDUSB_WRITE_FAILED, 2, .failed(
+                reason: "USB report rejected or short", reportsAccepted: 2)),
+            (DDUSB_CANCELLED, 1, .cancelled(reportsAccepted: 1))
+        ]
+
+        for (status, acceptedCount, expectedOutcome) in cases {
+            let recorder = TransportCallRecorder()
+            let service = KeyboardDeviceProgrammingService { bytes, count, _ in
+                recorder.record(bytes: bytes, count: count)
+                return DDUSBResult(status: status, reports_accepted: acceptedCount)
+            }
+            let programmer = KeyboardDeviceKeyAssignmentProgrammer(service: service)
+
+            let result = await programmer.programKeyAssignment(request)
+
+            XCTAssertEqual(result, .init(requestID: requestID, outcome: expectedOutcome))
+            XCTAssertEqual(recorder.count, 1)
+            XCTAssertEqual(recorder.lastReportCount, 4)
+            XCTAssertEqual(recorder.lastBytes, expectedPlainAssignmentBytes(slot: 14, usage: 0x0b))
+        }
+    }
+
     func testServiceLabelsInjectedFailureAndShortTransferAtEveryPosition() async throws {
         let x = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: 0x1b))
         for position in 0..<4 {
@@ -376,6 +473,15 @@ final class DeviceProgrammingTests: XCTestCase {
         let stroke = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: usage))
         return try ReportID3KeyboardEncoder.encode(slot: slot, layer: 1, strokes: [stroke])
             .flatMap { $0 }
+    }
+
+    private func expectedPlainAssignmentBytes(slot: UInt8, usage: UInt8) -> [UInt8] {
+        [
+            padded([0x03, 0xa1, 0x01]),
+            padded([0x03, slot, 0x11, 0x01, 0x00, 0x00, 0x00]),
+            padded([0x03, slot, 0x11, 0x01, 0x01, 0x00, usage]),
+            padded([0x03, 0xaa, 0xaa])
+        ].flatMap { $0 }
     }
 
     private func padded(_ prefix: [UInt8]) -> [UInt8] {
