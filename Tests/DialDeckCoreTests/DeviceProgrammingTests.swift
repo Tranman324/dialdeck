@@ -258,6 +258,25 @@ final class DeviceProgrammingTests: XCTestCase {
         XCTAssertEqual(offPermitted, 0)
     }
 
+    func testRuntimeLightingAdapterPreservesCancellationCountAndRequestIdentity() async {
+        let recorder = TransportCallRecorder()
+        let service = KeyboardDeviceProgrammingService { bytes, count, _ in
+            recorder.record(bytes: bytes, count: count)
+            return DDUSBResult(status: DDUSB_CANCELLED, reports_accepted: 2)
+        }
+        let programmer = KeyboardDeviceLightingProgrammer(service: service)
+        let request = LightingProgrammingRequest(
+            requestID: UUID(), mode: .mode2, acceptsPersistentOverwrite: true)
+
+        let result = await programmer.programLighting(request)
+
+        XCTAssertEqual(result, .init(
+            requestID: request.requestID,
+            outcome: .cancelled(reportsAccepted: 2)
+        ))
+        XCTAssertEqual(recorder.lastReportCount, 3)
+    }
+
     func testServiceLabelsInjectedFailureAndShortTransferAtEveryPosition() async throws {
         let x = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: 0x1b))
         for position in 0..<4 {

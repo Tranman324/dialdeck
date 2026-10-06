@@ -96,6 +96,8 @@ final class ContractsSmokeTests: XCTestCase {
             case let .programming(result):
                 XCTAssertEqual(result.requestID, request.requestID)
                 XCTAssertEqual(result.outcome, expectedOutcome)
+            case .lightingProgramming:
+                XCTFail("A keyboard assignment command must return a keyboard programming result")
             case .noProgrammingResult:
                 XCTFail("A programming command must return its correlated result")
             }
@@ -238,6 +240,11 @@ private actor FakeRuntime: RuntimeCommandHandling, RuntimeStatusProviding {
             return .noProgrammingResult
         case let .program(request):
             return .programming(await programmer.program(request))
+        case let .programLighting(request):
+            return .lightingProgramming(.init(
+                requestID: request.requestID,
+                outcome: .failed(reason: "Fake runtime has no lighting programmer", reportsAccepted: 0)
+            ))
         }
     }
 

@@ -408,6 +408,70 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertEqual(result.outcome, .failed(.init(reason: "Programming service returned a mismatched request ID")))
     }
 
+    func testLightingCommandPreservesTypedRequestIdentityAndAcceptedCount() async throws {
+        let fixture = try makeConfiguration(defaultButton: .primitive(.doNothing), appButton: .inherit)
+        let lightingProgrammer = RecordingLightingProgrammer(outcome: .sentUnverified(reportsAccepted: 3))
+        let runtime = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: RecordingActionService(),
+            foreground: MutableForeground(),
+            input: ManualInputProducer(),
+            mapping: [:],
+            lightingProgrammer: lightingProgrammer
+        )
+        let request = LightingProgrammingRequest(
+            requestID: UUID(), mode: .mode1, acceptsPersistentOverwrite: true)
+
+        let completion = await runtime.submit(.programLighting(request))
+
+        XCTAssertEqual(completion, .lightingProgramming(.init(
+            requestID: request.requestID,
+            outcome: .sentUnverified(reportsAccepted: 3)
+        )))
+        let captured = await lightingProgrammer.lastRequest
+        XCTAssertEqual(captured, request)
+    }
+
+    func testLightingCommandRequiresFreshAcceptanceAndFailsClosedWithoutProgrammer() async throws {
+        let fixture = try makeConfiguration(defaultButton: .primitive(.doNothing), appButton: .inherit)
+        let withoutProgrammer = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: RecordingActionService(),
+            foreground: MutableForeground(),
+            input: ManualInputProducer(),
+            mapping: [:]
+        )
+        let accepted = LightingProgrammingRequest(
+            mode: .mode2, acceptsPersistentOverwrite: true)
+        let unavailableCompletion = await withoutProgrammer.submit(.programLighting(accepted))
+        XCTAssertEqual(unavailableCompletion, .lightingProgramming(.init(
+            requestID: accepted.requestID,
+            outcome: .failed(
+                reason: "No supported device lighting programmer is configured",
+                reportsAccepted: 0
+            )
+        )))
+
+        let recorder = RecordingLightingProgrammer(outcome: .sentUnverified(reportsAccepted: 3))
+        let withProgrammer = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: RecordingActionService(),
+            foreground: MutableForeground(),
+            input: ManualInputProducer(),
+            mapping: [:],
+            lightingProgrammer: recorder
+        )
+        let denied = LightingProgrammingRequest(
+            mode: .mode2, acceptsPersistentOverwrite: false)
+        let deniedCompletion = await withProgrammer.submit(.programLighting(denied))
+        XCTAssertEqual(deniedCompletion, .lightingProgramming(.init(
+            requestID: denied.requestID,
+            outcome: .failed(reason: "Persistent overwrite was not accepted", reportsAccepted: 0)
+        )))
+        let captured = await recorder.lastRequest
+        XCTAssertNil(captured, "A denied request must not reach the hardware programmer")
+    }
+
     func testSequenceDeadlineBoundsConfiguredPauses() async throws {
         let service = RecordingActionService()
         let executor = HostActionExecutor(
@@ -1501,7 +1565,8 @@ final class ActionRuntimeTests: XCTestCase {
         foreground: any ForegroundApplicationProviding,
         input: ManualInputProducer,
         mapping: [PhysicalControlID: ActionAssignmentTarget],
-        capabilities: any DeviceCapabilityProviding = FixtureCapabilities()
+        capabilities: any DeviceCapabilityProviding = FixtureCapabilities(),
+        lightingProgrammer: (any DeviceLightingProgramming)? = nil
     ) async throws -> ActionRuntime {
         let url = URL(fileURLWithPath: "/virtual/action-runtime-\(UUID().uuidString).json")
         let store = ConfigurationStore(primaryURL: url, fileAccess: MemoryConfigurationFiles())
@@ -1514,7 +1579,8 @@ final class ActionRuntimeTests: XCTestCase {
             controlMapping: FixtureMapping(mapping),
             configurationStore: store,
             actionService: service,
-            executionLimits: ActionExecutionLimits(perActionTimeout: .seconds(1), sequenceDeadline: .seconds(2))
+            executionLimits: ActionExecutionLimits(perActionTimeout: .seconds(1), sequenceDeadline: .seconds(2)),
+            lightingProgrammer: lightingProgrammer
         )
     }
 
@@ -2017,6 +2083,20 @@ private struct FixtureProgrammer: DeviceProgramming {
 private struct MismatchedProgrammer: DeviceProgramming {
     func program(_ request: ProgrammingRequest) async -> ProgrammingResult {
         ProgrammingResult(requestID: UUID(), outcome: .sentUnverified)
+    }
+}
+
+private actor RecordingLightingProgrammer: DeviceLightingProgramming {
+    let outcome: LightingProgrammingOutcome
+    private(set) var lastRequest: LightingProgrammingRequest?
+
+    init(outcome: LightingProgrammingOutcome) {
+        self.outcome = outcome
+    }
+
+    func programLighting(_ request: LightingProgrammingRequest) async -> LightingProgrammingResult {
+        lastRequest = request
+        return LightingProgrammingResult(requestID: request.requestID, outcome: outcome)
     }
 }
 

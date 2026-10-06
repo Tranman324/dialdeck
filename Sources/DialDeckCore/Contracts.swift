@@ -216,11 +216,61 @@ public protocol DeviceProgramming: Sendable {
     func program(_ request: ProgrammingRequest) async -> ProgrammingResult
 }
 
+/// The two lighting behaviors observed on the supported keypad. This typed
+/// request is deliberately separate from `ProgrammingRequest.Assignment`,
+/// whose opaque action identifier must never be interpreted as USB data.
+public enum RuntimeLightingMode: Equatable, Sendable {
+    case mode1
+    case mode2
+}
+
+/// Explicit request to overwrite the device's persistent lighting mode.
+/// Callers must supply fresh acceptance for each write; there is no default.
+public struct LightingProgrammingRequest: Equatable, Sendable {
+    public let requestID: UUID
+    public let mode: RuntimeLightingMode
+    public let acceptsPersistentOverwrite: Bool
+
+    public init(
+        requestID: UUID = UUID(),
+        mode: RuntimeLightingMode,
+        acceptsPersistentOverwrite: Bool
+    ) {
+        self.requestID = requestID
+        self.mode = mode
+        self.acceptsPersistentOverwrite = acceptsPersistentOverwrite
+    }
+}
+
+/// Result of one lighting write. `reportsAccepted` records host transport
+/// acceptance only; it does not claim that the lighting behavior was verified.
+public enum LightingProgrammingOutcome: Equatable, Sendable {
+    case sentUnverified(reportsAccepted: Int)
+    case failed(reason: String, reportsAccepted: Int)
+    case cancelled(reportsAccepted: Int)
+}
+
+public struct LightingProgrammingResult: Equatable, Sendable {
+    public let requestID: UUID
+    public let outcome: LightingProgrammingOutcome
+
+    public init(requestID: UUID, outcome: LightingProgrammingOutcome) {
+        self.requestID = requestID
+        self.outcome = outcome
+    }
+}
+
+/// Typed runtime entry point for the observed lighting modes only.
+public protocol DeviceLightingProgramming: Sendable {
+    func programLighting(_ request: LightingProgrammingRequest) async -> LightingProgrammingResult
+}
+
 public enum RuntimeCommand: Equatable, Sendable {
     case start
     case stop
     case refreshCapabilities
     case program(ProgrammingRequest)
+    case programLighting(LightingProgrammingRequest)
 }
 
 /// Completion returned to the UI-facing caller of `RuntimeCommandHandling`.
@@ -229,6 +279,7 @@ public enum RuntimeCommand: Equatable, Sendable {
 public enum RuntimeCommandCompletion: Equatable, Sendable {
     case noProgrammingResult
     case programming(ProgrammingResult)
+    case lightingProgramming(LightingProgrammingResult)
 }
 
 public enum RuntimeFailure: Equatable, Sendable {

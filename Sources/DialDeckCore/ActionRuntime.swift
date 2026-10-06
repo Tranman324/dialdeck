@@ -46,6 +46,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     private let inputProducer: any InputEventProducing
     private let capabilities: any DeviceCapabilityProviding
     private let programmer: any DeviceProgramming
+    private let lightingProgrammer: (any DeviceLightingProgramming)?
     private let foregroundApplication: any ForegroundApplicationProviding
     private let controlMapping: any PhysicalActionMappingProviding
     private let configurationStore: ConfigurationStore
@@ -74,11 +75,13 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         controlMapping: any PhysicalActionMappingProviding,
         configurationStore: ConfigurationStore,
         actionService: any HostActionServicing,
-        executionLimits: ActionExecutionLimits = .init()
+        executionLimits: ActionExecutionLimits = .init(),
+        lightingProgrammer: (any DeviceLightingProgramming)? = nil
     ) {
         self.inputProducer = inputProducer
         self.capabilities = capabilities
         self.programmer = programmer
+        self.lightingProgrammer = lightingProgrammer
         self.foregroundApplication = foregroundApplication
         self.controlMapping = controlMapping
         self.configurationStore = configurationStore
@@ -105,6 +108,37 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 ))
             }
             return .programming(result)
+        case .programLighting(let request):
+            guard request.acceptsPersistentOverwrite else {
+                return .lightingProgramming(.init(
+                    requestID: request.requestID,
+                    outcome: .failed(reason: "Persistent overwrite was not accepted", reportsAccepted: 0)
+                ))
+            }
+            guard let lightingProgrammer else {
+                return .lightingProgramming(.init(
+                    requestID: request.requestID,
+                    outcome: .failed(reason: "No supported device lighting programmer is configured", reportsAccepted: 0)
+                ))
+            }
+            let result = await lightingProgrammer.programLighting(request)
+            guard result.requestID == request.requestID else {
+                let accepted: Int
+                switch result.outcome {
+                case .sentUnverified(let reportsAccepted),
+                     .failed(_, let reportsAccepted),
+                     .cancelled(let reportsAccepted):
+                    accepted = reportsAccepted
+                }
+                return .lightingProgramming(.init(
+                    requestID: request.requestID,
+                    outcome: .failed(
+                        reason: "Lighting service returned a mismatched request ID",
+                        reportsAccepted: accepted
+                    )
+                ))
+            }
+            return .lightingProgramming(result)
         }
     }
 
