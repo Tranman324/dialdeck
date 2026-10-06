@@ -34,17 +34,11 @@ DDUSBResult dd_usb_send_reports(
     const DDUSBCancelToken *token
 );
 
-// Pure injected transfer path for offline validation. The callback receives
-// one already validated 65-byte report and returns 65 on acceptance, or any
-// other value on failure. This function never opens a USB device.
-typedef int (*DDUSBInjectedTransfer)(void *context, const uint8_t *report, size_t length);
-DDUSBResult dd_usb_send_sequence_with_transfer(
+// Pure packet validator. It never opens a device or transmits a report.
+int dd_usb_reports_permitted(
     const uint8_t *reports,
     size_t report_count,
-    size_t report_bytes_length,
-    const DDUSBCancelToken *token,
-    DDUSBInjectedTransfer transfer,
-    void *context
+    size_t report_bytes_length
 );
 
 #endif

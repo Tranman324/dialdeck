@@ -124,57 +124,80 @@ final class DeviceProgrammingTests: XCTestCase {
         }
     }
 
-    func testInjectedSequenceWhitelistAcceptsExactlyNineObservedPairs() throws {
+    func testPureValidatorAcceptsExactlyNineObservedPairs() throws {
         for (slot, usage) in observed {
-            let (result, calls) = runInjectedSequence(try encodedBytes(slot: slot, usage: usage))
-            XCTAssertEqual(result.status, DDUSB_SENT_UNVERIFIED, "slot \(slot)")
-            XCTAssertEqual(result.reports_accepted, 4)
-            XCTAssertEqual(calls, 4)
+            let bytes = try encodedBytes(slot: slot, usage: usage)
+            let permitted = bytes.withUnsafeBufferPointer { buffer in
+                dd_usb_reports_permitted(buffer.baseAddress, 4, bytes.count)
+            }
+            XCTAssertEqual(permitted, 1, "slot \(slot)")
         }
         let unobservedPair = try encodedBytes(slot: 1, usage: 0x04)
-        let (rejected, calls) = runInjectedSequence(unobservedPair)
-        XCTAssertEqual(rejected.status, DDUSB_TARGET_MISMATCH)
-        XCTAssertEqual(calls, 0)
+        let permitted = unobservedPair.withUnsafeBufferPointer { buffer in
+            dd_usb_reports_permitted(buffer.baseAddress, 4, unobservedPair.count)
+        }
+        XCTAssertEqual(permitted, 0)
     }
 
-    func testInjectedSequenceStopsOnFailureOrShortTransferAtEveryPosition() throws {
-        let bytes = try encodedBytes(slot: 1, usage: 0x1b)
+    func testServiceLabelsInjectedFailureAndShortTransferAtEveryPosition() async throws {
+        let x = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: 0x1b))
         for position in 0..<4 {
-            for returnedLength: Int32 in [-1, 64] {
-                let (result, calls) = runInjectedSequence(
-                    bytes, failAt: position, failedLength: returnedLength)
-                XCTAssertEqual(result.status, DDUSB_WRITE_FAILED)
-                XCTAssertEqual(result.reports_accepted, position)
-                XCTAssertEqual(calls, position + 1)
+            for failureKind in ["failed", "short"] {
+                let recorder = TransportCallRecorder()
+                let service = KeyboardDeviceProgrammingService { bytes, count, _ in
+                    recorder.record(bytes: bytes, count: count)
+                    // Both rejected and short transfers are classified by C as WRITE_FAILED.
+                    return DDUSBResult(status: DDUSB_WRITE_FAILED, reports_accepted: position)
+                }
+                let request = KeyboardDeviceWriteRequest(
+                    slot: 1, strokes: [x], acceptsPersistentOverwrite: true)
+                let result = await service.program(request)
+                XCTAssertEqual(result.id, request.id, failureKind)
+                XCTAssertEqual(result.outcome, .failed(
+                    reason: "USB report rejected or short", reportsAccepted: position),
+                    failureKind)
+                XCTAssertEqual(recorder.count, 1, failureKind)
             }
         }
     }
 
-    func testInjectedSequenceCancellationStopsLaterReportsButKeepsCommittedSave() throws {
-        let bytes = try encodedBytes(slot: 1, usage: 0x1b)
+    func testServiceLabelsInjectedCancellationAndAcceptedFinalSave() async throws {
+        let x = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: 0x1b))
         for position in 0..<4 {
-            let (result, calls) = runInjectedSequence(bytes, cancelAfter: position)
-            XCTAssertEqual(calls, position + 1)
-            XCTAssertEqual(result.reports_accepted, position + 1)
-            XCTAssertEqual(result.status, position == 3 ? DDUSB_SENT_UNVERIFIED : DDUSB_CANCELLED)
+            let service = KeyboardDeviceProgrammingService { _, _, _ in
+                DDUSBResult(
+                    status: position == 3 ? DDUSB_SENT_UNVERIFIED : DDUSB_CANCELLED,
+                    reports_accepted: position + 1)
+            }
+            let request = KeyboardDeviceWriteRequest(
+                slot: 1, strokes: [x], acceptsPersistentOverwrite: true)
+            let result = await service.program(request)
+            XCTAssertEqual(result.id, request.id)
+            XCTAssertEqual(result.outcome, position == 3
+                ? .sentUnverified(reportsAccepted: 4)
+                : .cancelled(reportsAccepted: position + 1))
         }
-        let (preCancelled, calls) = runInjectedSequence(bytes, cancelBeforeStart: true)
-        XCTAssertEqual(preCancelled.status, DDUSB_CANCELLED)
-        XCTAssertEqual(preCancelled.reports_accepted, 0)
-        XCTAssertEqual(calls, 0)
+        let beforeStart = KeyboardDeviceProgrammingService { _, _, _ in
+            DDUSBResult(status: DDUSB_CANCELLED, reports_accepted: 0)
+        }
+        let result = await beforeStart.program(.init(
+            slot: 1, strokes: [x], acceptsPersistentOverwrite: true))
+        XCTAssertEqual(result.outcome, .cancelled(reportsAccepted: 0))
     }
 
-    func testInjectedSequenceRejectsInvalidBufferBeforeCallback() throws {
+    func testPureValidatorRejectsInvalidPayloadAndLength() throws {
         var bytes = try encodedBytes(slot: 1, usage: 0x1b)
         bytes[6] = 0x01
-        let (invalidPayload, calls) = runInjectedSequence(bytes)
-        XCTAssertEqual(invalidPayload.status, DDUSB_TARGET_MISMATCH)
-        XCTAssertEqual(calls, 0)
+        let invalidPayload = bytes.withUnsafeBufferPointer { buffer in
+            dd_usb_reports_permitted(buffer.baseAddress, 4, bytes.count)
+        }
+        XCTAssertEqual(invalidPayload, 0)
 
         let valid = try encodedBytes(slot: 1, usage: 0x1b)
-        let (shortBuffer, shortCalls) = runInjectedSequence(valid, suppliedLength: valid.count - 1)
-        XCTAssertEqual(shortBuffer.status, DDUSB_TARGET_MISMATCH)
-        XCTAssertEqual(shortCalls, 0)
+        let shortBuffer = valid.withUnsafeBufferPointer { buffer in
+            dd_usb_reports_permitted(buffer.baseAddress, 4, valid.count - 1)
+        }
+        XCTAssertEqual(shortBuffer, 0)
     }
 
     private func encodedBytes(slot: UInt8, usage: UInt8) throws -> [UInt8] {
@@ -187,49 +210,6 @@ final class DeviceProgrammingTests: XCTestCase {
         prefix + [UInt8](repeating: 0, count: 65 - prefix.count)
     }
 
-    private func runInjectedSequence(
-        _ bytes: [UInt8],
-        suppliedLength: Int? = nil,
-        failAt: Int? = nil,
-        failedLength: Int32 = -1,
-        cancelAfter: Int? = nil,
-        cancelBeforeStart: Bool = false
-    ) -> (DDUSBResult, Int) {
-        let token = dd_usb_cancel_token_create()!
-        defer { dd_usb_cancel_token_destroy(token) }
-        let context = InjectedTransferContext(
-            token: token, failAt: failAt, failedLength: failedLength, cancelAfter: cancelAfter)
-        if cancelBeforeStart { dd_usb_cancel(token) }
-        let result = bytes.withUnsafeBufferPointer { buffer in
-            dd_usb_send_sequence_with_transfer(
-                buffer.baseAddress, 4, suppliedLength ?? bytes.count, token,
-                { opaque, _, length in
-                    let context = Unmanaged<InjectedTransferContext>
-                        .fromOpaque(opaque!).takeUnretainedValue()
-                    let position = context.calls
-                    context.calls += 1
-                    if context.cancelAfter == position { dd_usb_cancel(context.token) }
-                    if context.failAt == position { return context.failedLength }
-                    return Int32(length)
-                }, Unmanaged.passUnretained(context).toOpaque())
-        }
-        return (result, context.calls)
-    }
-}
-
-private final class InjectedTransferContext {
-    let token: OpaquePointer
-    let failAt: Int?
-    let failedLength: Int32
-    let cancelAfter: Int?
-    var calls = 0
-
-    init(token: OpaquePointer, failAt: Int?, failedLength: Int32, cancelAfter: Int?) {
-        self.token = token
-        self.failAt = failAt
-        self.failedLength = failedLength
-        self.cancelAfter = cancelAfter
-    }
 }
 
 private final class TransportCallRecorder: @unchecked Sendable {

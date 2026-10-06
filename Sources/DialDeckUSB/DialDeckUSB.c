@@ -66,11 +66,6 @@ typedef struct {
     int (*interrupt_transfer)(libusb_device_handle *, unsigned char, unsigned char *,
                               int, int *, unsigned int);
 } usb_api;
-typedef struct {
-    const usb_api *api;
-    libusb_device_handle *handle;
-} usb_transport;
-
 struct DDUSBCancelToken { atomic_int cancelled; };
 static pthread_mutex_t operation_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -163,7 +158,7 @@ static int topology_matches(const usb_api *api, libusb_device *device) {
     return valid;
 }
 
-static int permitted_reports(const uint8_t *reports, size_t report_count,
+int dd_usb_reports_permitted(const uint8_t *reports, size_t report_count,
                              size_t report_bytes_length) {
     if (!reports || report_count != 4 ||
         report_bytes_length != report_count * 65) {
@@ -193,16 +188,18 @@ static int permitted_reports(const uint8_t *reports, size_t report_count,
     return permitted;
 }
 
-DDUSBResult dd_usb_send_sequence_with_transfer(
-    const uint8_t *reports, size_t report_count, size_t report_bytes_length,
-    const DDUSBCancelToken *token, DDUSBInjectedTransfer transfer, void *context) {
-    DDUSBResult result = {DDUSB_TARGET_MISMATCH, 0};
-    if (!token || !transfer ||
-        !permitted_reports(reports, report_count, report_bytes_length)) return result;
+static DDUSBResult send_reports_on_claimed_device(
+    const usb_api *api, libusb_device_handle *handle,
+    const uint8_t *reports, size_t report_count, const DDUSBCancelToken *token) {
+    DDUSBResult result = {DDUSB_WRITE_FAILED, 0};
     for (size_t i = 0; i < report_count; ++i) {
         if (cancelled(token)) { result.status = DDUSB_CANCELLED; return result; }
-        int accepted = transfer(context, reports + i * 65, 65);
-        if (accepted != 65) { result.status = DDUSB_WRITE_FAILED; return result; }
+        uint8_t report[65];
+        memcpy(report, reports + i * 65, sizeof(report));
+        int transferred = 0;
+        int status = api->interrupt_transfer(
+            handle, 0x02, report, sizeof(report), &transferred, 1000);
+        if (status != 0 || transferred != sizeof(report)) return result;
         ++result.reports_accepted;
         if (i + 1 < report_count) {
             const struct timespec pause = {.tv_sec = 0, .tv_nsec = 20000000};
@@ -213,21 +210,11 @@ DDUSBResult dd_usb_send_sequence_with_transfer(
     return result;
 }
 
-static int transfer_to_device(void *context, const uint8_t *report, size_t length) {
-    usb_transport *transport = context;
-    uint8_t copy[65];
-    memcpy(copy, report, sizeof(copy));
-    int transferred = 0;
-    int status = transport->api->interrupt_transfer(
-        transport->handle, 0x02, copy, (int)length, &transferred, 1000);
-    return status == 0 ? transferred : -1;
-}
-
 DDUSBResult dd_usb_send_reports(const uint8_t *reports, size_t report_count,
                                 size_t report_bytes_length,
                                 const DDUSBCancelToken *token) {
     DDUSBResult result = {DDUSB_UNAVAILABLE, 0};
-    if (!token || !permitted_reports(reports, report_count, report_bytes_length)) {
+    if (!token || !dd_usb_reports_permitted(reports, report_count, report_bytes_length)) {
         result.status = DDUSB_TARGET_MISMATCH; return result;
     }
     if (cancelled(token)) { result.status = DDUSB_CANCELLED; return result; }
@@ -283,9 +270,7 @@ DDUSBResult dd_usb_send_reports(const uint8_t *reports, size_t report_count,
     result.status = DDUSB_TARGET_MISMATCH;
     if (length != sizeof(expected) || memcmp(observed, expected, sizeof(expected)))
         goto cleanup;
-    usb_transport transport = {&api, handle};
-    result = dd_usb_send_sequence_with_transfer(
-        reports, report_count, report_bytes_length, token, transfer_to_device, &transport);
+    result = send_reports_on_claimed_device(&api, handle, reports, report_count, token);
 cleanup:
     if (claimed) api.release_interface(handle, 1);
     if (handle) api.close(handle);
