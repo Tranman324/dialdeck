@@ -363,18 +363,29 @@ final class ActionRuntimeTests: XCTestCase {
             generation: generation
         ))
 
-        let startedAt = ContinuousClock.now
-        let routing = Task { await input.emit(rotation) }
-        XCTAssertTrue(files.waitForBlockedBackup(), "Mode persistence should enter the gated backup write")
+        let completion = AsyncTestFlag()
+        let routing = Task {
+            await input.emit(rotation)
+            await completion.mark()
+        }
+        guard files.waitForBlockedBackup() else {
+            XCTFail("Mode persistence should enter the gated backup write")
+            return
+        }
+        try await Task.sleep(for: .milliseconds(140))
+        let completedBeforeBackupRelease = await completion.isMarked
+        XCTAssertFalse(completedBeforeBackupRelease, "A timed-out mode advance must join the pending store operation")
+        XCTAssertEqual(files.primaryWriteCount, 1, "Cancellation before the primary commit must leave the persisted mode unchanged")
+
+        files.releaseBlockedBackup()
         await routing.value
-        let elapsed = startedAt.duration(to: .now)
+        XCTAssertTrue(files.waitForBlockedBackupToFinish())
 
         let actionResult = await runtime.currentSnapshot().lastActionResult
         XCTAssertEqual(actionResult?.outcome, .partialFailure(
             completedSteps: 1,
             failure: .sequenceDeadlineExceeded
         ))
-        XCTAssertLessThan(elapsed, .milliseconds(500), "Sequence expiry should return while the backup write remains gated")
 
         let key = try XCTUnwrap(MacVirtualKeyCode(8))
         let intents = await service.intents
@@ -382,12 +393,167 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertTrue(intents.contains(.keyboard(.up, .modifier(.control))))
         XCTAssertTrue(intents.contains(.keyboard(.up, .modifier(.option))))
         XCTAssertEqual(files.primaryWriteCount, 1, "The expired mode change must not start a primary write")
-
-        files.releaseBlockedBackup()
-        XCTAssertTrue(files.waitForBlockedBackupToFinish())
-        XCTAssertEqual(files.primaryWriteCount, 1)
         let reloaded = try await ConfigurationStore(primaryURL: url, fileAccess: files).load()
         XCTAssertEqual(reloaded.defaultProfile.selectedDialMode.id, fixture.firstModeID)
+    }
+
+    func testSequenceModePersistenceJoiningPrimaryCommitReportsModeChange() async throws {
+        let sequence = try ActionSequence(steps: [.action(.nextDialMode)])
+        let fixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            clockwiseAction: .sequence(sequence)
+        )
+        let files = GatedBackupConfigurationFiles()
+        let url = URL(fileURLWithPath: "/virtual/sequence-mode-primary-race-\(UUID().uuidString).json")
+        let store = ConfigurationStore(primaryURL: url, fileAccess: files)
+        try await store.save(fixture.configuration)
+        files.blockNextPrimaryWrite()
+
+        let input = ManualInputProducer()
+        let runtime = ActionRuntime(
+            inputProducer: input,
+            capabilities: FixtureCapabilities(),
+            programmer: FixtureProgrammer(),
+            foregroundApplication: MutableForeground(),
+            controlMapping: FixtureMapping([:]),
+            configurationStore: store,
+            actionService: RecordingActionService(),
+            executionLimits: ActionExecutionLimits(
+                perActionTimeout: .seconds(1),
+                sequenceDeadline: .milliseconds(70)
+            )
+        )
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+        let dial = try XCTUnwrap(PhysicalControlID(rawValue: "fixture-dial", kind: .dial))
+        let rotation = try XCTUnwrap(NormalizedInputEvent.dialRotation(
+            control: dial,
+            delta: 1,
+            generation: generation
+        ))
+        let completion = AsyncTestFlag()
+        let routing = Task {
+            await input.emit(rotation)
+            await completion.mark()
+        }
+
+        guard files.waitForBlockedPrimaryWrite() else {
+            XCTFail("Mode persistence should enter the gated primary replacement")
+            return
+        }
+        try await Task.sleep(for: .milliseconds(140))
+        let completedBeforePrimaryRelease = await completion.isMarked
+        XCTAssertFalse(completedBeforePrimaryRelease, "A timed-out mode advance must wait for the actual primary-write result")
+        files.releaseBlockedPrimaryWrite()
+        await routing.value
+        XCTAssertTrue(files.waitForBlockedPrimaryWriteToFinish())
+
+        let snapshot = await runtime.currentSnapshot()
+        XCTAssertEqual(snapshot.lastActionResult?.outcome, .modeChanged(
+            profileID: fixture.configuration.defaultProfileID,
+            modeID: fixture.secondModeID
+        ))
+        XCTAssertEqual(snapshot.selectedDialModeID, fixture.secondModeID)
+        let reloaded = try await ConfigurationStore(primaryURL: url, fileAccess: files).load()
+        XCTAssertEqual(reloaded.defaultProfile.selectedDialMode.id, fixture.secondModeID)
+        XCTAssertEqual(files.primaryWriteCount, 2)
+    }
+
+    func testInstallConfigurationCancelsExecutorSequenceAndReleasesInputsBeforeReturning() async throws {
+        try await assertConfigurationReplacementCancelsExecutorWork(reload: false)
+    }
+
+    func testReloadConfigurationCancelsExecutorSequenceAndReleasesInputsBeforeReturning() async throws {
+        try await assertConfigurationReplacementCancelsExecutorWork(reload: true)
+    }
+
+    private func assertConfigurationReplacementCancelsExecutorWork(reload: Bool) async throws {
+        let target = try XCTUnwrap(ApplicationBundleIdentifier("com.example.blocked"))
+        let chord = KeyboardChord(
+            key: try XCTUnwrap(MacVirtualKeyCode(8)),
+            modifiers: [.control, .option]
+        )
+        let sequence = try ActionSequence(steps: [
+            .action(.holdKeys(chord)),
+            .action(.openApplication(target)),
+        ])
+        let oldFixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            clockwiseAction: .sequence(sequence)
+        )
+        let newFixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            clockwiseAction: .primitive(.zoom(.out))
+        )
+        let files = MemoryConfigurationFiles()
+        let url = URL(fileURLWithPath: "/virtual/configuration-cancels-executor-\(UUID().uuidString).json")
+        let store = ConfigurationStore(primaryURL: url, fileAccess: files)
+        try await store.save(oldFixture.configuration)
+        let service = CancellationAwareGatedActionService(
+            delayedIntent: .launchOrActivateApplication(target)
+        )
+        let input = ManualInputProducer()
+        let runtime = ActionRuntime(
+            inputProducer: input,
+            capabilities: FixtureCapabilities(),
+            programmer: FixtureProgrammer(),
+            foregroundApplication: MutableForeground(),
+            controlMapping: FixtureMapping([:]),
+            configurationStore: store,
+            actionService: service,
+            executionLimits: ActionExecutionLimits(
+                perActionTimeout: .seconds(4),
+                sequenceDeadline: .seconds(5)
+            )
+        )
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+        let dial = try XCTUnwrap(PhysicalControlID(rawValue: "fixture-dial", kind: .dial))
+        let rotation = try XCTUnwrap(NormalizedInputEvent.dialRotation(
+            control: dial,
+            delta: 1,
+            generation: generation
+        ))
+        let routing = Task { await input.emit(rotation) }
+        guard await service.waitUntilDelayedActionEntered() else {
+            _ = await runtime.submit(.stop)
+            XCTFail("Sequence should reach the gated service call")
+            return
+        }
+
+        if reload {
+            try await store.save(newFixture.configuration)
+            try await runtime.reloadConfiguration()
+        } else {
+            try await runtime.installConfiguration(newFixture.configuration)
+        }
+        let replacementReturnedAt = ContinuousClock.now
+        let callsAtReplacementReturn = await service.startedCallCount
+        await routing.value
+        let callsAfterRoutingCompleted = await service.startedCallCount
+        XCTAssertEqual(
+            callsAfterRoutingCompleted,
+            callsAtReplacementReturn,
+            "No executor service call should begin after configuration replacement returns"
+        )
+        let cancellationObserved = await service.didObserveCancellation
+        XCTAssertTrue(cancellationObserved, "Replacement should cancel the active sequence service wait")
+        let callStartTimes = await service.callStartTimes
+        XCTAssertTrue(
+            callStartTimes.allSatisfy { $0 < replacementReturnedAt },
+            "Every service call must start before configuration replacement returns"
+        )
+        let intents = await service.completedIntents
+        let key = try XCTUnwrap(MacVirtualKeyCode(8))
+        XCTAssertTrue(intents.contains(.keyboard(.up, .key(key))))
+        XCTAssertTrue(intents.contains(.keyboard(.up, .modifier(.control))))
+        XCTAssertTrue(intents.contains(.keyboard(.up, .modifier(.option))))
+        XCTAssertFalse(intents.contains(.launchOrActivateApplication(target)))
     }
 
     func testInstallConfigurationInvalidatesRouteWaitingForForeground() async throws {
@@ -1020,6 +1186,88 @@ private actor RecordingActionService: HostActionServicing {
     }
 }
 
+private actor CancellationAwareGatedActionService: HostActionServicing {
+    private let delayedIntent: HostActionIntent
+    private var delayedContinuation: CheckedContinuation<HostActionServiceResult, Never>?
+    private var enteredContinuation: CheckedContinuation<Bool, Never>?
+    private var entryWatchdog: Task<Void, Never>?
+    private var didEnterDelayedAction = false
+    private(set) var startedCallCount = 0
+    private(set) var callStartTimes: [ContinuousClock.Instant] = []
+    private(set) var didObserveCancellation = false
+    private(set) var completedIntents: [HostActionIntent] = []
+
+    init(delayedIntent: HostActionIntent) {
+        self.delayedIntent = delayedIntent
+    }
+
+    func waitUntilDelayedActionEntered() async -> Bool {
+        if didEnterDelayedAction { return true }
+        return await withCheckedContinuation { continuation in
+            enteredContinuation = continuation
+            entryWatchdog = Task {
+                try? await Task.sleep(for: .seconds(3))
+                self.expireEntryWait()
+            }
+        }
+    }
+
+    func perform(_ intent: HostActionIntent) async -> HostActionServiceResult {
+        startedCallCount += 1
+        callStartTimes.append(.now)
+        guard intent == delayedIntent else {
+            completedIntents.append(intent)
+            return .acceptedUnverified
+        }
+
+        let watchdog = Task {
+            try? await Task.sleep(for: .seconds(3))
+            self.expireDelayedAction()
+        }
+        let result = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                delayedContinuation = continuation
+                didEnterDelayedAction = true
+                entryWatchdog?.cancel()
+                entryWatchdog = nil
+                enteredContinuation?.resume(returning: true)
+                enteredContinuation = nil
+            }
+        } onCancel: {
+            Task { await self.cancelDelayedAction() }
+        }
+        watchdog.cancel()
+        return result
+    }
+
+    private func cancelDelayedAction() {
+        didObserveCancellation = true
+        finishDelayedAction(.failed(reason: "cancelled by configuration replacement"))
+    }
+
+    private func expireDelayedAction() {
+        finishDelayedAction(.failed(reason: "service gate expired"))
+    }
+
+    private func finishDelayedAction(_ result: HostActionServiceResult) {
+        let continuation = delayedContinuation
+        delayedContinuation = nil
+        continuation?.resume(returning: result)
+    }
+
+    private func expireEntryWait() {
+        let continuation = enteredContinuation
+        enteredContinuation = nil
+        entryWatchdog = nil
+        continuation?.resume(returning: false)
+    }
+}
+
+private actor AsyncTestFlag {
+    private(set) var isMarked = false
+    func mark() { isMarked = true }
+}
+
 private actor MutableForeground: ForegroundApplicationProviding {
     private var value: ApplicationBundleIdentifier?
     func foregroundBundleIdentifier() async -> ApplicationBundleIdentifier? { value }
@@ -1164,10 +1412,14 @@ private final class GatedBackupConfigurationFiles: ConfigurationFileAccess, @unc
     private let lock = NSLock()
     private var files: [String: Data] = [:]
     private var shouldBlockNextBackupWrite = false
+    private var shouldBlockNextPrimaryWrite = false
     private var primaryWrites = 0
     private let backupEntered = DispatchSemaphore(value: 0)
     private let releaseBackup = DispatchSemaphore(value: 0)
     private let backupFinished = DispatchSemaphore(value: 0)
+    private let primaryEntered = DispatchSemaphore(value: 0)
+    private let releasePrimary = DispatchSemaphore(value: 0)
+    private let primaryFinished = DispatchSemaphore(value: 0)
 
     var primaryWriteCount: Int {
         lock.lock(); defer { lock.unlock() }
@@ -1191,6 +1443,23 @@ private final class GatedBackupConfigurationFiles: ConfigurationFileAccess, @unc
         backupFinished.wait(timeout: .now() + .seconds(2)) == .success
     }
 
+    func blockNextPrimaryWrite() {
+        lock.lock(); defer { lock.unlock() }
+        shouldBlockNextPrimaryWrite = true
+    }
+
+    func waitForBlockedPrimaryWrite() -> Bool {
+        primaryEntered.wait(timeout: .now() + .seconds(2)) == .success
+    }
+
+    func releaseBlockedPrimaryWrite() {
+        releasePrimary.signal()
+    }
+
+    func waitForBlockedPrimaryWriteToFinish() -> Bool {
+        primaryFinished.wait(timeout: .now() + .seconds(2)) == .success
+    }
+
     func exists(at url: URL) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return files[url.path] != nil
@@ -1205,19 +1474,29 @@ private final class GatedBackupConfigurationFiles: ConfigurationFileAccess, @unc
     func writeAtomically(_ data: Data, to url: URL) throws {
         let isBackup = url.pathExtension == "backup"
         lock.lock()
-        let shouldBlock = isBackup && shouldBlockNextBackupWrite
-        if shouldBlock { shouldBlockNextBackupWrite = false }
+        let shouldBlock: Bool
+        if isBackup && shouldBlockNextBackupWrite {
+            shouldBlockNextBackupWrite = false
+            shouldBlock = true
+        } else if !isBackup && shouldBlockNextPrimaryWrite {
+            shouldBlockNextPrimaryWrite = false
+            shouldBlock = true
+        } else {
+            shouldBlock = false
+        }
         lock.unlock()
 
         if shouldBlock {
-            backupEntered.signal()
-            releaseBackup.wait()
+            (isBackup ? backupEntered : primaryEntered).signal()
+            (isBackup ? releaseBackup : releasePrimary).wait()
         }
 
         lock.lock()
         files[url.path] = data
         if !isBackup { primaryWrites += 1 }
         lock.unlock()
-        if shouldBlock { backupFinished.signal() }
+        if shouldBlock {
+            (isBackup ? backupFinished : primaryFinished).signal()
+        }
     }
 }

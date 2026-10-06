@@ -125,7 +125,7 @@ private final class TimeoutRace<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<TimedValue<Value>, Never>?
     private var result: TimedValue<Value>?
-    private var operationTask: Task<Void, Never>?
+    private var operationTask: Task<Value, Never>?
     private var timerTask: Task<Void, Never>?
 
     func begin(_ continuation: CheckedContinuation<TimedValue<Value>, Never>) {
@@ -142,13 +142,17 @@ private final class TimeoutRace<Value: Sendable>: @unchecked Sendable {
     func start(
         timeout: Duration,
         operation: @escaping @Sendable () async -> Value
-    ) {
+    ) -> Task<Value, Never>? {
         lock.lock()
         let alreadyFinished = result != nil
         lock.unlock()
-        guard !alreadyFinished else { return }
+        guard !alreadyFinished else { return nil }
 
-        let operation = Task { self.finish(.value(await operation())) }
+        let operation = Task<Value, Never> {
+            let value = await operation()
+            self.finish(.value(value))
+            return value
+        }
         let timer = Task {
             do {
                 try await Task.sleep(for: timeout)
@@ -169,6 +173,7 @@ private final class TimeoutRace<Value: Sendable>: @unchecked Sendable {
             operation.cancel()
             timer.cancel()
         }
+        return operation
     }
 
     func cancel() {
@@ -555,10 +560,9 @@ public actor HostActionExecutor {
                         failure = advanceFailure
                     }
                     if failure != nil { break }
-                    if ContinuousClock.now >= deadline {
-                        failure = .sequenceDeadlineExceeded
-                        break
-                    }
+                    // A joined synchronous store commit is authoritative even
+                    // when it completes after the deadline. Any following step
+                    // is rejected by the loop's deadline guard.
                     continue
                 }
                 executedHostAction = true
@@ -598,10 +602,11 @@ public actor HostActionExecutor {
         let remaining = ContinuousClock.now.duration(to: deadline)
         guard remaining > .zero else { return .timedOut }
         let race = TimeoutRace<DialModeAdvanceResult>()
+        var operationTask: Task<DialModeAdvanceResult, Never>?
         let timed: TimedValue<DialModeAdvanceResult> = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 race.begin(continuation)
-                race.start(timeout: remaining) {
+                operationTask = race.start(timeout: remaining) {
                     if let sequenceAdvanceMode {
                         return await sequenceAdvanceMode(profileID, deadline)
                     }
@@ -611,8 +616,13 @@ public actor HostActionExecutor {
         } onCancel: {
             race.cancel()
         }
-        if case .value = timed, ContinuousClock.now >= deadline { return .timedOut }
-        return timed
+        switch timed {
+        case .timedOut:
+            guard let operationTask else { return .timedOut }
+            return .value(await operationTask.value)
+        case .value(_), .cancelled:
+            return timed
+        }
     }
 
     private func performPrimitive(
@@ -800,7 +810,7 @@ public actor HostActionExecutor {
         let timed: TimedValue<HostActionServiceResult> = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 race.begin(continuation)
-                race.start(timeout: timeout) { await self.service.perform(intent) }
+                _ = race.start(timeout: timeout) { await self.service.perform(intent) }
             }
         } onCancel: {
             race.cancel()

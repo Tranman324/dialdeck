@@ -124,6 +124,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     /// installed snapshot and its remembered modes become active together.
     public func installConfiguration(_ newConfiguration: Configuration) async throws {
         beginConfigurationMutation()
+        await cancelExecutorAndRecordCleanupFailure()
         await configurationMutationGate.acquire()
         do {
             try await configurationStore.save(newConfiguration)
@@ -140,6 +141,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     /// app restart also restores each profile's remembered mode from the store.
     public func reloadConfiguration() async throws {
         beginConfigurationMutation()
+        await cancelExecutorAndRecordCleanupFailure()
         await configurationMutationGate.acquire()
         do {
             configuration = try await configurationStore.load()
@@ -155,10 +157,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         if isEditing != editing { routingRevision &+= 1 }
         isEditing = editing
         if editing {
-            let failures = await executor.cancelAndRelease()
-            if let failure = failures.first {
-                setActionResult(ActionExecutionResult(outcome: .failed(failure)))
-            }
+            await cancelExecutorAndRecordCleanupFailure()
         }
     }
 
@@ -457,11 +456,10 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                     return .failed(deadline.map({ ContinuousClock.now >= $0 }) == true ? .sequenceDeadlineExceeded : .cancelled)
                 }
                 try await configurationStore.save(updated)
-                guard routeIsCurrent(permit), !Task.isCancelled,
-                      deadline.map({ ContinuousClock.now < $0 }) ?? true else {
-                    await configurationMutationGate.release()
-                    return .failed(deadline.map({ ContinuousClock.now >= $0 }) == true ? .sequenceDeadlineExceeded : .cancelled)
-                }
+                // A successful save is the commit point. The store's atomic
+                // primary replacement is synchronous, so it may return after
+                // the sequence deadline or cancellation arrived. Reflect that
+                // committed state before releasing the mutation gate.
                 configuration = updated
                 if activeProfileID == profileID { selectedDialModeID = nextMode.id }
                 await configurationMutationGate.release()
@@ -470,6 +468,11 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 await configurationMutationGate.release()
                 throw error
             }
+        } catch is CancellationError {
+            let failure = deadline.map({ ContinuousClock.now >= $0 }) == true
+                ? ActionExecutionFailure.sequenceDeadlineExceeded
+                : .cancelled
+            return .failed(failure)
         } catch {
             return .failed(.modePersistenceFailed(RuntimeFailureText.sanitize(String(describing: error))))
         }
@@ -505,6 +508,13 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     private func finishConfigurationMutation() async {
         configurationMutationsInProgress = max(0, configurationMutationsInProgress - 1)
         await configurationMutationGate.release()
+    }
+
+    private func cancelExecutorAndRecordCleanupFailure() async {
+        let failures = await executor.cancelAndRelease()
+        if let failure = failures.first {
+            setActionResult(ActionExecutionResult(outcome: .failed(failure)))
+        }
     }
 
     private func routePermit(for eventGeneration: SessionGeneration) -> RoutePermit? {
