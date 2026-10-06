@@ -29,6 +29,16 @@ UI-facing code submits commands through `RuntimeCommandHandling.submit(_:)`. A `
 - Interface owns presentation and view modules.
 - Shared contract amendments go through the Runtime owner so all consumers can update against one accepted interface.
 
+## Configuration model and storage
+
+`DialDeckCore` exposes validated `PrimitiveAction`, `ConfiguredAction`, `ActionSequence`, `Profile`, `DialMode`, and `Configuration` values. Profiles use UUID-backed `ProfileID` and `DialModeID`; labels and array order do not determine identity. Application profiles match validated bundle identifiers. A missing application assignment or `.inherit` resolves to the default profile, while `.set(.primitive(.doNothing))` is an explicit disabled action. Missing default-profile assignments resolve to Do nothing.
+
+Use `ProfileActionResolver.resolve(bundleIdentifier:target:in:)` for button assignments and `resolveDialModeAction(bundleIdentifier:target:in:)` for the selected profile's dial mode. A profile remembers a mode by ID; if it has no remembered selection, its default mode is selected. Deleting the remembered mode selects the profile default. Deleting the default mode promotes the first remaining mode in current order; a profile cannot delete its last mode.
+
+`ConfigurationStore` is an actor with `load()`, `save(_:)`, `importConfiguration(_:)`, and `exportConfiguration()`. Its JSON envelope carries schema version 1. Imports are limited to 1 MiB and are completely decoded and validated before any state is replaced; malformed input and unsupported schema versions have structured errors. Saves write the previous valid snapshot to a backup before atomically replacing the primary file. The store serializes file transactions and checks cancellation before replacement, so cancellation before commit leaves the primary snapshot intact. Consumers should await store calls from UI code; synchronous filesystem operations run inside the store actor. File-access implementations must preserve the destination when an atomic write fails.
+
+Host action sequences contain only leaf primitive actions and bounded pauses, so nested or cyclic sequence graphs cannot be represented. Current app-side safety bounds are 32 steps, 10,000 ms per explicit pause, and 60,000 ms total explicit pause duration in a sequence. These bounds describe host configuration only; they do not establish action-execution timeouts or device capacity. The recovered Windows encoder serializes only five keyboard steps and provides no macro delays. That observed encoder format is separate from host-run sequences and does not prove a firmware maximum. Configuration resolution and storage do not synthesize system input, execute actions, or write hardware.
+
 ## Local signing
 
 Local signing identity availability was observed on the verified host as noted above. No signing credentials are stored in this repository. Public Developer ID signing and notarization are not configured or verified by this foundation.
