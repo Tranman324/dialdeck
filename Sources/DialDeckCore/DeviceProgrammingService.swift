@@ -50,12 +50,24 @@ private final class USBWriteCancellation: @unchecked Sendable {
 /// calls from distinct service instances. Blocking USB calls run off the UI actor.
 public final class KeyboardDeviceProgrammingService: Sendable {
     private let queue = DispatchQueue(label: "DialDeck.deviceProgramming")
+    private let transport: @Sendable ([UInt8], Int, OpaquePointer) -> DDUSBResult
     private static let observedUsages: [UInt8: UInt8] = [
         1: 0x1b, 2: 0x04, 3: 0x05, 4: 0x07, 5: 0x08, 6: 0x09,
         13: 0x0a, 14: 0x0b, 15: 0x0d
     ]
 
-    public init() {}
+    public init() {
+        transport = { bytes, count, token in
+            bytes.withUnsafeBufferPointer { buffer in
+                dd_usb_send_reports(buffer.baseAddress, count, bytes.count, token)
+            }
+        }
+    }
+
+    // Offline injection only. Production callers use the public initializer.
+    internal init(transport: @escaping @Sendable ([UInt8], Int, OpaquePointer) -> DDUSBResult) {
+        self.transport = transport
+    }
 
     public func program(_ request: KeyboardDeviceWriteRequest) async -> KeyboardDeviceWriteResult {
         guard request.acceptsPersistentOverwrite else {
@@ -83,13 +95,11 @@ public final class KeyboardDeviceProgrammingService: Sendable {
                 reason: "Unable to allocate cancellation state", reportsAccepted: 0))
         }
         let bytes = reports.flatMap { $0 }
+        let transport = self.transport
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 queue.async {
-                    let result = bytes.withUnsafeBufferPointer { buffer in
-                        dd_usb_send_reports(
-                            buffer.baseAddress, reports.count, bytes.count, cancellation.pointer)
-                    }
+                    let result = transport(bytes, reports.count, cancellation.pointer)
                     let accepted = Int(result.reports_accepted)
                     let outcome: KeyboardDeviceWriteOutcome
                     switch result.status {
