@@ -295,6 +295,50 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertTrue(intents.isEmpty, "The cancellation check must prevent perform from starting")
     }
 
+    func testLateAcceptedKeyDownIsLedgeredAndReleasedDuringExecutorCleanup() async throws {
+        let keyCode = try XCTUnwrap(MacVirtualKeyCode(8))
+        let down = HostActionIntent.keyboard(.down, .key(keyCode))
+        let service = LateAcceptedKeyDownActionService(gatedDown: down)
+        let executor = HostActionExecutor(
+            service: service,
+            limits: ActionExecutionLimits(perActionTimeout: .seconds(2), sequenceDeadline: .seconds(5))
+        )
+        let sequence = try ActionSequence(steps: [
+            .action(.holdKeys(KeyboardChord(key: keyCode, modifiers: []))),
+            .pause(milliseconds: 1_000),
+        ])
+        let action = Task {
+            await executor.executeDialAction(
+                .sequence(sequence),
+                profileID: ProfileID(),
+                dialMagnitude: 1,
+                advanceMode: noModeChange,
+                admissionRevision: 0
+            )
+        }
+
+        let downStarted = await service.waitUntilDownStarted()
+        XCTAssertTrue(downStarted, "The synthetic key-down should enter the gated adapter call")
+        guard downStarted else {
+            await service.releaseDown()
+            _ = await action.value
+            return
+        }
+        let cleanup = Task { await executor.cancelAndRelease(floor: 1) }
+        let cancellationObserved = await service.waitUntilCancellationObserved()
+        XCTAssertTrue(cancellationObserved, "Executor cleanup should cancel the in-flight key-down call")
+
+        await service.releaseDown()
+        let result = await action.value
+        let cleanupFailures = await cleanup.value
+        let intents = await service.intents
+
+        XCTAssertEqual(result.outcome, .cancelled)
+        XCTAssertTrue(cleanupFailures.isEmpty)
+        XCTAssertEqual(intents, [down, .keyboard(.up, .key(keyCode))],
+                       "A late accepted down must be entered in the owner ledger so executor cleanup balances it")
+    }
+
     func testMissingTargetIsActionableAndSequencesReportPartialFailure() async throws {
         let missingID = try XCTUnwrap(ApplicationBundleIdentifier("com.example.missing"))
         let service = RecordingActionService(result: .missingTarget(.application(missingID)))
@@ -699,7 +743,11 @@ final class ActionRuntimeTests: XCTestCase {
     }
 
     func testExplicitStopDuringPrimaryCommitWaitsAndReportsCommittedMode() async throws {
-        let sequence = try ActionSequence(steps: [.action(.nextDialMode)])
+        let keyCode = try XCTUnwrap(MacVirtualKeyCode(8))
+        let sequence = try ActionSequence(steps: [
+            .action(.holdKeys(KeyboardChord(key: keyCode, modifiers: []))),
+            .action(.nextDialMode),
+        ])
         let fixture = try makeConfiguration(
             defaultButton: .primitive(.doNothing),
             appButton: .inherit,
@@ -712,6 +760,7 @@ final class ActionRuntimeTests: XCTestCase {
         files.blockNextPrimaryWrite()
 
         let input = ManualInputProducer()
+        let service = RecordingActionService()
         let runtime = ActionRuntime(
             inputProducer: input,
             capabilities: FixtureCapabilities(),
@@ -719,7 +768,7 @@ final class ActionRuntimeTests: XCTestCase {
             foregroundApplication: MutableForeground(),
             controlMapping: FixtureMapping([:]),
             configurationStore: store,
-            actionService: RecordingActionService(),
+            actionService: service,
             executionLimits: ActionExecutionLimits(
                 perActionTimeout: .seconds(1),
                 sequenceDeadline: .seconds(5)
@@ -776,6 +825,9 @@ final class ActionRuntimeTests: XCTestCase {
             modeID: fixture.secondModeID
         ))
         XCTAssertEqual(snapshot.selectedDialModeID, fixture.secondModeID)
+        let intents = await service.intents
+        XCTAssertEqual(intents, [.keyboard(.down, .key(keyCode)), .keyboard(.up, .key(keyCode))],
+                       "A committed terminal mode result should survive cancellation-only held-key cleanup")
         let reloaded = try await ConfigurationStore(primaryURL: url, fileAccess: files).load()
         XCTAssertEqual(reloaded.defaultProfile.selectedDialMode.id, fixture.secondModeID)
         XCTAssertEqual(files.primaryWriteCount, 2)
@@ -1604,6 +1656,34 @@ private actor RecordingActionService: HostActionServicing {
         intents.append(intent)
         timestamps.append(.now)
         return result
+    }
+}
+
+private actor LateAcceptedKeyDownActionService: HostActionServicing {
+    private let gatedDown: HostActionIntent
+    private let gate = CancellationGate()
+    private(set) var intents: [HostActionIntent] = []
+
+    init(gatedDown: HostActionIntent) {
+        self.gatedDown = gatedDown
+    }
+
+    func waitUntilDownStarted() async -> Bool {
+        await gate.waitUntilEntered()
+    }
+
+    func waitUntilCancellationObserved() async -> Bool {
+        await gate.waitUntilCancelled()
+    }
+
+    func releaseDown() async {
+        await gate.release()
+    }
+
+    func perform(_ intent: HostActionIntent) async -> HostActionServiceResult {
+        intents.append(intent)
+        if intent == gatedDown { await gate.suspend() }
+        return .acceptedUnverified
     }
 }
 

@@ -642,7 +642,14 @@ public actor HostActionExecutor {
                     // is rejected by the loop's deadline guard.
                     continue
                 }
-                executedHostAction = true
+                if case .holdKeys = primitive {
+                    // Held inputs are temporary executor-owned state. If the
+                    // sequence ends with a committed mode change, their
+                    // cancellation-only release can remain pending in the
+                    // executor cleanup path without masking that result.
+                } else {
+                    executedHostAction = true
+                }
                 failure = await performPrimitive(
                     primitive,
                     owner: owner,
@@ -664,7 +671,14 @@ public actor HostActionExecutor {
         }
 
         let cleanup = await release(owner)
-        if failure == nil, let cleanupFailure = cleanup.first { failure = cleanupFailure }
+        let terminalModeWithPendingCancellationCleanup = changedModeID != nil
+            && !executedHostAction
+            && cleanup.allSatisfy { $0 == .cancelled }
+        if failure == nil,
+           !terminalModeWithPendingCancellationCleanup,
+           let cleanupFailure = cleanup.first {
+            failure = cleanupFailure
+        }
         if failure != nil, let stop = SequenceStopClassifier.failure(deadline: deadline) {
             failure = stop
         }
@@ -773,7 +787,8 @@ public actor HostActionExecutor {
             if owners.isEmpty {
                 if let failure = await perform(
                     .keyboard(.down, .modifier(modifier)),
-                    sequenceDeadline: sequenceDeadline
+                    sequenceDeadline: sequenceDeadline,
+                    acceptedDownOwner: owner
                 ) { return failure }
             }
             owners.insert(owner)
@@ -792,7 +807,8 @@ public actor HostActionExecutor {
         if owners.isEmpty {
             if let failure = await perform(
                 .keyboard(.down, .key(key)),
-                sequenceDeadline: sequenceDeadline
+                sequenceDeadline: sequenceDeadline,
+                acceptedDownOwner: owner
             ) { return failure }
         }
         owners.insert(owner)
@@ -861,7 +877,8 @@ public actor HostActionExecutor {
 
     private func perform(
         _ intent: HostActionIntent,
-        sequenceDeadline: ContinuousClock.Instant? = nil
+        sequenceDeadline: ContinuousClock.Instant? = nil,
+        acceptedDownOwner: ActionOwner? = nil
     ) async -> ActionExecutionFailure? {
         var timeout = limits.perActionTimeout
         var timeoutFailure: ActionExecutionFailure = .actionTimedOut
@@ -882,9 +899,11 @@ public actor HostActionExecutor {
             return await service.perform(intent)
         }
         switch timed {
-        case .timedOut:
+        case .timedOut(let lateResult):
+            recordLateAcceptedDown(lateResult.flatMap { $0 }, intent: intent, owner: acceptedDownOwner)
             return SequenceStopClassifier.failure(deadline: sequenceDeadline) ?? timeoutFailure
-        case .cancelled:
+        case .cancelled(let lateResult):
+            recordLateAcceptedDown(lateResult.flatMap { $0 }, intent: intent, owner: acceptedDownOwner)
             return SequenceStopClassifier.failure(deadline: sequenceDeadline) ?? .cancelled
         case .skipped:
             return SequenceStopClassifier.failure(deadline: sequenceDeadline) ?? .cancelled
@@ -900,6 +919,25 @@ public actor HostActionExecutor {
         case .value(.some(.failed(let reason))):
             return SequenceStopClassifier.failure(deadline: sequenceDeadline)
                 ?? .serviceFailed(RuntimeFailureText.sanitize(reason))
+        }
+    }
+
+    /// A timed-out or canceled adapter call may still report that its down
+    /// intent was accepted. Preserve ownership before returning the typed
+    /// failure so executor cleanup can issue the balancing up transition.
+    private func recordLateAcceptedDown(
+        _ result: HostActionServiceResult?,
+        intent: HostActionIntent,
+        owner: ActionOwner?
+    ) {
+        guard result == .acceptedUnverified, let owner else { return }
+        switch intent {
+        case .keyboard(.down, .key(let key)):
+            keyOwners[key, default: []].insert(owner)
+        case .keyboard(.down, .modifier(let modifier)):
+            modifierOwners[modifier, default: []].insert(owner)
+        default:
+            break
         }
     }
 
