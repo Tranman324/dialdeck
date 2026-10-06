@@ -23,7 +23,8 @@ public struct KeyboardDeviceWriteRequest: Sendable {
 }
 
 /// Mode 2 was observed running a six-color sequence, retained after one reconnect.
-/// Mode 1 is a source-derived candidate for a separate bounded physical check.
+/// Mode 1 was observed changing colors on key press and release, including
+/// after one reconnect. Exact per-key color behavior remains unverified.
 public enum DeviceLightingModeCandidate: UInt8, Sendable {
     case mode1 = 1
     case mode2 = 2
