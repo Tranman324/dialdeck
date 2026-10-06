@@ -114,95 +114,109 @@ private enum ActionOwner: Hashable, Sendable {
 
 private enum TimedValue<Value: Sendable>: Sendable {
     case value(Value)
+    case timedOut(Value?)
+    case cancelled(Value?)
+    case skipped
+}
+
+private enum RaceEvent<Value: Sendable>: Sendable {
+    case operation(Value)
+    case skipped
     case timedOut
     case cancelled
 }
 
-/// One-shot race that lets a timeout return even if a service fails to honor
-/// cancellation. The service contract still requires cancellation cooperation
-/// so it cannot perform a late side effect after the caller has timed out.
-private final class TimeoutRace<Value: Sendable>: @unchecked Sendable {
+/// Bridges task cancellation into a task-group child without creating an
+/// unstructured task or relying on a long-duration sleeper.
+private final class TaskCancellationSignal: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<TimedValue<Value>, Never>?
-    private var result: TimedValue<Value>?
-    private var operationTask: Task<Value, Never>?
-    private var timerTask: Task<Void, Never>?
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var didSignal = false
 
-    func begin(_ continuation: CheckedContinuation<TimedValue<Value>, Never>) {
-        lock.lock()
-        if let result {
-            lock.unlock()
-            continuation.resume(returning: result)
-        } else {
-            self.continuation = continuation
-            lock.unlock()
-        }
-    }
-
-    func start(
-        timeout: Duration,
-        operation: @escaping @Sendable () async -> Value
-    ) -> Task<Value, Never>? {
-        lock.lock()
-        let alreadyFinished = result != nil
-        lock.unlock()
-        guard !alreadyFinished else { return nil }
-
-        let operation = Task<Value, Never> {
-            let value = await operation()
-            self.finish(.value(value))
-            return value
-        }
-        let timer = Task {
-            do {
-                try await Task.sleep(for: timeout)
-                self.finish(.timedOut)
-            } catch {
-                // A competing result ended this race.
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if didSignal {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                self.continuation = continuation
+                lock.unlock()
             }
         }
-
-        lock.lock()
-        let finishedDuringInstall = result != nil
-        if !finishedDuringInstall {
-            operationTask = operation
-            timerTask = timer
-        }
-        lock.unlock()
-        if finishedDuringInstall {
-            operation.cancel()
-            timer.cancel()
-        }
-        return operation
     }
 
-    func cancel() {
-        finish(.cancelled)
-    }
-
-    private func finish(_ result: TimedValue<Value>) {
+    func signal() {
         lock.lock()
-        guard self.result == nil else {
-            lock.unlock()
-            return
-        }
-        self.result = result
+        didSignal = true
         let continuation = self.continuation
         self.continuation = nil
-        let operation = operationTask
-        operationTask = nil
-        let timer = timerTask
-        timerTask = nil
         lock.unlock()
+        continuation?.resume()
+    }
+}
 
-        switch result {
-        case .value, .timedOut:
-            operation?.cancel()
-        case .cancelled:
-            operation?.cancel()
+/// Structured race: every child is canceled and drained before this returns.
+/// A late operation value is retained because it may describe an already
+/// committed mode write that the caller must report accurately.
+private func race<Value: Sendable>(
+    timeout: Duration,
+    operation: @escaping @Sendable () async -> Value
+) async -> TimedValue<Value> {
+    let cancellationSignal = TaskCancellationSignal()
+    return await withTaskGroup(of: RaceEvent<Value>.self, returning: TimedValue<Value>.self) { group in
+        group.addTask {
+            guard !Task.isCancelled else { return .skipped }
+            return .operation(await operation())
         }
-        timer?.cancel()
-        continuation?.resume(returning: result)
+        group.addTask {
+            do {
+                try await Task.sleep(for: timeout)
+                return .timedOut
+            } catch {
+                return .cancelled
+            }
+        }
+        group.addTask {
+            await withTaskCancellationHandler {
+                await cancellationSignal.wait()
+            } onCancel: {
+                cancellationSignal.signal()
+            }
+            return .cancelled
+        }
+
+        guard let first = await group.next() else { return .cancelled(nil) }
+        let parentWasCancelled = Task.isCancelled
+        var lateValue: Value?
+        if case .operation(let value) = first { lateValue = value }
+        group.cancelAll()
+        while let event = await group.next() {
+            if case .operation(let value) = event { lateValue = value }
+        }
+
+        switch first {
+        case .operation(let value):
+            return parentWasCancelled ? .cancelled(lateValue ?? value) : .value(value)
+        case .timedOut:
+            return .timedOut(lateValue)
+        case .cancelled:
+            return .cancelled(lateValue)
+        case .skipped:
+            return .cancelled(lateValue)
+        }
+    }
+}
+
+enum SequenceStopClassifier {
+    static func failure(
+        deadline: ContinuousClock.Instant?,
+        isCancelled: Bool = Task.isCancelled,
+        now: ContinuousClock.Instant = .now
+    ) -> ActionExecutionFailure? {
+        if let deadline, now >= deadline { return .sequenceDeadlineExceeded }
+        if isCancelled { return .cancelled }
+        return nil
     }
 }
 
@@ -236,6 +250,7 @@ public actor HostActionExecutor {
 
     private let service: any HostActionServicing
     private let limits: ActionExecutionLimits
+    private let beforeServiceInvocation: (@Sendable () async -> Void)?
     private let gate = AsyncActionGate()
     private var activeOperations: [UUID: Task<ActionExecutionResult, Never>] = [:]
     private var admissionFloor: UInt64 = 0
@@ -246,6 +261,17 @@ public actor HostActionExecutor {
     public init(service: any HostActionServicing, limits: ActionExecutionLimits = .init()) {
         self.service = service
         self.limits = limits
+        self.beforeServiceInvocation = nil
+    }
+
+    init(
+        service: any HostActionServicing,
+        limits: ActionExecutionLimits = .init(),
+        beforeServiceInvocation: @escaping @Sendable () async -> Void
+    ) {
+        self.service = service
+        self.limits = limits
+        self.beforeServiceInvocation = beforeServiceInvocation
     }
 
     public func keyDown(
@@ -542,30 +568,27 @@ public actor HostActionExecutor {
         var changedModeID: DialModeID?
         var executedHostAction = false
         for step in sequence.steps {
-            guard !Task.isCancelled else {
-                failure = .cancelled
-                break
-            }
-            guard ContinuousClock.now < deadline else {
-                failure = .sequenceDeadlineExceeded
+            if let stop = SequenceStopClassifier.failure(deadline: deadline) {
+                failure = stop
                 break
             }
             switch step {
             case .pause(let milliseconds):
                 let remaining = ContinuousClock.now.duration(to: deadline)
-                guard remaining > .zero else {
-                    failure = .sequenceDeadlineExceeded
+                if let stop = SequenceStopClassifier.failure(deadline: deadline) {
+                    failure = stop
                     break
                 }
+                guard remaining > .zero else { failure = .sequenceDeadlineExceeded; break }
                 do {
                     try await Task.sleep(for: min(.milliseconds(milliseconds), remaining))
-                    if ContinuousClock.now >= deadline {
-                        failure = .sequenceDeadlineExceeded
+                    if let stop = SequenceStopClassifier.failure(deadline: deadline) {
+                        failure = stop
                     } else {
                         completedSteps += 1
                     }
                 } catch {
-                    failure = .cancelled
+                    failure = SequenceStopClassifier.failure(deadline: deadline) ?? .cancelled
                 }
             case .action(let primitive):
                 if case .doNothing = primitive {
@@ -579,15 +602,27 @@ public actor HostActionExecutor {
                         advanceMode: advanceMode,
                         sequenceAdvanceMode: sequenceAdvanceMode
                     ) {
-                    case .timedOut:
+                    case .timedOut(let lateResult):
+                        if case .advanced(let modeID)? = lateResult {
+                            changedModeID = modeID
+                            completedSteps += 1
+                            continue
+                        }
                         failure = .sequenceDeadlineExceeded
-                    case .cancelled:
-                        failure = .cancelled
+                    case .cancelled(let lateResult):
+                        if case .advanced(let modeID)? = lateResult {
+                            changedModeID = modeID
+                            completedSteps += 1
+                            continue
+                        }
+                        failure = SequenceStopClassifier.failure(deadline: deadline) ?? .cancelled
+                    case .skipped:
+                        failure = SequenceStopClassifier.failure(deadline: deadline) ?? .cancelled
                     case .value(.advanced(let modeID)):
                         changedModeID = modeID
                         completedSteps += 1
                     case .value(.failed(let advanceFailure)):
-                        failure = advanceFailure
+                        failure = SequenceStopClassifier.failure(deadline: deadline) ?? advanceFailure
                     }
                     if failure != nil { break }
                     // A joined synchronous store commit is authoritative even
@@ -610,8 +645,8 @@ public actor HostActionExecutor {
                 completedSteps += 1
             }
             if failure != nil { break }
-            if ContinuousClock.now >= deadline {
-                failure = .sequenceDeadlineExceeded
+            if let stop = SequenceStopClassifier.failure(deadline: deadline) {
+                failure = stop
                 break
             }
         }
@@ -629,29 +664,16 @@ public actor HostActionExecutor {
         advanceMode: @escaping @Sendable (ProfileID) async -> DialModeAdvanceResult,
         sequenceAdvanceMode: (@Sendable (ProfileID, ContinuousClock.Instant) async -> DialModeAdvanceResult)?
     ) async -> TimedValue<DialModeAdvanceResult> {
-        let remaining = ContinuousClock.now.duration(to: deadline)
-        guard remaining > .zero else { return .timedOut }
-        let race = TimeoutRace<DialModeAdvanceResult>()
-        var operationTask: Task<DialModeAdvanceResult, Never>?
-        let timed: TimedValue<DialModeAdvanceResult> = await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                race.begin(continuation)
-                operationTask = race.start(timeout: remaining) {
-                    if let sequenceAdvanceMode {
-                        return await sequenceAdvanceMode(profileID, deadline)
-                    }
-                    return await advanceMode(profileID)
-                }
-            }
-        } onCancel: {
-            race.cancel()
+        if let stop = SequenceStopClassifier.failure(deadline: deadline) {
+            return stop == .sequenceDeadlineExceeded ? .timedOut(nil) : .cancelled(nil)
         }
-        switch timed {
-        case .timedOut, .cancelled:
-            guard let operationTask else { return timed }
-            return .value(await operationTask.value)
-        case .value(_):
-            return timed
+        let remaining = ContinuousClock.now.duration(to: deadline)
+        guard remaining > .zero else { return .timedOut(nil) }
+        return await race(timeout: remaining) {
+            if let sequenceAdvanceMode {
+                return await sequenceAdvanceMode(profileID, deadline)
+            }
+            return await advanceMode(profileID)
         }
     }
 
@@ -829,6 +851,9 @@ public actor HostActionExecutor {
         var timeout = limits.perActionTimeout
         var timeoutFailure: ActionExecutionFailure = .actionTimedOut
         if let sequenceDeadline {
+            if let stop = SequenceStopClassifier.failure(deadline: sequenceDeadline) {
+                return stop
+            }
             let remaining = ContinuousClock.now.duration(to: sequenceDeadline)
             guard remaining > .zero else { return .sequenceDeadlineExceeded }
             if remaining <= timeout {
@@ -836,28 +861,30 @@ public actor HostActionExecutor {
                 timeoutFailure = .sequenceDeadlineExceeded
             }
         }
-        let race = TimeoutRace<HostActionServiceResult>()
-        let timed: TimedValue<HostActionServiceResult> = await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                race.begin(continuation)
-                _ = race.start(timeout: timeout) { await self.service.perform(intent) }
-            }
-        } onCancel: {
-            race.cancel()
+        let timed = await race(timeout: timeout) { [service, beforeServiceInvocation] in
+            if let beforeServiceInvocation { await beforeServiceInvocation() }
+            guard !Task.isCancelled else { return nil as HostActionServiceResult? }
+            return await service.perform(intent)
         }
         switch timed {
         case .timedOut:
-            return timeoutFailure
+            return SequenceStopClassifier.failure(deadline: sequenceDeadline) ?? timeoutFailure
         case .cancelled:
-            return .cancelled
-        case .value(.acceptedUnverified):
+            return SequenceStopClassifier.failure(deadline: sequenceDeadline) ?? .cancelled
+        case .skipped:
+            return SequenceStopClassifier.failure(deadline: sequenceDeadline) ?? .cancelled
+        case .value(nil):
+            return SequenceStopClassifier.failure(deadline: sequenceDeadline) ?? .cancelled
+        case .value(.some(.acceptedUnverified)):
             return nil
-        case .value(.missingTarget(let target)):
-            return .missingTarget(target)
-        case .value(.unsupported(let reason)):
-            return .unsupportedAction(RuntimeFailureText.sanitize(reason))
-        case .value(.failed(let reason)):
-            return .serviceFailed(RuntimeFailureText.sanitize(reason))
+        case .value(.some(.missingTarget(let target))):
+            return SequenceStopClassifier.failure(deadline: sequenceDeadline) ?? .missingTarget(target)
+        case .value(.some(.unsupported(let reason))):
+            return SequenceStopClassifier.failure(deadline: sequenceDeadline)
+                ?? .unsupportedAction(RuntimeFailureText.sanitize(reason))
+        case .value(.some(.failed(let reason))):
+            return SequenceStopClassifier.failure(deadline: sequenceDeadline)
+                ?? .serviceFailed(RuntimeFailureText.sanitize(reason))
         }
     }
 

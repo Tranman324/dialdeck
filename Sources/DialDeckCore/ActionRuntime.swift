@@ -64,6 +64,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     private let configurationMutationGate = AsyncActionGate()
     private var routingRevision: UInt64 = 0
     private var configurationMutationsInProgress = 0
+    private var modeAdvanceStartGateForTesting: (@Sendable () async -> Void)?
 
     public init(
         inputProducer: any InputEventProducing,
@@ -118,6 +119,10 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             selectedDialModeID: selectedDialModeID,
             lastActionResult: lastActionResult
         )
+    }
+
+    func setModeAdvanceStartGateForTesting(_ gate: (@Sendable () async -> Void)?) {
+        modeAdvanceStartGateForTesting = gate
     }
 
     /// Configuration editors should save through this method so a newly
@@ -442,13 +447,21 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         permit: RoutePermit,
         deadline: ContinuousClock.Instant? = nil
     ) async -> DialModeAdvanceResult {
-        guard routeIsCurrent(permit), !Task.isCancelled,
-              deadline.map({ ContinuousClock.now < $0 }) ?? true else { return .failed(.cancelled) }
+        if let modeAdvanceStartGateForTesting { await modeAdvanceStartGateForTesting() }
+        if let stop = SequenceStopClassifier.failure(deadline: deadline) {
+            return .failed(stop)
+        }
+        guard routeIsCurrent(permit) else { return .failed(.cancelled) }
         do {
             let config = try await loadConfigurationIfNeeded()
-            guard routeIsCurrent(permit), !Task.isCancelled,
-                  deadline.map({ ContinuousClock.now < $0 }) ?? true else { return .failed(.cancelled) }
+            if let stop = SequenceStopClassifier.failure(deadline: deadline) {
+                return .failed(stop)
+            }
+            guard routeIsCurrent(permit) else { return .failed(.cancelled) }
             guard let profile = config.profile(id: profileID), !profile.dialModes.isEmpty else {
+                if let stop = SequenceStopClassifier.failure(deadline: deadline) {
+                    return .failed(stop)
+                }
                 return .failed(.modePersistenceFailed("The routed profile no longer exists"))
             }
             let currentID = profile.selectedDialMode.id
@@ -457,10 +470,13 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
             let updated = try config.rememberingDialMode(nextMode.id, for: profileID)
             await configurationMutationGate.acquire()
             do {
-                guard routeIsCurrent(permit), !Task.isCancelled,
-                      deadline.map({ ContinuousClock.now < $0 }) ?? true else {
+                if let stop = SequenceStopClassifier.failure(deadline: deadline) {
                     await configurationMutationGate.release()
-                    return .failed(deadline.map({ ContinuousClock.now >= $0 }) == true ? .sequenceDeadlineExceeded : .cancelled)
+                    return .failed(stop)
+                }
+                guard routeIsCurrent(permit) else {
+                    await configurationMutationGate.release()
+                    return .failed(.cancelled)
                 }
                 try await configurationStore.save(updated)
                 // A successful save is the commit point. The store's atomic
@@ -476,11 +492,11 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 throw error
             }
         } catch is CancellationError {
-            let failure = deadline.map({ ContinuousClock.now >= $0 }) == true
-                ? ActionExecutionFailure.sequenceDeadlineExceeded
-                : .cancelled
-            return .failed(failure)
+            return .failed(SequenceStopClassifier.failure(deadline: deadline) ?? .cancelled)
         } catch {
+            if let stop = SequenceStopClassifier.failure(deadline: deadline) {
+                return .failed(stop)
+            }
             return .failed(.modePersistenceFailed(RuntimeFailureText.sanitize(String(describing: error))))
         }
     }

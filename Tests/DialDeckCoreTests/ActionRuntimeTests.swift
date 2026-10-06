@@ -246,6 +246,55 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertEqual(result.outcome, .failed(.actionTimedOut))
     }
 
+    func testCancellationBeforeServiceInvocationJoinsNestedRace() async throws {
+        let service = RecordingActionService()
+        let invocationGate = CancellationGate()
+        let executor = HostActionExecutor(
+            service: service,
+            limits: ActionExecutionLimits(perActionTimeout: .seconds(2), sequenceDeadline: .seconds(2)),
+            beforeServiceInvocation: { await invocationGate.suspend() }
+        )
+        let target = try XCTUnwrap(ApplicationBundleIdentifier("com.example.cancelled-before-call"))
+        let action = Task {
+            await executor.executeDialAction(
+                .primitive(.openApplication(target)),
+                profileID: ProfileID(),
+                dialMagnitude: 1,
+                advanceMode: noModeChange,
+                admissionRevision: 41
+            )
+        }
+
+        let reachedInvocationGate = await invocationGate.waitUntilEntered()
+        XCTAssertTrue(reachedInvocationGate, "The service child should pause immediately before invocation")
+        guard reachedInvocationGate else {
+            await invocationGate.release()
+            _ = await action.value
+            return
+        }
+
+        let cleanupCompleted = AsyncTestFlag()
+        let cleanup = Task {
+            let failures = await executor.cancelAndRelease(floor: 42)
+            await cleanupCompleted.mark()
+            return failures
+        }
+        let cancellationReachedChild = await invocationGate.waitUntilCancelled()
+        XCTAssertTrue(cancellationReachedChild, "The nested operation should observe cancellation before service invocation")
+        let cleanupReturnedBeforeChildJoined = await cleanupCompleted.isMarked
+        XCTAssertFalse(cleanupReturnedBeforeChildJoined, "Cleanup must wait for the structured race child to return")
+
+        await invocationGate.release()
+        let result = await action.value
+        let cleanupFailures = await cleanup.value
+        let intents = await service.intents
+        let cleanupReturned = await cleanupCompleted.isMarked
+        XCTAssertEqual(result.outcome, .cancelled)
+        XCTAssertTrue(cleanupFailures.isEmpty)
+        XCTAssertTrue(cleanupReturned)
+        XCTAssertTrue(intents.isEmpty, "The cancellation check must prevent perform from starting")
+    }
+
     func testMissingTargetIsActionableAndSequencesReportPartialFailure() async throws {
         let missingID = try XCTUnwrap(ApplicationBundleIdentifier("com.example.missing"))
         let service = RecordingActionService(result: .missingTarget(.application(missingID)))
@@ -456,6 +505,69 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertEqual(files.primaryWriteCount, 1, "The expired mode change must not start a primary write")
         let reloaded = try await ConfigurationStore(primaryURL: url, fileAccess: files).load()
         XCTAssertEqual(reloaded.defaultProfile.selectedDialMode.id, fixture.firstModeID)
+    }
+
+    func testSequenceDeadlineWinsWhenModeCallbackIsCancelledBeforeItsFirstGuard() async throws {
+        let sequence = try ActionSequence(steps: [.action(.nextDialMode)])
+        let fixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            clockwiseAction: .sequence(sequence)
+        )
+        let url = URL(fileURLWithPath: "/virtual/sequence-mode-first-guard-\(UUID().uuidString).json")
+        let store = ConfigurationStore(primaryURL: url, fileAccess: MemoryConfigurationFiles())
+        try await store.save(fixture.configuration)
+
+        let input = ManualInputProducer()
+        let runtime = ActionRuntime(
+            inputProducer: input,
+            capabilities: FixtureCapabilities(),
+            programmer: FixtureProgrammer(),
+            foregroundApplication: MutableForeground(),
+            controlMapping: FixtureMapping([:]),
+            configurationStore: store,
+            actionService: RecordingActionService(),
+            executionLimits: ActionExecutionLimits(
+                perActionTimeout: .seconds(1),
+                sequenceDeadline: .milliseconds(70)
+            )
+        )
+        let modeGate = CancellationGate()
+        await runtime.setModeAdvanceStartGateForTesting { await modeGate.suspend() }
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+        let dial = try XCTUnwrap(PhysicalControlID(rawValue: "fixture-dial", kind: .dial))
+        let rotation = try XCTUnwrap(NormalizedInputEvent.dialRotation(
+            control: dial,
+            delta: 1,
+            generation: generation
+        ))
+        let routeCompleted = AsyncTestFlag()
+        let routing = Task {
+            await input.emit(rotation)
+            await routeCompleted.mark()
+        }
+
+        let callbackPausedBeforeGuard = await modeGate.waitUntilEntered()
+        XCTAssertTrue(callbackPausedBeforeGuard, "The test gate must pause before the runtime deadline guard")
+        guard callbackPausedBeforeGuard else {
+            await modeGate.release()
+            await routing.value
+            return
+        }
+        let callbackCancelled = await modeGate.waitUntilCancelled()
+        XCTAssertTrue(callbackCancelled, "The deadline must cancel the mode callback while it is before the first guard")
+        let routeReturnedBeforeGuard = await routeCompleted.isMarked
+        XCTAssertFalse(routeReturnedBeforeGuard, "The executor must join the blocked callback before returning")
+
+        await modeGate.release()
+        await routing.value
+        let snapshot = await runtime.currentSnapshot()
+        XCTAssertEqual(snapshot.lastActionResult?.outcome, .failed(.sequenceDeadlineExceeded))
+        XCTAssertEqual(snapshot.selectedDialModeID, fixture.firstModeID)
+        let persisted = try await store.load()
+        XCTAssertEqual(persisted.defaultProfile.selectedDialMode.id, fixture.firstModeID)
     }
 
     func testSequenceModePersistenceJoiningPrimaryCommitReportsModeChange() async throws {
@@ -1532,6 +1644,82 @@ private actor CancellationAwareGatedActionService: HostActionServicing {
 private actor AsyncTestFlag {
     private(set) var isMarked = false
     func mark() { isMarked = true }
+}
+
+private actor CancellationGate {
+    private var operationContinuation: CheckedContinuation<Void, Never>?
+    private var enteredContinuation: CheckedContinuation<Bool, Never>?
+    private var cancelledContinuation: CheckedContinuation<Bool, Never>?
+    private var enteredWatchdog: Task<Void, Never>?
+    private var cancelledWatchdog: Task<Void, Never>?
+    private var didEnter = false
+    private var didCancel = false
+
+    func suspend() async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                operationContinuation = continuation
+                didEnter = true
+                enteredWatchdog?.cancel()
+                enteredWatchdog = nil
+                enteredContinuation?.resume(returning: true)
+                enteredContinuation = nil
+            }
+        } onCancel: {
+            Task { await self.noteCancellation() }
+        }
+    }
+
+    func waitUntilEntered() async -> Bool {
+        if didEnter { return true }
+        return await withCheckedContinuation { continuation in
+            enteredContinuation = continuation
+            enteredWatchdog = Task {
+                try? await Task.sleep(for: .seconds(3))
+                self.expireEnteredWait()
+            }
+        }
+    }
+
+    func waitUntilCancelled() async -> Bool {
+        if didCancel { return true }
+        return await withCheckedContinuation { continuation in
+            cancelledContinuation = continuation
+            cancelledWatchdog = Task {
+                try? await Task.sleep(for: .seconds(3))
+                self.expireCancelledWait()
+            }
+        }
+    }
+
+    func release() {
+        let continuation = operationContinuation
+        operationContinuation = nil
+        continuation?.resume()
+    }
+
+    private func noteCancellation() {
+        didCancel = true
+        cancelledWatchdog?.cancel()
+        cancelledWatchdog = nil
+        let continuation = cancelledContinuation
+        cancelledContinuation = nil
+        continuation?.resume(returning: true)
+    }
+
+    private func expireEnteredWait() {
+        let continuation = enteredContinuation
+        enteredContinuation = nil
+        enteredWatchdog = nil
+        continuation?.resume(returning: false)
+    }
+
+    private func expireCancelledWait() {
+        let continuation = cancelledContinuation
+        cancelledContinuation = nil
+        cancelledWatchdog = nil
+        continuation?.resume(returning: false)
+    }
 }
 
 private actor MutableForeground: ForegroundApplicationProviding {
