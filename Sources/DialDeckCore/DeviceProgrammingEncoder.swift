@@ -20,7 +20,7 @@ public enum ReportID3EncodingError: Error, Equatable, Sendable {
 
 /// The packet layout is source-derived. Its broader stroke sequences are
 /// offline-only; the transport separately restricts callable writes to the
-/// nine observed slot, layer, and plain-usage combinations.
+/// nine observed vectors and one explicitly staged validation vector.
 public enum ReportID3KeyboardEncoder {
     public static func encode(
         slot: UInt8,

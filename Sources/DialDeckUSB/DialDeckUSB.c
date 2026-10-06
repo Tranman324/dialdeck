@@ -183,7 +183,8 @@ int dd_usb_reports_permitted(const uint8_t *reports, size_t report_count,
     static const uint8_t observed_usages[9] = {
         0x1b,0x04,0x05,0x07,0x08,0x09,0x0a,0x0b,0x0d
     };
-    int permitted = 0;
+    static const uint8_t candidate_slot = 1;
+    static const uint8_t candidate_usage = 0x1d;
     for (size_t candidate = 0; candidate < 9; ++candidate) {
         uint8_t expected_reports[4][65] = {{0}};
         for (size_t i = 0; i < 4; ++i) expected_reports[i][0] = 3;
@@ -195,12 +196,19 @@ int dd_usb_reports_permitted(const uint8_t *reports, size_t report_count,
         expected_reports[2][4] = 1;
         expected_reports[2][6] = observed_usages[candidate];
         expected_reports[3][1] = 0xaa; expected_reports[3][2] = 0xaa;
-        if (memcmp(reports, expected_reports, sizeof(expected_reports)) == 0) {
-            permitted = 1;
-            break;
-        }
+        if (memcmp(reports, expected_reports, sizeof(expected_reports)) == 0) return 1;
     }
-    return permitted;
+    uint8_t candidate_reports[4][65] = {{0}};
+    for (size_t i = 0; i < 4; ++i) candidate_reports[i][0] = 3;
+    candidate_reports[0][1] = 0xa1; candidate_reports[0][2] = 1;
+    candidate_reports[1][1] = candidate_slot;
+    candidate_reports[1][2] = 0x11; candidate_reports[1][3] = 1;
+    candidate_reports[2][1] = candidate_slot;
+    candidate_reports[2][2] = 0x11; candidate_reports[2][3] = 1;
+    candidate_reports[2][4] = 1;
+    candidate_reports[2][6] = candidate_usage;
+    candidate_reports[3][1] = 0xaa; candidate_reports[3][2] = 0xaa;
+    return memcmp(reports, candidate_reports, sizeof(candidate_reports)) == 0;
 }
 
 static DDUSBResult send_reports_on_claimed_device(

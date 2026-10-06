@@ -1,7 +1,8 @@
 import DialDeckUSB
 import Foundation
 
-/// A deliberate layer-1 flash write to one observed protocol slot.
+/// A deliberate layer-1 flash write to one observed slot and approved usage
+/// vector, including any separately staged bounded validation candidate.
 /// The previous assignment cannot be read back or restored reliably.
 public struct KeyboardDeviceWriteRequest: Sendable {
     public let id: UUID
@@ -82,6 +83,8 @@ public final class KeyboardDeviceProgrammingService: Sendable {
         1: 0x1b, 2: 0x04, 3: 0x05, 4: 0x07, 5: 0x08, 6: 0x09,
         13: 0x0a, 14: 0x0b, 15: 0x0d
     ]
+    // One separately reviewed cross-dock validation candidate: slot 1 plain z.
+    private static let stagedValidationUsages: [UInt8: Set<UInt8>] = [1: [0x1d]]
 
     public init() {
         transport = { bytes, count, token in
@@ -103,10 +106,10 @@ public final class KeyboardDeviceProgrammingService: Sendable {
         }
         guard request.strokes.count == 1,
               request.strokes[0].modifiers == 0,
-              let observedUsage = Self.observedUsages[request.slot],
-              request.strokes[0].usage == observedUsage else {
+              (Self.observedUsages[request.slot] == request.strokes[0].usage ||
+               Self.stagedValidationUsages[request.slot]?.contains(request.strokes[0].usage) == true) else {
             return .init(id: request.id, outcome: .failed(
-                reason: "Only observed slot and plain-usage assignments are enabled",
+                reason: "Unsupported slot and plain-usage assignment",
                 reportsAccepted: 0))
         }
         let reports: [[UInt8]]

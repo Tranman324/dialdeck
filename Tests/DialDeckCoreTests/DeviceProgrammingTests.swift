@@ -111,6 +111,40 @@ final class DeviceProgrammingTests: XCTestCase {
         XCTAssertEqual(recorder.count, 0)
     }
 
+    func testHomeDockValidationCandidatePermitsOnlySlotOnePlainZ() async throws {
+        let recorder = TransportCallRecorder()
+        let service = KeyboardDeviceProgrammingService { bytes, count, _ in
+            recorder.record(bytes: bytes, count: count)
+            return DDUSBResult(status: DDUSB_SENT_UNVERIFIED, reports_accepted: 4)
+        }
+        let z = try XCTUnwrap(USBKeyboardStroke(modifiers: 0, usage: 0x1d))
+
+        let denied = await service.program(.init(
+            slot: 1, strokes: [z], acceptsPersistentOverwrite: false))
+        XCTAssertEqual(denied.outcome, .failed(
+            reason: "Persistent overwrite was not accepted", reportsAccepted: 0))
+        XCTAssertEqual(recorder.count, 0)
+
+        let accepted = await service.program(.init(
+            slot: 1, strokes: [z], acceptsPersistentOverwrite: true))
+        XCTAssertEqual(accepted.outcome, .sentUnverified(reportsAccepted: 4))
+        let expected = try encodedBytes(slot: 1, usage: 0x1d)
+        XCTAssertEqual(recorder.lastBytes, expected)
+        XCTAssertEqual(recorder.lastReportCount, 4)
+        let permitted = expected.withUnsafeBufferPointer { buffer in
+            dd_usb_reports_permitted(buffer.baseAddress, 4, expected.count)
+        }
+        XCTAssertEqual(permitted, 1)
+
+        for (slot, usage) in [(UInt8(2), UInt8(0x1d)), (UInt8(1), UInt8(0x1c))] {
+            let unsupported = try encodedBytes(slot: slot, usage: usage)
+            let rejected = unsupported.withUnsafeBufferPointer { buffer in
+                dd_usb_reports_permitted(buffer.baseAddress, 4, unsupported.count)
+            }
+            XCTAssertEqual(rejected, 0, "slot \(slot), usage \(usage)")
+        }
+    }
+
     func testServicePreservesIdentityAndReportsHostAcceptanceOnly() async throws {
         let recorder = TransportCallRecorder()
         let service = KeyboardDeviceProgrammingService { bytes, count, _ in
