@@ -98,6 +98,8 @@ final class ContractsSmokeTests: XCTestCase {
                 XCTAssertEqual(result.outcome, expectedOutcome)
             case .lightingProgramming:
                 XCTFail("A keyboard assignment command must return a keyboard programming result")
+            case .keyAssignmentProgramming:
+                XCTFail("An opaque generic programming command must retain the generic result case")
             case .noProgrammingResult:
                 XCTFail("A programming command must return its correlated result")
             }
@@ -240,6 +242,11 @@ private actor FakeRuntime: RuntimeCommandHandling, RuntimeStatusProviding {
             return .noProgrammingResult
         case let .program(request):
             return .programming(await programmer.program(request))
+        case let .programKeyAssignment(request):
+            return .keyAssignmentProgramming(.init(
+                requestID: request.requestID,
+                outcome: .failed(reason: "Fake runtime does not exercise typed key assignments", reportsAccepted: 0)
+            ))
         case let .programLighting(request):
             return .lightingProgramming(.init(
                 requestID: request.requestID,

@@ -408,6 +408,138 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertEqual(result.outcome, .failed(.init(reason: "Programming service returned a mismatched request ID")))
     }
 
+    func testRuntimeKeyAssignmentCandidatesExposeOnlyReviewedVectors() throws {
+        let candidates: [(RuntimeKeyAssignmentCandidate, UInt8, UInt8)] = [
+            (.topLeftUsage05, 3, 0x05),
+            (.topRightUsage09, 6, 0x09),
+            (.middleLeftUsage04, 2, 0x04),
+            (.middleRightUsage08, 5, 0x08),
+            (.bottomLeftUsage1B, 1, 0x1b),
+            (.bottomLeftUsage1D, 1, 0x1d),
+            (.bottomRightUsage07, 4, 0x07),
+            (.clockwiseKnobUsage0D, 15, 0x0d),
+            (.counterclockwiseKnobUsage0A, 13, 0x0a),
+            (.knobPressUsage0B, 14, 0x0b),
+        ]
+
+        XCTAssertEqual(candidates.count, 10)
+        for (candidate, slot, usage) in candidates {
+            XCTAssertEqual(candidate.slot, slot)
+            XCTAssertEqual(candidate.usage, usage)
+            XCTAssertEqual(RuntimeKeyAssignmentCandidate(slot: slot, usage: usage), candidate)
+        }
+        XCTAssertNil(RuntimeKeyAssignmentCandidate(slot: 1, usage: 0x04), "A usage supported on another slot must be rejected")
+        XCTAssertNil(RuntimeKeyAssignmentCandidate(slot: 99, usage: 0x05), "An unsupported slot must be rejected")
+    }
+
+    func testTypedKeyAssignmentCommandPreservesCandidateConsentIdentityAndUnverifiedCount() async throws {
+        let fixture = try makeConfiguration(defaultButton: .primitive(.doNothing), appButton: .inherit)
+        let programmer = RecordingKeyAssignmentProgrammer(outcome: .sentUnverified(reportsAccepted: 4))
+        let runtime = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: RecordingActionService(),
+            foreground: MutableForeground(),
+            input: ManualInputProducer(),
+            mapping: [:],
+            keyAssignmentProgrammer: programmer
+        )
+        let request = KeyAssignmentProgrammingRequest(
+            requestID: UUID(),
+            candidate: .bottomLeftUsage1D,
+            acceptsPersistentOverwrite: true
+        )
+
+        let completion = await runtime.submit(.programKeyAssignment(request))
+
+        XCTAssertEqual(completion, .keyAssignmentProgramming(.init(
+            requestID: request.requestID,
+            outcome: .sentUnverified(reportsAccepted: 4)
+        )))
+        let captured = await programmer.requests
+        XCTAssertEqual(captured, [request])
+    }
+
+    func testTypedKeyAssignmentRejectsMissingConsentAndUnsupportedInputWithoutProgrammerCall() async throws {
+        let fixture = try makeConfiguration(defaultButton: .primitive(.doNothing), appButton: .inherit)
+        let programmer = RecordingKeyAssignmentProgrammer(outcome: .sentUnverified(reportsAccepted: 4))
+        let runtime = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: RecordingActionService(),
+            foreground: MutableForeground(),
+            input: ManualInputProducer(),
+            mapping: [:],
+            keyAssignmentProgrammer: programmer
+        )
+        let denied = KeyAssignmentProgrammingRequest(
+            candidate: .topLeftUsage05,
+            acceptsPersistentOverwrite: false
+        )
+
+        let deniedCompletion = await runtime.submit(.programKeyAssignment(denied))
+
+        XCTAssertEqual(deniedCompletion, .keyAssignmentProgramming(.init(
+            requestID: denied.requestID,
+            outcome: .failed(reason: "Persistent overwrite was not accepted", reportsAccepted: 0)
+        )))
+        XCTAssertNil(RuntimeKeyAssignmentCandidate(slot: 1, usage: 0x04))
+        let captured = await programmer.requests
+        XCTAssertTrue(captured.isEmpty, "Unaccepted or unsupported assignment input must not reach the programmer")
+    }
+
+    func testTypedKeyAssignmentFailsClosedWithoutProgrammer() async throws {
+        let fixture = try makeConfiguration(defaultButton: .primitive(.doNothing), appButton: .inherit)
+        let runtime = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: RecordingActionService(),
+            foreground: MutableForeground(),
+            input: ManualInputProducer(),
+            mapping: [:]
+        )
+        let request = KeyAssignmentProgrammingRequest(
+            candidate: .knobPressUsage0B,
+            acceptsPersistentOverwrite: true
+        )
+
+        let completion = await runtime.submit(.programKeyAssignment(request))
+
+        XCTAssertEqual(completion, .keyAssignmentProgramming(.init(
+            requestID: request.requestID,
+            outcome: .failed(
+                reason: "No supported key assignment programmer is configured",
+                reportsAccepted: 0
+            )
+        )))
+    }
+
+    func testTypedKeyAssignmentRejectsMismatchedResultIdentityAndPreservesAcceptedCount() async throws {
+        let fixture = try makeConfiguration(defaultButton: .primitive(.doNothing), appButton: .inherit)
+        let runtime = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: RecordingActionService(),
+            foreground: MutableForeground(),
+            input: ManualInputProducer(),
+            mapping: [:],
+            keyAssignmentProgrammer: MismatchedKeyAssignmentProgrammer(result: .init(
+                requestID: UUID(),
+                outcome: .sentUnverified(reportsAccepted: 2)
+            ))
+        )
+        let request = KeyAssignmentProgrammingRequest(
+            candidate: .clockwiseKnobUsage0D,
+            acceptsPersistentOverwrite: true
+        )
+
+        let completion = await runtime.submit(.programKeyAssignment(request))
+
+        XCTAssertEqual(completion, .keyAssignmentProgramming(.init(
+            requestID: request.requestID,
+            outcome: .failed(
+                reason: "Key assignment service returned a mismatched request ID",
+                reportsAccepted: 2
+            )
+        )))
+    }
+
     func testLightingCommandPreservesTypedRequestIdentityAndAcceptedCount() async throws {
         let fixture = try makeConfiguration(defaultButton: .primitive(.doNothing), appButton: .inherit)
         let lightingProgrammer = RecordingLightingProgrammer(outcome: .sentUnverified(reportsAccepted: 3))
@@ -1594,7 +1726,8 @@ final class ActionRuntimeTests: XCTestCase {
         input: ManualInputProducer,
         mapping: [PhysicalControlID: ActionAssignmentTarget],
         capabilities: any DeviceCapabilityProviding = FixtureCapabilities(),
-        lightingProgrammer: (any DeviceLightingProgramming)? = nil
+        lightingProgrammer: (any DeviceLightingProgramming)? = nil,
+        keyAssignmentProgrammer: (any DeviceKeyAssignmentProgramming)? = nil
     ) async throws -> ActionRuntime {
         let url = URL(fileURLWithPath: "/virtual/action-runtime-\(UUID().uuidString).json")
         let store = ConfigurationStore(primaryURL: url, fileAccess: MemoryConfigurationFiles())
@@ -1608,7 +1741,8 @@ final class ActionRuntimeTests: XCTestCase {
             configurationStore: store,
             actionService: service,
             executionLimits: ActionExecutionLimits(perActionTimeout: .seconds(1), sequenceDeadline: .seconds(2)),
-            lightingProgrammer: lightingProgrammer
+            lightingProgrammer: lightingProgrammer,
+            keyAssignmentProgrammer: keyAssignmentProgrammer
         )
     }
 
@@ -2111,6 +2245,28 @@ private struct FixtureProgrammer: DeviceProgramming {
 private struct MismatchedProgrammer: DeviceProgramming {
     func program(_ request: ProgrammingRequest) async -> ProgrammingResult {
         ProgrammingResult(requestID: UUID(), outcome: .sentUnverified)
+    }
+}
+
+private actor RecordingKeyAssignmentProgrammer: DeviceKeyAssignmentProgramming {
+    let outcome: KeyAssignmentProgrammingOutcome
+    private(set) var requests: [KeyAssignmentProgrammingRequest] = []
+
+    init(outcome: KeyAssignmentProgrammingOutcome) {
+        self.outcome = outcome
+    }
+
+    func programKeyAssignment(_ request: KeyAssignmentProgrammingRequest) async -> KeyAssignmentProgrammingResult {
+        requests.append(request)
+        return KeyAssignmentProgrammingResult(requestID: request.requestID, outcome: outcome)
+    }
+}
+
+private struct MismatchedKeyAssignmentProgrammer: DeviceKeyAssignmentProgramming {
+    let result: KeyAssignmentProgrammingResult
+
+    func programKeyAssignment(_ request: KeyAssignmentProgrammingRequest) async -> KeyAssignmentProgrammingResult {
+        result
     }
 }
 

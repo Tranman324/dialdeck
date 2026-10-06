@@ -216,6 +216,114 @@ public protocol DeviceProgramming: Sendable {
     func program(_ request: ProgrammingRequest) async -> ProgrammingResult
 }
 
+/// One bounded layer-1 plain-key assignment candidate. These are write
+/// intents, not device-state readbacks; the two bottom-left cases are
+/// alternative candidate writes for the same slot.
+public enum RuntimeKeyAssignmentCandidate: Equatable, Sendable {
+    case topLeftUsage05
+    case topRightUsage09
+    case middleLeftUsage04
+    case middleRightUsage08
+    case bottomLeftUsage1B
+    case bottomLeftUsage1D
+    case bottomRightUsage07
+    case clockwiseKnobUsage0D
+    case counterclockwiseKnobUsage0A
+    case knobPressUsage0B
+
+    /// The observed or separately staged slot for this exact candidate.
+    public var slot: UInt8 {
+        switch self {
+        case .topLeftUsage05: 3
+        case .topRightUsage09: 6
+        case .middleLeftUsage04: 2
+        case .middleRightUsage08: 5
+        case .bottomLeftUsage1B, .bottomLeftUsage1D: 1
+        case .bottomRightUsage07: 4
+        case .clockwiseKnobUsage0D: 15
+        case .counterclockwiseKnobUsage0A: 13
+        case .knobPressUsage0B: 14
+        }
+    }
+
+    /// The exact plain USB keyboard usage for this candidate.
+    public var usage: UInt8 {
+        switch self {
+        case .topLeftUsage05: 0x05
+        case .topRightUsage09: 0x09
+        case .middleLeftUsage04: 0x04
+        case .middleRightUsage08: 0x08
+        case .bottomLeftUsage1B: 0x1b
+        case .bottomLeftUsage1D: 0x1d
+        case .bottomRightUsage07: 0x07
+        case .clockwiseKnobUsage0D: 0x0d
+        case .counterclockwiseKnobUsage0A: 0x0a
+        case .knobPressUsage0B: 0x0b
+        }
+    }
+
+    /// Creates a candidate only for one of the reviewed slot and usage pairs.
+    public init?(slot: UInt8, usage: UInt8) {
+        switch (slot, usage) {
+        case (3, 0x05): self = .topLeftUsage05
+        case (6, 0x09): self = .topRightUsage09
+        case (2, 0x04): self = .middleLeftUsage04
+        case (5, 0x08): self = .middleRightUsage08
+        case (1, 0x1b): self = .bottomLeftUsage1B
+        case (1, 0x1d): self = .bottomLeftUsage1D
+        case (4, 0x07): self = .bottomRightUsage07
+        case (15, 0x0d): self = .clockwiseKnobUsage0D
+        case (13, 0x0a): self = .counterclockwiseKnobUsage0A
+        case (14, 0x0b): self = .knobPressUsage0B
+        default: return nil
+        }
+    }
+}
+
+/// An explicit request to overwrite a persistent key assignment. Every write
+/// requires fresh acceptance; there is no consent default. This is a bounded
+/// write intent and does not establish the current assignment or its retention.
+public struct KeyAssignmentProgrammingRequest: Equatable, Sendable {
+    public let requestID: UUID
+    public let candidate: RuntimeKeyAssignmentCandidate
+    public let acceptsPersistentOverwrite: Bool
+
+    public init(
+        requestID: UUID = UUID(),
+        candidate: RuntimeKeyAssignmentCandidate,
+        acceptsPersistentOverwrite: Bool
+    ) {
+        self.requestID = requestID
+        self.candidate = candidate
+        self.acceptsPersistentOverwrite = acceptsPersistentOverwrite
+    }
+}
+
+/// Result of a key assignment attempt. `reportsAccepted` and
+/// `sentUnverified` mean host transport acceptance only, not verified behavior
+/// or persistent device state.
+public enum KeyAssignmentProgrammingOutcome: Equatable, Sendable {
+    case sentUnverified(reportsAccepted: Int)
+    case failed(reason: String, reportsAccepted: Int)
+    case cancelled(reportsAccepted: Int)
+}
+
+public struct KeyAssignmentProgrammingResult: Equatable, Sendable {
+    public let requestID: UUID
+    public let outcome: KeyAssignmentProgrammingOutcome
+
+    public init(requestID: UUID, outcome: KeyAssignmentProgrammingOutcome) {
+        self.requestID = requestID
+        self.outcome = outcome
+    }
+}
+
+/// Device-owned adapters implement this seam and translate only the bounded
+/// candidate into the device service's write request.
+public protocol DeviceKeyAssignmentProgramming: Sendable {
+    func programKeyAssignment(_ request: KeyAssignmentProgrammingRequest) async -> KeyAssignmentProgrammingResult
+}
+
 /// The two lighting behaviors observed on the supported keypad. This typed
 /// request is deliberately separate from `ProgrammingRequest.Assignment`,
 /// whose opaque action identifier must never be interpreted as USB data.
@@ -270,15 +378,19 @@ public enum RuntimeCommand: Equatable, Sendable {
     case stop
     case refreshCapabilities
     case program(ProgrammingRequest)
+    case programKeyAssignment(KeyAssignmentProgrammingRequest)
     case programLighting(LightingProgrammingRequest)
 }
 
 /// Completion returned to the UI-facing caller of `RuntimeCommandHandling`.
 /// A `.program` command returns `.programming` with the same request ID and its
-/// transmission/verification outcome; other commands return `.noProgrammingResult`.
+/// transmission/verification outcome. Typed assignment and lighting commands
+/// return their corresponding correlated result; other commands return
+/// `.noProgrammingResult`.
 public enum RuntimeCommandCompletion: Equatable, Sendable {
     case noProgrammingResult
     case programming(ProgrammingResult)
+    case keyAssignmentProgramming(KeyAssignmentProgrammingResult)
     case lightingProgramming(LightingProgrammingResult)
 }
 
@@ -298,7 +410,8 @@ public enum RuntimeStatus: Equatable, Sendable {
 
 public protocol RuntimeCommandHandling: Sendable {
     /// Awaits command completion. For `.program(request)`, the result's
-    /// `requestID` must equal `request.requestID`.
+    /// `requestID` must equal `request.requestID`. Typed assignment and
+    /// lighting completions preserve the same correlation requirement.
     func submit(_ command: RuntimeCommand) async -> RuntimeCommandCompletion
 }
 
