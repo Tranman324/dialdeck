@@ -578,6 +578,30 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         ]))
     }
 
+    func testHIDDescriptorDumpIsDisabledUnlessSeparatelyEnabled() {
+        XCTAssertFalse(HIDDescriptorDumpHarness.isEnabled(environment: [:]))
+        XCTAssertFalse(HIDDescriptorDumpHarness.isEnabled(environment: [
+            HIDDescriptorDumpHarness.environmentKey: "true",
+        ]))
+        XCTAssertTrue(HIDDescriptorDumpHarness.isEnabled(environment: [
+            HIDDescriptorDumpHarness.environmentKey: "1",
+        ]))
+    }
+
+    /// This is a dump-only diagnostic. It checks existing ListenEvent access,
+    /// enumerates only target keyboard children, reads their static element
+    /// descriptors, and never registers callbacks or opens a device.
+    func testOptInTargetKeyboardHIDDescriptorDump() throws {
+        guard HIDDescriptorDumpHarness.isEnabled(environment: ProcessInfo.processInfo.environment) else {
+            throw XCTSkip("Set DIALDECK_RUN_HID_DESCRIPTOR_DUMP=1 to dump target keyboard descriptors.")
+        }
+        guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
+            throw XCTSkip("Input Monitoring is not already granted; no permission request was made.")
+        }
+
+        try HIDDescriptorDumpHarness.dumpTargetKeyboardChildren()
+    }
+
     func testPhysicalVerificationRecorderBoundsAndForwardsNormalizedEvents() async throws {
         let generation = SessionGeneration(91)
         let dial = try XCTUnwrap(PhysicalControlID(rawValue: "knob", kind: .dial))
@@ -677,13 +701,6 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
             throw XCTSkip("Set DIALDECK_RUN_PHYSICAL_HID_VERIFICATION=1 for supervised physical verification.")
         }
 
-        let openProbe = PhysicalHIDOpenProbe.collect()
-        print("Physical capture process: \(PhysicalHIDProcessIdentity.current)")
-        print("Physical capture I/O probe: \(openProbe)")
-        guard openProbe.accessGranted else {
-            throw PhysicalVerificationHarnessError.inputMonitoringUnavailable(openProbe)
-        }
-
         let actionService = PhysicalVerificationNoOpActionService()
         let profileID = ProfileID()
         let modeID = DialModeID()
@@ -742,10 +759,7 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
             _ = await runtime.submit(.start)
             let startupStatus = await runtime.currentStatus()
             guard case .running = startupStatus else {
-                throw PhysicalVerificationHarnessError.sessionDidNotStart(
-                    status: startupStatus,
-                    openProbe: openProbe
-                )
+                throw PhysicalVerificationHarnessError.sessionDidNotStart(status: startupStatus)
             }
 
             let recorded = try await PhysicalVerificationHarness.waitForReconnectSequence(
@@ -1398,96 +1412,58 @@ private enum PhysicalVerificationHarness {
 }
 
 private enum PhysicalVerificationHarnessError: Error, LocalizedError {
-    case inputMonitoringUnavailable(PhysicalHIDOpenProbe)
-    case sessionDidNotStart(status: RuntimeStatus, openProbe: PhysicalHIDOpenProbe)
+    case sessionDidNotStart(status: RuntimeStatus)
 
     var errorDescription: String? {
         switch self {
-        case .inputMonitoringUnavailable(let openProbe):
-            "Input Monitoring is not already granted. \(openProbe)"
-        case .sessionDidNotStart(let status, let openProbe):
-            "Input session did not start; ActionRuntime status: \(String(describing: status)); I/O probe: \(openProbe)"
+        case .sessionDidNotStart(let status):
+            "Input session did not start; ActionRuntime status: \(String(describing: status))"
         }
     }
 }
 
-private struct PhysicalHIDOpenProbe: CustomStringConvertible {
-    struct DeviceResult {
-        let label: String
-        let withoutSeize: IOReturn
-        let withSeize: IOReturn
-    }
+private enum HIDDescriptorDumpHarness {
+    static let environmentKey = "DIALDECK_RUN_HID_DESCRIPTOR_DUMP"
 
-    let accessResult: IOHIDAccessType
-    let managerWithoutSeize: IOReturn?
-    let managerWithSeize: IOReturn?
-    let deviceResults: [DeviceResult]
+    private enum DumpError: Error, LocalizedError {
+        case permissionNotGranted
+        case managerOpenFailed(IOReturn)
+        case managerCloseFailed(IOReturn)
+        case operationAndCloseFailed(operation: String, closeResult: IOReturn)
+        case noMatchingKeyboardChildren
+        case elementListUnavailable
 
-    var accessGranted: Bool { accessResult == kIOHIDAccessTypeGranted }
-
-    var description: String {
-        let managerResults = "IOHIDManagerOpen withoutSeize=\(Self.format(managerWithoutSeize)) withSeize=\(Self.format(managerWithSeize))"
-        let devices = deviceResults.map {
-            "\($0.label) IOHIDDeviceOpen withoutSeize=\(Self.format($0.withoutSeize)) withSeize=\(Self.format($0.withSeize))"
-        }.joined(separator: "; ")
-        return "IOHIDCheckAccess(ListenEvent)=\(accessResult.rawValue) granted=\(accessGranted); \(managerResults); devices=[\(devices)]"
-    }
-
-    static func collect() -> Self {
-        let accessResult = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
-        guard accessResult == kIOHIDAccessTypeGranted else {
-            return Self(
-                accessResult: accessResult,
-                managerWithoutSeize: nil,
-                managerWithSeize: nil,
-                deviceResults: []
-            )
-        }
-
-        let enumerationManager = makeTargetManager()
-        let managerWithoutSeize = IOHIDManagerOpen(
-            enumerationManager,
-            IOOptionBits(kIOHIDOptionsTypeNone)
-        )
-        var devices: [IOHIDDevice] = []
-        if managerWithoutSeize == kIOReturnSuccess,
-           let deviceSet = IOHIDManagerCopyDevices(enumerationManager) {
-            devices = (deviceSet as NSSet).allObjects as! [IOHIDDevice]
-        }
-        _ = IOHIDManagerClose(enumerationManager, IOOptionBits(kIOHIDOptionsTypeNone))
-
-        let deviceResults = devices.filter(isTargetKeyboard).enumerated().map { index, device -> DeviceResult in
-            let withoutSeize = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
-            if withoutSeize == kIOReturnSuccess {
-                _ = IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+        var errorDescription: String? {
+            switch self {
+            case .permissionNotGranted:
+                "Input Monitoring access is not already granted; no permission request was made"
+            case .managerOpenFailed(let result):
+                "Target-only HID manager open failed with IOReturn \(format(result))"
+            case .managerCloseFailed(let result):
+                "Target-only HID manager close failed with IOReturn \(format(result))"
+            case .operationAndCloseFailed(let operation, let closeResult):
+                "Descriptor dump failed (\(operation)); manager close also failed with IOReturn \(format(closeResult))"
+            case .noMatchingKeyboardChildren:
+                "No target USB keyboard children matched VID 0x1189, PID 0x8890, and the keyboard application usage"
+            case .elementListUnavailable:
+                "IOHIDDeviceCopyMatchingElements returned no complete element list for a matching keyboard child"
             }
-            let withSeize = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
-            if withSeize == kIOReturnSuccess {
-                _ = IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
-            }
-            return DeviceResult(
-                label: "target-keyboard-child-\(index)",
-                withoutSeize: withoutSeize,
-                withSeize: withSeize
-            )
         }
 
-        let seizeManager = makeTargetManager()
-        let managerWithSeize = IOHIDManagerOpen(
-            seizeManager,
-            IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
-        )
-        _ = IOHIDManagerClose(seizeManager, IOOptionBits(kIOHIDOptionsTypeNone))
-
-        return Self(
-            accessResult: accessResult,
-            managerWithoutSeize: managerWithoutSeize,
-            managerWithSeize: managerWithSeize,
-            deviceResults: deviceResults
-        )
+        private func format(_ result: IOReturn) -> String {
+            String(format: "0x%08X", UInt32(bitPattern: result))
+        }
     }
 
-    private static func makeTargetManager() -> IOHIDManager {
+    static func isEnabled(environment: [String: String]) -> Bool {
+        environment[environmentKey] == "1"
+    }
+
+    static func dumpTargetKeyboardChildren() throws {
+        guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
+            throw DumpError.permissionNotGranted
+        }
+
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, 0)
         let matching: [String: Any] = [
             kIOHIDVendorIDKey as String: NSNumber(value: KeyboardHIDTarget.vendorID),
@@ -1497,16 +1473,194 @@ private struct PhysicalHIDOpenProbe: CustomStringConvertible {
             kIOHIDDeviceUsageKey as String: NSNumber(value: KeyboardHIDTarget.keyboardApplicationUsage),
         ]
         IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
-        return manager
+        let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard openResult == kIOReturnSuccess else {
+            throw DumpError.managerOpenFailed(openResult)
+        }
+
+        do {
+            try inspectMatchingChildren(manager)
+        } catch {
+            let operation = String(describing: error)
+            let closeResult = IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+            guard closeResult == kIOReturnSuccess else {
+                throw DumpError.operationAndCloseFailed(operation: operation, closeResult: closeResult)
+            }
+            throw error
+        }
+
+        let closeResult = IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard closeResult == kIOReturnSuccess else {
+            throw DumpError.managerCloseFailed(closeResult)
+        }
+    }
+
+    private static func inspectMatchingChildren(_ manager: IOHIDManager) throws {
+        guard let deviceSet = IOHIDManagerCopyDevices(manager) else {
+            throw DumpError.noMatchingKeyboardChildren
+        }
+        let devices = (deviceSet as NSSet).allObjects as! [IOHIDDevice]
+        let targetDevices = devices.filter(isTargetKeyboard)
+        guard !targetDevices.isEmpty else {
+            throw DumpError.noMatchingKeyboardChildren
+        }
+
+        print("HID descriptor dump: \(targetDevices.count) matching target keyboard child(ren); no device was opened and no callbacks were registered.")
+        var identities: [KeyboardHIDChildIdentity] = []
+        for (index, device) in targetDevices.enumerated() {
+            print("HID descriptor child \(index + 1)/\(targetDevices.count): target USB keyboard 0x1189:0x8890")
+            do {
+                let elements = try copyAllElements(from: device)
+                for (elementIndex, element) in elements.enumerated() {
+                    print("  element[\(elementIndex)]: \(describe(element))")
+                }
+                identities.append(try describeEligibility(of: device, elements: elements, childIndex: index))
+            } catch {
+                print("  element list/validator result: ineligible; exact reason: \(String(describing: error))")
+                identities.append(ineligibleIdentity(for: device))
+            }
+        }
+
+        do {
+            let selectedIndex = try KeyboardHIDChildSelection.uniqueEligibleIndex(in: identities)
+            print("HID descriptor selection: exactly one eligible keyboard child at index \(selectedIndex + 1). No child was opened.")
+        } catch {
+            print("HID descriptor selection: no unique eligible keyboard child; exact reason: \(error.localizedDescription)")
+        }
+    }
+
+    private static func copyAllElements(from device: IOHIDDevice) throws -> [IOHIDElement] {
+        guard let rawElements = IOHIDDeviceCopyMatchingElements(
+            device,
+            nil,
+            IOOptionBits(kIOHIDOptionsTypeNone)
+        ) else {
+            throw DumpError.elementListUnavailable
+        }
+        return rawElements as! [IOHIDElement]
+    }
+
+    private static func describeEligibility(
+        of device: IOHIDDevice,
+        elements: [IOHIDElement],
+        childIndex: Int
+    ) throws -> KeyboardHIDChildIdentity {
+        let collectionCount = Set(elements.filter(isKeyboardApplicationCollection).map {
+            UInt32(IOHIDElementGetCookie($0))
+        }).count
+        let descriptors = elements.compactMap { element -> KeyboardHIDElementDescriptor? in
+            guard isInputElement(element), belongsToUniqueKeyboardCollection(element),
+                  IOHIDElementGetUsagePage(element) == KeyboardHIDTarget.keyboardUsagePage else {
+                return nil
+            }
+            let representation: KeyboardHIDElementDescriptor.Representation
+            if IOHIDElementIsArray(element) {
+                representation = .array(
+                    minimumUsage: propertyInteger(element, key: kIOHIDElementUsageMinKey),
+                    maximumUsage: propertyInteger(element, key: kIOHIDElementUsageMaxKey)
+                )
+            } else {
+                representation = .variable(usage: IOHIDElementGetUsage(element))
+            }
+            return KeyboardHIDElementDescriptor(
+                cookie: UInt64(IOHIDElementGetCookie(element)),
+                usagePage: IOHIDElementGetUsagePage(element),
+                representation: representation,
+                reportID: IOHIDElementGetReportID(element),
+                reportCount: IOHIDElementGetReportCount(element),
+                logicalMinimum: Int64(IOHIDElementGetLogicalMin(element)),
+                logicalMaximum: Int64(IOHIDElementGetLogicalMax(element))
+            )
+        }
+
+        let plan: KeyboardHIDElementPlan?
+        do {
+            plan = try KeyboardHIDElementPlan(validating: descriptors)
+            print("  validator: eligible element plan (\(descriptors.count) target-collection keyboard-page input element(s))")
+        } catch {
+            plan = nil
+            print("  validator: ineligible; exact error: \(validatorErrorDescription(error))")
+        }
+
+        let pairs = usagePairs(for: device)
+        let registryIdentifier = registryID(for: device)
+        let fingerprint = KeyboardHIDDescriptorFingerprint(descriptors: descriptors)
+        var reasons: [String] = []
+        if fingerprint.canonicalElements.isEmpty {
+            reasons.append("keyboard-page input descriptor fingerprint is empty")
+        }
+        if collectionCount != 1 {
+            reasons.append("keyboard Application collection count is \(collectionCount), expected exactly 1")
+        }
+        if let pairs {
+            let keyboardPairCount = pairs.filter {
+                $0.usagePage == KeyboardHIDTarget.genericDesktopUsagePage
+                    && $0.usage == KeyboardHIDTarget.keyboardApplicationUsage
+            }.count
+            if keyboardPairCount != 1 {
+                reasons.append("keyboard usage-pair count is \(keyboardPairCount), expected exactly 1")
+            }
+        } else {
+            reasons.append("device usage-pair property is unavailable or malformed")
+        }
+        if registryIdentifier == nil || registryIdentifier == 0 {
+            reasons.append("nonzero registry entry ID is unavailable")
+        }
+        if plan == nil, !reasons.contains(where: { $0.hasPrefix("keyboard-page input descriptor") }) {
+            // Keep the validator's exact localized error as the ineligibility reason.
+            reasons.append("element plan rejected by validator; see exact validator error above")
+        }
+        if reasons.isEmpty {
+            print("  child eligibility: eligible (candidate \(childIndex + 1))")
+        } else {
+            print("  child eligibility: ineligible; reason(s): \(reasons.joined(separator: "; "))")
+        }
+
+        return KeyboardHIDChildIdentity(
+            descriptorFingerprint: fingerprint,
+            usagePairs: pairs,
+            keyboardApplicationCollectionCount: collectionCount,
+            registryEntryID: registryIdentifier,
+            elementPlan: plan
+        )
+    }
+
+    private static func ineligibleIdentity(for device: IOHIDDevice) -> KeyboardHIDChildIdentity {
+        let reason = KeyboardHIDCaptureError.interfaceMismatch.localizedDescription
+        do {
+            _ = try KeyboardHIDElementPlan(validating: [])
+            print("  validator fallback: unexpectedly accepted an empty descriptor list")
+        } catch {
+            print("  validator: ineligible; exact error: \(validatorErrorDescription(error)) (element-list retrieval failed: \(reason))")
+        }
+        return KeyboardHIDChildIdentity(
+            descriptorFingerprint: KeyboardHIDDescriptorFingerprint(descriptors: []),
+            usagePairs: usagePairs(for: device),
+            keyboardApplicationCollectionCount: nil,
+            registryEntryID: registryID(for: device),
+            elementPlan: nil
+        )
+    }
+
+    private static func describe(_ element: IOHIDElement) -> String {
+        let type = IOHIDElementGetType(element)
+        let collectionContext = collectionAncestors(of: element).map { collection in
+            "cookie=\(UInt32(IOHIDElementGetCookie(collection)))/\(collectionTypeName(IOHIDElementGetCollectionType(collection))):page=\(hex(IOHIDElementGetUsagePage(collection))):usage=\(hex(IOHIDElementGetUsage(collection)))"
+        }
+        let ownCollection: [String]
+        if type == kIOHIDElementTypeCollection {
+            ownCollection = ["self=cookie=\(UInt32(IOHIDElementGetCookie(element)))/\(collectionTypeName(IOHIDElementGetCollectionType(element))):page=\(hex(IOHIDElementGetUsagePage(element))):usage=\(hex(IOHIDElementGetUsage(element)))"]
+        } else {
+            ownCollection = []
+        }
+        let context = (collectionContext + ownCollection).joined(separator: " > ")
+        return "cookie=\(UInt32(IOHIDElementGetCookie(element))) type=\(elementTypeName(type)) usagePage=\(hex(IOHIDElementGetUsagePage(element))) usage=\(hex(IOHIDElementGetUsage(element))) usageMin=\(propertyInteger(element, key: kIOHIDElementUsageMinKey).map(hex) ?? "unavailable") usageMax=\(propertyInteger(element, key: kIOHIDElementUsageMaxKey).map(hex) ?? "unavailable") logicalMin=\(IOHIDElementGetLogicalMin(element)) logicalMax=\(IOHIDElementGetLogicalMax(element)) isArray=\(IOHIDElementIsArray(element)) reportID=\(IOHIDElementGetReportID(element)) reportSize=\(IOHIDElementGetReportSize(element)) reportCount=\(IOHIDElementGetReportCount(element)) collectionContext=\(context.isEmpty ? "none" : context)"
     }
 
     private static func isTargetKeyboard(_ device: IOHIDDevice) -> Bool {
-        let vendor = (IOHIDDeviceGetProperty(device, kIOHIDVendorIDKey as CFString) as? NSNumber)?.uint32Value
-        let product = (IOHIDDeviceGetProperty(device, kIOHIDProductIDKey as CFString) as? NSNumber)?.uint32Value
-        let transport = IOHIDDeviceGetProperty(device, kIOHIDTransportKey as CFString) as? String
-        return vendor == KeyboardHIDTarget.vendorID
-            && product == KeyboardHIDTarget.productID
-            && transport == kIOHIDTransportUSBValue
+        propertyInteger(device, key: kIOHIDVendorIDKey) == KeyboardHIDTarget.vendorID
+            && propertyInteger(device, key: kIOHIDProductIDKey) == KeyboardHIDTarget.productID
+            && propertyString(device, key: kIOHIDTransportKey) == kIOHIDTransportUSBValue
             && IOHIDDeviceConformsTo(
                 device,
                 KeyboardHIDTarget.genericDesktopUsagePage,
@@ -1514,17 +1668,126 @@ private struct PhysicalHIDOpenProbe: CustomStringConvertible {
             )
     }
 
-    private static func format(_ result: IOReturn?) -> String {
-        guard let result else { return "not-attempted" }
-        return String(format: "0x%08X (%d)", UInt32(bitPattern: result), result)
+    private static func isKeyboardApplicationCollection(_ element: IOHIDElement) -> Bool {
+        IOHIDElementGetType(element) == kIOHIDElementTypeCollection
+            && IOHIDElementGetCollectionType(element) == kIOHIDElementCollectionTypeApplication
+            && IOHIDElementGetUsagePage(element) == KeyboardHIDTarget.genericDesktopUsagePage
+            && IOHIDElementGetUsage(element) == KeyboardHIDTarget.keyboardApplicationUsage
     }
-}
 
-private enum PhysicalHIDProcessIdentity {
-    static var current: String {
-        let bundle = Bundle.main
-        let executable = ProcessInfo.processInfo.arguments.first ?? "unknown"
-        return "bundlePath=\(bundle.bundlePath); bundleIdentifier=\(bundle.bundleIdentifier ?? "unknown"); executable=\(executable)"
+    private static func belongsToUniqueKeyboardCollection(_ element: IOHIDElement) -> Bool {
+        var current = IOHIDElementGetParent(element)
+        var matchingApplications = 0
+        while let parent = current {
+            if isKeyboardApplicationCollection(parent) {
+                matchingApplications += 1
+            }
+            current = IOHIDElementGetParent(parent)
+        }
+        return matchingApplications == 1
+    }
+
+    private static func isInputElement(_ element: IOHIDElement) -> Bool {
+        let type = IOHIDElementGetType(element)
+        return type == kIOHIDElementTypeInput_Misc
+            || type == kIOHIDElementTypeInput_Button
+            || type == kIOHIDElementTypeInput_ScanCodes
+            || type == kIOHIDElementTypeInput_NULL
+    }
+
+    private static func collectionAncestors(of element: IOHIDElement) -> [IOHIDElement] {
+        var collections: [IOHIDElement] = []
+        var current = IOHIDElementGetParent(element)
+        while let parent = current {
+            if IOHIDElementGetType(parent) == kIOHIDElementTypeCollection {
+                collections.append(parent)
+            }
+            current = IOHIDElementGetParent(parent)
+        }
+        return collections.reversed()
+    }
+
+    private static func elementTypeName(_ type: IOHIDElementType) -> String {
+        switch type {
+        case kIOHIDElementTypeInput_Misc: "input-misc"
+        case kIOHIDElementTypeInput_Button: "input-button"
+        case kIOHIDElementTypeInput_Axis: "input-axis"
+        case kIOHIDElementTypeInput_ScanCodes: "input-scan-codes"
+        case kIOHIDElementTypeInput_NULL: "input-null"
+        case kIOHIDElementTypeOutput: "output"
+        case kIOHIDElementTypeFeature: "feature"
+        case kIOHIDElementTypeCollection: "collection"
+        default: "other-\(String(describing: type))"
+        }
+    }
+
+    private static func collectionTypeName(_ type: IOHIDElementCollectionType) -> String {
+        switch type {
+        case kIOHIDElementCollectionTypePhysical: "physical"
+        case kIOHIDElementCollectionTypeApplication: "application"
+        case kIOHIDElementCollectionTypeLogical: "logical"
+        case kIOHIDElementCollectionTypeReport: "report"
+        case kIOHIDElementCollectionTypeNamedArray: "named-array"
+        case kIOHIDElementCollectionTypeUsageSwitch: "usage-switch"
+        case kIOHIDElementCollectionTypeUsageModifier: "usage-modifier"
+        default: "other-\(String(describing: type))"
+        }
+    }
+
+    private static func usagePairs(for device: IOHIDDevice) -> [KeyboardHIDUsagePair]? {
+        guard let rawPairs = IOHIDDeviceGetProperty(device, kIOHIDDeviceUsagePairsKey as CFString) as? NSArray else {
+            return nil
+        }
+        var pairs: [KeyboardHIDUsagePair] = []
+        for value in rawPairs {
+            guard let pair = value as? NSDictionary,
+                  let page = (pair[kIOHIDDeviceUsagePageKey] as? NSNumber)?.uint32Value,
+                  let usage = (pair[kIOHIDDeviceUsageKey] as? NSNumber)?.uint32Value else {
+                return nil
+            }
+            pairs.append(KeyboardHIDUsagePair(usagePage: page, usage: usage))
+        }
+        return pairs.sorted()
+    }
+
+    private static func registryID(for device: IOHIDDevice) -> UInt64? {
+        let service = IOHIDDeviceGetService(device)
+        guard service != IO_OBJECT_NULL else { return nil }
+        var identifier: UInt64 = 0
+        guard IORegistryEntryGetRegistryEntryID(service, &identifier) == KERN_SUCCESS else { return nil }
+        return identifier
+    }
+
+    private static func propertyInteger(_ element: IOHIDElement, key: String) -> UInt32? {
+        guard let value = IOHIDElementGetProperty(element, key as CFString) as? NSNumber else { return nil }
+        return value.uint32Value
+    }
+
+    private static func propertyInteger(_ device: IOHIDDevice, key: String) -> UInt32? {
+        guard let value = IOHIDDeviceGetProperty(device, key as CFString) as? NSNumber else { return nil }
+        return value.uint32Value
+    }
+
+    private static func propertyString(_ device: IOHIDDevice, key: String) -> String? {
+        IOHIDDeviceGetProperty(device, key as CFString) as? String
+    }
+
+    private static func hex(_ value: UInt32) -> String {
+        String(format: "0x%04X", value)
+    }
+
+    private static func validatorErrorDescription(_ error: Error) -> String {
+        let caseName: String
+        switch error as? KeyboardHIDCaptureError {
+        case .permissionUnavailable: caseName = "KeyboardHIDCaptureError.permissionUnavailable"
+        case .targetUnavailable: caseName = "KeyboardHIDCaptureError.targetUnavailable"
+        case .ambiguousTarget: caseName = "KeyboardHIDCaptureError.ambiguousTarget"
+        case .ambiguousInterface: caseName = "KeyboardHIDCaptureError.ambiguousInterface"
+        case .interfaceMismatch: caseName = "KeyboardHIDCaptureError.interfaceMismatch"
+        case .openFailed: caseName = "KeyboardHIDCaptureError.openFailed"
+        case nil: caseName = String(reflecting: type(of: error))
+        }
+        return "\(caseName): \(error.localizedDescription)"
     }
 }
 
