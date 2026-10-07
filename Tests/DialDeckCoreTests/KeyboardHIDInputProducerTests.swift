@@ -1079,6 +1079,7 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         XCTAssertEqual(Set(selectedIDs.suffix(2)).count, 1, "Reconnect double-selection must agree.")
         XCTAssertTrue(closeResultsAreSuccess, "Every manager/device close must return 0x00000000 after device cancel.")
         XCTAssertEqual(serviceCalls, 0, "The injected service must not synthesize host actions.")
+        XCTAssertTrue(passed, "The recorded evidence must satisfy every capture acceptance condition.")
     }
 
     func testElementPlanFailsClosedForMissingOrAmbiguousInputLayouts() throws {
