@@ -576,6 +576,7 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
         } catch let error as KeyboardHIDCaptureError where error.canRetry {
             return true
         } catch let error as KeyboardHIDCaptureError where error == .permissionUnavailable {
+            guard !isClosed, reconnectTaskID == taskID else { return false }
             await terminate(
                 with: .failed(error.localizedDescription),
                 currentReconnectID: taskID

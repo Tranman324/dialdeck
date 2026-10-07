@@ -337,6 +337,57 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         await session.cancel()
     }
 
+    func testLateReconnectPermissionFailureDoesNotDeadlockExternalCancellation() async throws {
+        let reconnectGate = TestConnectionGate()
+        let firstConnection = TestKeyboardHIDConnection(plan: try variablePlan())
+        let replacementConnection = TestKeyboardHIDConnection(plan: try variablePlan())
+        let transport = TestKeyboardHIDTransport(
+            connections: [firstConnection, replacementConnection],
+            gatedAttempts: [1: reconnectGate],
+            errorsByAttempt: [1: .permissionUnavailable]
+        )
+        let consumer = RecordingInputConsumer()
+        let producer = KeyboardHIDInputEventProducer(transport: transport)
+        let firstGeneration = SessionGeneration(146)
+        let session = try await producer.start(generation: firstGeneration, consumer: consumer)
+        firstConnection.send(.disconnected)
+        await reconnectGate.waitUntilEntered()
+
+        let replacementStarted = TestAsyncBarrier()
+        let replacementFinished = TestAsyncBarrier()
+        let replacementGeneration = SessionGeneration(147)
+        let replacementStart = Task<any InputSessionHandle, Error> {
+            await replacementStarted.open()
+            let newSession = try await producer.start(generation: replacementGeneration, consumer: consumer)
+            await replacementFinished.open()
+            return newSession
+        }
+        await replacementStarted.wait()
+        try await Task.sleep(for: .milliseconds(30))
+        let replacementReturnedBeforePermissionError = await replacementFinished.isOpen
+        XCTAssertFalse(replacementReturnedBeforePermissionError)
+
+        await reconnectGate.open()
+        let replacementCompleted = await waitUntil {
+            await replacementFinished.isOpen
+        }
+        XCTAssertTrue(replacementCompleted, "External cancellation must join the late reconnect error without deadlocking")
+        guard replacementCompleted else { return }
+
+        let newSession = try await replacementStart.value
+        let attempts = await transport.connectionAttempts
+        XCTAssertEqual(attempts, 3)
+        let snapshot = await consumer.snapshot()
+        XCTAssertEqual(snapshot.lifecycle, [
+            .started(firstGeneration),
+            .stopping(firstGeneration),
+            .stopped(firstGeneration),
+            .started(replacementGeneration),
+        ])
+        await newSession.cancel()
+        await session.cancel()
+    }
+
     func testCaptureProducerRoutesNormalizedKeyAndDialPressThroughActionRuntime() async throws {
         let actionService = CaptureRuntimeActionService()
         let modeID = DialModeID()
@@ -617,22 +668,26 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
 private actor TestKeyboardHIDTransport: KeyboardHIDCaptureTransport {
     private var connections: [TestKeyboardHIDConnection]
     private let gatedAttempts: [Int: TestConnectionGate]
+    private let errorsByAttempt: [Int: KeyboardHIDCaptureError]
     private(set) var connectionAttempts = 0
 
     init(
         connections: [TestKeyboardHIDConnection],
-        gatedAttempts: [Int: TestConnectionGate] = [:]
+        gatedAttempts: [Int: TestConnectionGate] = [:],
+        errorsByAttempt: [Int: KeyboardHIDCaptureError] = [:]
     ) {
         self.connections = connections
         self.gatedAttempts = gatedAttempts
+        self.errorsByAttempt = errorsByAttempt
     }
 
     func connectToUniqueTarget() async throws -> any KeyboardHIDCaptureConnection {
         let attempt = connectionAttempts
         connectionAttempts += 1
+        if let gate = gatedAttempts[attempt] { await gate.wait() }
+        if let error = errorsByAttempt[attempt] { throw error }
         guard !connections.isEmpty else { throw KeyboardHIDCaptureError.targetUnavailable }
         let connection = connections.removeFirst()
-        if let gate = gatedAttempts[attempt] { await gate.wait() }
         return connection
     }
 }
