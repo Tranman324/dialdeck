@@ -12,6 +12,10 @@ let package = Package(
         .target(name: "DialDeckUSB", publicHeadersPath: "include"),
         .target(name: "DialDeckCore", dependencies: ["DialDeckUSB"]),
         .executableTarget(name: "DialDeckApp", dependencies: ["DialDeckCore"]),
-        .testTarget(name: "DialDeckCoreTests", dependencies: ["DialDeckCore"]),
+        .testTarget(
+            name: "DialDeckCoreTests",
+            dependencies: ["DialDeckCore"],
+            resources: [.copy("Fixtures/hid-raw-reports-2026-10-06.txt")]
+        ),
     ]
 )

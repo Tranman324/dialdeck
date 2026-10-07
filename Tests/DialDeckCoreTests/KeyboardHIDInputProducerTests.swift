@@ -42,6 +42,145 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         XCTAssertTrue(decoder.consume(variableValue(usage: 0x73, value: 0)).isEmpty)
     }
 
+    func testRawReportDescriptorSelectionRequiresOneExactMatch() throws {
+        let descriptor = KeyboardHIDTarget.rawReportDescriptor
+        let expectedDescriptorHex = """
+        05 01 09 06 A1 01 85 01 05 07 19 E0 29 E7 15 00 25 01 75 01 95 08 81 02
+        95 01 75 08 81 01 95 03 75 01 05 08 19 01 29 03 91 02 95 05 75 01 91 01
+        95 06 75 08 26 FF 00 05 07 19 00 29 91 81 00 C0
+        """
+        let expectedDescriptor = try expectedDescriptorHex.split(whereSeparator: \.isWhitespace).map { token in
+            guard let byte = UInt8(token, radix: 16) else {
+                throw RawReportFixtureError.invalidByte(String(token))
+            }
+            return byte
+        }
+        XCTAssertEqual(descriptor, Data(expectedDescriptor))
+
+        let unrelatedDescriptor = Data(descriptor.dropLast())
+
+        XCTAssertEqual(
+            try KeyboardHIDRawReportInterfaceSelection.uniqueMatchingIndex(
+                in: [unrelatedDescriptor, descriptor]
+            ),
+            1
+        )
+        XCTAssertThrowsError(
+            try KeyboardHIDRawReportInterfaceSelection.uniqueMatchingIndex(in: [unrelatedDescriptor])
+        ) { error in
+            XCTAssertEqual(error as? KeyboardHIDCaptureError, .interfaceMismatch)
+        }
+        XCTAssertThrowsError(
+            try KeyboardHIDRawReportInterfaceSelection.uniqueMatchingIndex(in: [descriptor, descriptor])
+        ) { error in
+            XCTAssertEqual(error as? KeyboardHIDCaptureError, .ambiguousTarget)
+        }
+    }
+
+    func testGoldenRawReportsDecodeNineControlsAndObservedGestures() throws {
+        // Sanitized byte-for-byte payloads from .apm/evidence/hardware/hid-raw-reports-2026-10-06.md.
+        let fixtureURL = try XCTUnwrap(
+            Bundle.module.url(
+                forResource: "hid-raw-reports-2026-10-06",
+                withExtension: "txt"
+            )
+        )
+        let fixture = try String(contentsOf: fixtureURL, encoding: .utf8)
+        let reports = try fixture.split(whereSeparator: \.isNewline).map { line -> [UInt8] in
+            try line.split(separator: " ").map { token in
+                guard let byte = UInt8(token, radix: 16) else {
+                    throw RawReportFixtureError.invalidByte(String(token))
+                }
+                return byte
+            }
+        }
+        XCTAssertEqual(reports.count, 20, "The fixture mirrors all 20 reports from the 2026-10-06 capture.")
+
+        var rawDecoder = KeyboardHIDRawReportDecoder()
+        var usageDecoder = KeyboardHIDUsageDecoder(
+            generation: SessionGeneration(31),
+            plan: .observedArrayControlPlan
+        )
+        let deliveries = reports.flatMap { report in
+            rawDecoder.consume(reportID: KeyboardHIDRawReportDecoder.expectedReportID, bytes: report)
+                .flatMap { rawValue in usageDecoder.consume(rawValue) }
+        }
+
+        let expected: [KeyboardHIDDelivery] = [
+            .event(try keyEvent("top-left", down: true, generation: 31)),
+            .event(try keyEvent("top-left", down: false, generation: 31)),
+            .event(try keyEvent("top-right", down: true, generation: 31)),
+            .event(try keyEvent("top-right", down: false, generation: 31)),
+            .event(try keyEvent("middle-left", down: true, generation: 31)),
+            .event(try keyEvent("middle-left", down: false, generation: 31)),
+            .event(try keyEvent("middle-right", down: true, generation: 31)),
+            .event(try keyEvent("middle-right", down: false, generation: 31)),
+            .event(try keyEvent("bottom-left", down: true, generation: 31)),
+            .event(try keyEvent("bottom-left", down: false, generation: 31)),
+            .event(try keyEvent("bottom-right", down: true, generation: 31)),
+            .event(try keyEvent("bottom-right", down: false, generation: 31)),
+            .event(try rotationEvent(1, generation: 31)),
+            .event(try rotationEvent(1, generation: 31)),
+            .event(try rotationEvent(-1, generation: 31)),
+            .dialPress(try XCTUnwrap(PhysicalControlID(rawValue: "knob", kind: .dial))),
+        ]
+        XCTAssertEqual(deliveries, expected)
+    }
+
+    func testRawReportDecoderKeepsOverlappingKeysUntilEachIsReleased() {
+        var decoder = KeyboardHIDRawReportDecoder()
+
+        XCTAssertEqual(
+            decoder.consume(reportID: 1, bytes: rawReport(keys: [0x6b, 0x6c])),
+            [rawValue(usage: 0x6b, pressed: true), rawValue(usage: 0x6c, pressed: true)]
+        )
+        XCTAssertEqual(
+            decoder.consume(reportID: 1, bytes: rawReport(keys: [0x6c])),
+            [rawValue(usage: 0x6b, pressed: false)]
+        )
+        XCTAssertEqual(
+            decoder.consume(reportID: 1, bytes: rawReport(keys: [])),
+            [rawValue(usage: 0x6c, pressed: false)]
+        )
+    }
+
+    func testRawReportRolloverDoesNotChangeActiveState() {
+        var decoder = KeyboardHIDRawReportDecoder()
+        _ = decoder.consume(reportID: 1, bytes: rawReport(keys: [0x6b]))
+
+        XCTAssertTrue(decoder.consume(reportID: 1, bytes: rawReport(keys: [1, 1, 1, 1, 1, 1])).isEmpty)
+        XCTAssertEqual(decoder.activeUsages, [0x6b])
+        XCTAssertEqual(
+            decoder.consume(reportID: 1, bytes: rawReport(keys: [])),
+            [rawValue(usage: 0x6b, pressed: false)]
+        )
+    }
+
+    func testRawReportDecoderIgnoresWrongLengthAndReportIDsWithoutChangingState() {
+        var decoder = KeyboardHIDRawReportDecoder()
+        _ = decoder.consume(reportID: 1, bytes: rawReport(keys: [0x6b]))
+
+        XCTAssertTrue(decoder.consume(reportID: 2, bytes: rawReport(keys: [])).isEmpty)
+        XCTAssertTrue(decoder.consume(reportID: 1, bytes: [1, 0, 0, 0]).isEmpty)
+        var wrongEmbeddedID = rawReport(keys: [])
+        wrongEmbeddedID[0] = 2
+        XCTAssertTrue(decoder.consume(reportID: 1, bytes: wrongEmbeddedID).isEmpty)
+        XCTAssertEqual(decoder.activeUsages, [0x6b])
+    }
+
+    func testRawReportDecoderIgnoresZeroAndUnknownUsages() {
+        var decoder = KeyboardHIDRawReportDecoder()
+
+        XCTAssertEqual(
+            decoder.consume(reportID: 1, bytes: rawReport(keys: [0, 0x6b, 0xfe, 0x6c])),
+            [rawValue(usage: 0x6b, pressed: true), rawValue(usage: 0x6c, pressed: true)]
+        )
+        XCTAssertEqual(
+            decoder.consume(reportID: 1, bytes: rawReport(keys: [0xfe])),
+            [rawValue(usage: 0x6b, pressed: false), rawValue(usage: 0x6c, pressed: false)]
+        )
+    }
+
     func testChildSelectionChoosesOneCompleteKeyboardAmongTwoCandidates() throws {
         let incompleteDescriptors = Array(variableDescriptors().dropLast())
         let candidates = [
@@ -974,6 +1113,24 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         try KeyboardHIDElementPlan(validating: variableDescriptors())
     }
 
+    private func rawReport(keys: [UInt8]) -> [UInt8] {
+        [1, 0, 0] + Array((keys + Array(repeating: 0, count: 6)).prefix(6))
+    }
+
+    private func rawValue(usage: UInt32, pressed: Bool) -> KeyboardHIDRawValue {
+        KeyboardHIDRawValue(
+            cookie: UInt64(usage),
+            usagePage: KeyboardHIDTarget.keyboardUsagePage,
+            elementUsage: usage,
+            isArray: false,
+            integerValue: pressed ? 1 : 0
+        )
+    }
+
+    private enum RawReportFixtureError: Error {
+        case invalidByte(String)
+    }
+
     private func childIdentity(
         descriptors suppliedDescriptors: [KeyboardHIDElementDescriptor]? = nil,
         registryEntryID: UInt64? = 1,
@@ -1154,11 +1311,12 @@ private final class TestKeyboardHIDConnection: KeyboardHIDCaptureConnection, @un
 
     var wasCancelled: Bool { lock.withLock { cancelled } }
 
-    func cancel() async {
+    func cancel() async -> KeyboardHIDCaptureError? {
         lock.withLock { cancelled = true }
         await cancelEntered?.open()
         await cancelBarrier?.wait()
         if finishesStreamOnCancel { continuation.finish() }
+        return nil
     }
 }
 
@@ -1541,6 +1699,8 @@ private enum HIDDescriptorDumpHarness {
             targetDevices,
             inspect: { index, device in
                 print("HID descriptor child \(index + 1)/\(targetDevices.count): target USB keyboard 0x1189:0x8890")
+                print("  registryEntryID=\(registryID(for: device).map { String($0) } ?? "unavailable") (source=IORegistryEntryGetRegistryEntryID(IOHIDDeviceGetService(device)))")
+                print("  ReportDescriptor=\(reportDescriptorHex(for: device)) (source=IOHIDDeviceGetProperty(kIOHIDReportDescriptorKey))")
                 let elements = try copyAllElements(from: device)
                 for (elementIndex, element) in elements.enumerated() {
                     print("  element[\(elementIndex)]: \(describe(element))")
@@ -1710,7 +1870,28 @@ private enum HIDDescriptorDumpHarness {
             ownCollection = []
         }
         let context = (collectionContext + ownCollection).joined(separator: " > ")
-        return "cookie=\(UInt32(IOHIDElementGetCookie(element))) type=\(elementTypeName(type)) usagePage=\(hex(IOHIDElementGetUsagePage(element))) usage=\(hex(IOHIDElementGetUsage(element))) usageMin=\(propertyInteger(element, key: kIOHIDElementUsageMinKey).map(hex) ?? "unavailable") usageMax=\(propertyInteger(element, key: kIOHIDElementUsageMaxKey).map(hex) ?? "unavailable") logicalMin=\(IOHIDElementGetLogicalMin(element)) logicalMax=\(IOHIDElementGetLogicalMax(element)) isArray=\(IOHIDElementIsArray(element)) reportID=\(IOHIDElementGetReportID(element)) reportSize=\(IOHIDElementGetReportSize(element)) reportCount=\(IOHIDElementGetReportCount(element)) collectionContext=\(context.isEmpty ? "none" : context)"
+        return "cookie=\(UInt32(IOHIDElementGetCookie(element))) type=\(elementTypeName(type)) usagePage=\(hex(IOHIDElementGetUsagePage(element))) usage=\(hex(IOHIDElementGetUsage(element))) usageMin=\(usageBoundDescription(element, key: kIOHIDElementUsageMinKey, keyName: "kIOHIDElementUsageMinKey")) usageMax=\(usageBoundDescription(element, key: kIOHIDElementUsageMaxKey, keyName: "kIOHIDElementUsageMaxKey")) logicalMin=\(IOHIDElementGetLogicalMin(element)) [source=IOHIDElementGetLogicalMin] logicalMax=\(IOHIDElementGetLogicalMax(element)) [source=IOHIDElementGetLogicalMax] isArray=\(IOHIDElementIsArray(element)) reportID=\(IOHIDElementGetReportID(element)) reportSize=\(IOHIDElementGetReportSize(element)) reportCount=\(IOHIDElementGetReportCount(element)) collectionContext=\(context.isEmpty ? "none" : context)"
+    }
+
+    private static func usageBoundDescription(
+        _ element: IOHIDElement,
+        key: String,
+        keyName: String
+    ) -> String {
+        guard let value = propertyInteger(element, key: key) else {
+            return "unavailable [source=IOHIDElementGetProperty(\(keyName)); property absent or non-numeric]"
+        }
+        return "\(hex(value)) [source=IOHIDElementGetProperty(\(keyName))]"
+    }
+
+    private static func reportDescriptorHex(for device: IOHIDDevice) -> String {
+        guard let property = IOHIDDeviceGetProperty(device, kIOHIDReportDescriptorKey as CFString) else {
+            return "unavailable (property absent)"
+        }
+        guard let bytes = property as? Data else {
+            return "unavailable (unexpected property type \(String(reflecting: type(of: property))))"
+        }
+        return bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
     }
 
     private static func isTargetKeyboard(_ device: IOHIDDevice) -> Bool {
@@ -1841,6 +2022,8 @@ private enum HIDDescriptorDumpHarness {
         case .ambiguousInterface: caseName = "KeyboardHIDCaptureError.ambiguousInterface"
         case .interfaceMismatch: caseName = "KeyboardHIDCaptureError.interfaceMismatch"
         case .openFailed: caseName = "KeyboardHIDCaptureError.openFailed"
+        case .managerCloseFailed: caseName = "KeyboardHIDCaptureError.managerCloseFailed"
+        case .deviceCloseFailed: caseName = "KeyboardHIDCaptureError.deviceCloseFailed"
         case nil: caseName = String(reflecting: type(of: error))
         }
         return "\(caseName): \(error.localizedDescription)"

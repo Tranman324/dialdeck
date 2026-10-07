@@ -6,18 +6,7 @@ import IOKit.hidsystem
 private struct SelectedKeyboardCollection {
     let device: IOHIDDevice
     let registryEntryID: UInt64
-    let elementPlan: KeyboardHIDElementPlan
-    let identity: KeyboardHIDChildIdentity
-}
-
-private struct KeyboardHIDRuntimeCandidate {
-    let device: IOHIDDevice
-    let identity: KeyboardHIDChildIdentity
-}
-
-private struct KeyboardHIDInputSnapshot {
-    let descriptors: [KeyboardHIDElementDescriptor]
-    let keyboardApplicationCollectionCount: Int
+    let reportDescriptor: Data
 }
 
 struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
@@ -28,7 +17,7 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
         return try await withTaskCancellationHandler {
             let connection = try await openingTask.value
             guard !Task.isCancelled else {
-                await connection.cancel()
+                if let closeError = await connection.cancel() { throw closeError }
                 throw CancellationError()
             }
             return connection
@@ -46,8 +35,8 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
         try Task.checkCancellation()
         let currentSelection = try selectCurrentTarget()
         try Task.checkCancellation()
-        // The fingerprint omits element cookies; identity also compares the callback plan that binds them.
-        guard firstSelection.identity == currentSelection.identity else {
+        guard firstSelection.registryEntryID == currentSelection.registryEntryID,
+              firstSelection.reportDescriptor == currentSelection.reportDescriptor else {
             throw KeyboardHIDCaptureError.targetUnavailable
         }
 
@@ -58,20 +47,22 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
         let connection = MacOSKeyboardHIDCaptureConnection(
             device: currentSelection.device,
             registryEntryID: currentSelection.registryEntryID,
-            elementPlan: currentSelection.elementPlan
+            reportDescriptor: currentSelection.reportDescriptor,
+            elementPlan: KeyboardHIDElementPlan.observedArrayControlPlan
         )
         try connection.openReadOnly()
         return connection
     }
 
-    /// Enumerates matching keyboard children and selects the unique complete descriptor plan.
-    /// This temporary manager has no input callbacks and never seizes the device.
+    /// Selects only the target child whose complete ReportDescriptor matches
+    /// the captured keyboard-array descriptor. The manager is non-seizing and
+    /// is closed before the selected device is opened directly.
     private static func selectCurrentTarget() throws -> SelectedKeyboardCollection {
         guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
             throw KeyboardHIDCaptureError.permissionUnavailable
         }
-        let manager = IOHIDManagerCreate(kCFAllocatorDefault, 0)
 
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, 0)
         let matching: [String: Any] = [
             kIOHIDVendorIDKey as String: NSNumber(value: KeyboardHIDTarget.vendorID),
             kIOHIDProductIDKey as String: NSNumber(value: KeyboardHIDTarget.productID),
@@ -80,163 +71,84 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
             kIOHIDDeviceUsageKey as String: NSNumber(value: KeyboardHIDTarget.keyboardApplicationUsage),
         ]
         IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
-        guard IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
+        let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard openResult == kIOReturnSuccess else {
             throw KeyboardHIDCaptureError.openFailed
         }
-        defer { _ = IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone)) }
 
+        let selected: SelectedKeyboardCollection
+        do {
+            selected = try selectMatchingKeyboardChild(from: manager)
+        } catch {
+            let closeResult = IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+            guard closeResult == kIOReturnSuccess else {
+                throw KeyboardHIDCaptureError.managerCloseFailed(Int32(closeResult))
+            }
+            throw error
+        }
+
+        let closeResult = IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard closeResult == kIOReturnSuccess else {
+            throw KeyboardHIDCaptureError.managerCloseFailed(Int32(closeResult))
+        }
+        return selected
+    }
+
+    private static func selectMatchingKeyboardChild(from manager: IOHIDManager) throws -> SelectedKeyboardCollection {
         guard let deviceSet = IOHIDManagerCopyDevices(manager) else {
             throw KeyboardHIDCaptureError.targetUnavailable
         }
         let devices = (deviceSet as NSSet).allObjects as! [IOHIDDevice]
-        guard !devices.isEmpty else { throw KeyboardHIDCaptureError.targetUnavailable }
-
-        let keyboardDevices = devices.filter { device in
-            propertyInteger(device, key: kIOHIDVendorIDKey) == KeyboardHIDTarget.vendorID
-                && propertyInteger(device, key: kIOHIDProductIDKey) == KeyboardHIDTarget.productID
-                && propertyString(device, key: kIOHIDTransportKey) == kIOHIDTransportUSBValue
-                && IOHIDDeviceConformsTo(
-                    device,
-                    KeyboardHIDTarget.genericDesktopUsagePage,
-                    KeyboardHIDTarget.keyboardApplicationUsage
-                )
-        }
-        guard !keyboardDevices.isEmpty else { throw KeyboardHIDCaptureError.targetUnavailable }
-
-        let candidates = keyboardDevices.map { device -> KeyboardHIDRuntimeCandidate in
-            let inputSnapshot = try? inputElementSnapshot(for: device)
-            let descriptors = inputSnapshot?.descriptors ?? []
-            let identity = KeyboardHIDChildIdentity(
-                descriptorFingerprint: KeyboardHIDDescriptorFingerprint(descriptors: descriptors),
-                usagePairs: usagePairs(for: device),
-                keyboardApplicationCollectionCount: inputSnapshot?.keyboardApplicationCollectionCount,
-                registryEntryID: try? registryID(for: device),
-                elementPlan: try? KeyboardHIDElementPlan(validating: descriptors)
-            )
-            return KeyboardHIDRuntimeCandidate(device: device, identity: identity)
+        let keyboardDevices = devices.filter(isTargetKeyboard)
+        guard !keyboardDevices.isEmpty else {
+            throw KeyboardHIDCaptureError.targetUnavailable
         }
 
-        let selectedIndex = try KeyboardHIDChildSelection.uniqueEligibleIndex(
-            in: candidates.map(\.identity)
+        let descriptors = keyboardDevices.map(reportDescriptor(for:))
+        let selectedIndex = try KeyboardHIDRawReportInterfaceSelection.uniqueMatchingIndex(
+            in: descriptors
         )
-        let selected = candidates[selectedIndex]
-        guard let registryEntryID = selected.identity.registryEntryID,
-              let elementPlan = selected.identity.elementPlan else {
+        let device = keyboardDevices[selectedIndex]
+        guard let descriptor = descriptors[selectedIndex] else {
             throw KeyboardHIDCaptureError.interfaceMismatch
         }
         return SelectedKeyboardCollection(
-            device: selected.device,
-            registryEntryID: registryEntryID,
-            elementPlan: elementPlan,
-            identity: selected.identity
+            device: device,
+            registryEntryID: try registryID(for: device),
+            reportDescriptor: descriptor
         )
     }
 
-    private static func inputElementSnapshot(for device: IOHIDDevice) throws -> KeyboardHIDInputSnapshot {
-        guard let rawElements = IOHIDDeviceCopyMatchingElements(device, nil, IOOptionBits(kIOHIDOptionsTypeNone)) else {
-            throw KeyboardHIDCaptureError.interfaceMismatch
-        }
-        let elements = rawElements as! [IOHIDElement]
-        // A nil element match returns all device elements; count collection nodes directly to include empty ones.
-        let keyboardApplicationCollectionCount = Set(
-            elements.filter(isKeyboardApplicationCollection).map { UInt32(IOHIDElementGetCookie($0)) }
-        ).count
-        var descriptors: [KeyboardHIDElementDescriptor] = []
-
-        for element in elements where isInputElement(element) && belongsToUniqueKeyboardCollection(element) {
-            guard IOHIDElementGetUsagePage(element) == KeyboardHIDTarget.keyboardUsagePage else { continue }
-            let isArray = IOHIDElementIsArray(element)
-            let usage = IOHIDElementGetUsage(element)
-            let representation: KeyboardHIDElementDescriptor.Representation
-            if isArray {
-                representation = .array(
-                    minimumUsage: propertyInteger(element, key: kIOHIDElementUsageMinKey),
-                    maximumUsage: propertyInteger(element, key: kIOHIDElementUsageMaxKey)
-                )
-            } else {
-                representation = .variable(usage: usage)
-            }
-
-            descriptors.append(KeyboardHIDElementDescriptor(
-                cookie: UInt64(IOHIDElementGetCookie(element)),
-                usagePage: IOHIDElementGetUsagePage(element),
-                representation: representation,
-                reportID: IOHIDElementGetReportID(element),
-                reportCount: IOHIDElementGetReportCount(element),
-                logicalMinimum: Int64(IOHIDElementGetLogicalMin(element)),
-                logicalMaximum: Int64(IOHIDElementGetLogicalMax(element))
-            ))
-        }
-        return KeyboardHIDInputSnapshot(
-            descriptors: descriptors,
-            keyboardApplicationCollectionCount: keyboardApplicationCollectionCount
-        )
+    private static func isTargetKeyboard(_ device: IOHIDDevice) -> Bool {
+        propertyInteger(device, key: kIOHIDVendorIDKey) == KeyboardHIDTarget.vendorID
+            && propertyInteger(device, key: kIOHIDProductIDKey) == KeyboardHIDTarget.productID
+            && propertyString(device, key: kIOHIDTransportKey) == kIOHIDTransportUSBValue
+            && IOHIDDeviceConformsTo(
+                device,
+                KeyboardHIDTarget.genericDesktopUsagePage,
+                KeyboardHIDTarget.keyboardApplicationUsage
+            )
     }
 
-    private static func isKeyboardApplicationCollection(_ element: IOHIDElement) -> Bool {
-        IOHIDElementGetType(element) == kIOHIDElementTypeCollection
-            && IOHIDElementGetCollectionType(element) == kIOHIDElementCollectionTypeApplication
-            && IOHIDElementGetUsagePage(element) == KeyboardHIDTarget.genericDesktopUsagePage
-            && IOHIDElementGetUsage(element) == KeyboardHIDTarget.keyboardApplicationUsage
-    }
-
-    private static func belongsToUniqueKeyboardCollection(_ element: IOHIDElement) -> Bool {
-        var current = IOHIDElementGetParent(element)
-        var matchingApplications = 0
-        while let parent = current {
-            if IOHIDElementGetType(parent) == kIOHIDElementTypeCollection,
-               IOHIDElementGetCollectionType(parent) == kIOHIDElementCollectionTypeApplication,
-               IOHIDElementGetUsagePage(parent) == KeyboardHIDTarget.genericDesktopUsagePage,
-               IOHIDElementGetUsage(parent) == KeyboardHIDTarget.keyboardApplicationUsage {
-                matchingApplications += 1
-            }
-            current = IOHIDElementGetParent(parent)
-        }
-        return matchingApplications == 1
-    }
-
-    private static func isInputElement(_ element: IOHIDElement) -> Bool {
-        let type = IOHIDElementGetType(element)
-        return type == kIOHIDElementTypeInput_Misc
-            || type == kIOHIDElementTypeInput_Button
-            || type == kIOHIDElementTypeInput_ScanCodes
-            || type == kIOHIDElementTypeInput_NULL
-    }
-
-    private static func usagePairs(for device: IOHIDDevice) -> [KeyboardHIDUsagePair]? {
-        guard let rawPairs = IOHIDDeviceGetProperty(device, kIOHIDDeviceUsagePairsKey as CFString) as? NSArray else {
-            return nil
-        }
-        var pairs: [KeyboardHIDUsagePair] = []
-        for value in rawPairs {
-            guard let pair = value as? NSDictionary,
-                  let page = (pair[kIOHIDDeviceUsagePageKey] as? NSNumber)?.uint32Value,
-                  let usage = (pair[kIOHIDDeviceUsageKey] as? NSNumber)?.uint32Value else {
-                return nil
-            }
-            pairs.append(KeyboardHIDUsagePair(usagePage: page, usage: usage))
-        }
-        return pairs.sorted()
+    private static func reportDescriptor(for device: IOHIDDevice) -> Data? {
+        IOHIDDeviceGetProperty(device, kIOHIDReportDescriptorKey as CFString) as? Data
     }
 
     private static func registryID(for device: IOHIDDevice) throws -> UInt64 {
         let service = IOHIDDeviceGetService(device)
-        guard service != IO_OBJECT_NULL else { throw KeyboardHIDCaptureError.interfaceMismatch }
+        guard service != IO_OBJECT_NULL else {
+            throw KeyboardHIDCaptureError.interfaceMismatch
+        }
         var identifier: UInt64 = 0
-        guard IORegistryEntryGetRegistryEntryID(service, &identifier) == KERN_SUCCESS else {
+        guard IORegistryEntryGetRegistryEntryID(service, &identifier) == KERN_SUCCESS,
+              identifier != 0 else {
             throw KeyboardHIDCaptureError.interfaceMismatch
         }
         return identifier
     }
 
     private static func propertyInteger(_ device: IOHIDDevice, key: String) -> UInt32? {
-        guard let value = IOHIDDeviceGetProperty(device, key as CFString) as? NSNumber else { return nil }
-        return value.uint32Value
-    }
-
-    private static func propertyInteger(_ element: IOHIDElement, key: String) -> UInt32? {
-        guard let value = IOHIDElementGetProperty(element, key as CFString) as? NSNumber else { return nil }
-        return value.uint32Value
+        (IOHIDDeviceGetProperty(device, key as CFString) as? NSNumber)?.uint32Value
     }
 
     private static func propertyString(_ device: IOHIDDevice, key: String) -> String? {
@@ -246,25 +158,40 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
 
 private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnection, @unchecked Sendable {
     private static let eventBufferLimit = 256
+    private static let inputReportBufferCapacity = 256
 
     let elementPlan: KeyboardHIDElementPlan
     let events: AsyncStream<KeyboardHIDTransportEvent>
 
     private let device: IOHIDDevice
     private let registryEntryID: UInt64
+    private let reportDescriptor: Data
+    private let reportBuffer: UnsafeMutablePointer<UInt8>
     private let continuation: AsyncStream<KeyboardHIDTransportEvent>.Continuation
     private let callbackQueue: DispatchQueue
     private let lock = NSLock()
-    private var isOpen = false
+    private var reportDecoder = KeyboardHIDRawReportDecoder()
+    private var hasOpenHandle = false
     private var isClosing = false
-    private var cancelHandlerFinished = false
-    private var cancelWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancellationHandlerFinished = false
+    private var cancellationFinished = false
+    private var cancellationError: KeyboardHIDCaptureError?
+    private var cancellationHandlerWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
     private var permissionMonitor: Task<Void, Never>?
 
-    init(device: IOHIDDevice, registryEntryID: UInt64, elementPlan: KeyboardHIDElementPlan) {
+    init(
+        device: IOHIDDevice,
+        registryEntryID: UInt64,
+        reportDescriptor: Data,
+        elementPlan: KeyboardHIDElementPlan
+    ) {
         self.device = device
         self.registryEntryID = registryEntryID
+        self.reportDescriptor = reportDescriptor
         self.elementPlan = elementPlan
+        reportBuffer = .allocate(capacity: Self.inputReportBufferCapacity)
+        reportBuffer.initialize(repeating: 0, count: Self.inputReportBufferCapacity)
         callbackQueue = DispatchQueue(label: "DialDeck.keyboardHIDCapture")
         let pair = AsyncStream<KeyboardHIDTransportEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(Self.eventBufferLimit)
@@ -273,39 +200,39 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
         continuation = pair.continuation
     }
 
+    deinit {
+        reportBuffer.deinitialize(count: Self.inputReportBufferCapacity)
+        reportBuffer.deallocate()
+    }
+
     func openReadOnly() throws {
         guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
             throw KeyboardHIDCaptureError.permissionUnavailable
         }
-        guard Self.registryEntryID(for: device) == registryEntryID else {
+        guard Self.registryEntryID(for: device) == registryEntryID,
+              Self.reportDescriptor(for: device) == reportDescriptor,
+              reportDescriptor == KeyboardHIDTarget.rawReportDescriptor else {
             throw KeyboardHIDCaptureError.targetUnavailable
         }
 
-        let matches: [[String: Any]] = elementPlan.inputsByCookie.map { cookie, input in
-            var match: [String: Any] = [
-                kIOHIDElementCookieKey as String: NSNumber(value: cookie),
-                kIOHIDElementUsagePageKey as String: NSNumber(value: KeyboardHIDTarget.keyboardUsagePage),
-            ]
-            if case .variable(let usage) = input {
-                match[kIOHIDElementUsageKey as String] = NSNumber(value: usage)
-            }
-            return match
-        }
-        IOHIDDeviceSetInputValueMatchingMultiple(device, matches as CFArray)
         IOHIDDeviceSetDispatchQueue(device, callbackQueue)
-
-        guard IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
-            // No callbacks or cancel handler retain this connection's context on failure.
+        let openResult = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard openResult == kIOReturnSuccess else {
             throw KeyboardHIDCaptureError.openFailed
         }
-        isOpen = true
+        lock.withLock { hasOpenHandle = true }
 
-        // Install unretained callback context only once open succeeds, and before activation.
         let context = Unmanaged.passUnretained(self).toOpaque()
-        IOHIDDeviceRegisterInputValueCallback(device, Self.inputValueCallback, context)
+        IOHIDDeviceRegisterInputReportCallback(
+            device,
+            reportBuffer,
+            Self.inputReportBufferCapacity,
+            Self.inputReportCallback,
+            context
+        )
         IOHIDDeviceRegisterRemovalCallback(device, Self.deviceRemovalCallback, context)
         IOHIDDeviceSetCancelHandler(device) { [weak self] in
-            self?.finishCancellation()
+            self?.finishCancellationHandler()
         }
         IOHIDDeviceActivate(device)
 
@@ -325,45 +252,86 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
         }
     }
 
-    func cancel() async {
+    func cancel() async -> KeyboardHIDCaptureError? {
         permissionMonitor?.cancel()
         permissionMonitor = nil
 
         enum CancelAction {
             case begin
             case wait
-            case complete
+            case noHandle
+            case finished(KeyboardHIDCaptureError?)
         }
         let action = lock.withLock { () -> CancelAction in
-            if isClosing {
-                return cancelHandlerFinished || !isOpen ? .complete : .wait
-            }
+            if cancellationFinished { return .finished(cancellationError) }
+            if isClosing { return .wait }
             isClosing = true
-            return isOpen ? .begin : .complete
+            return hasOpenHandle ? .begin : .noHandle
         }
 
         switch action {
         case .begin:
-            _ = IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
             IOHIDDeviceCancel(device)
-            await waitForCancellation()
+            await waitForCancellationHandler()
+            let closeResult = IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+            let closeError = closeResult == kIOReturnSuccess
+                ? nil
+                : KeyboardHIDCaptureError.deviceCloseFailed(Int32(closeResult))
+            finishCancellation(with: closeError)
         case .wait:
             await waitForCancellation()
-        case .complete:
-            break
+        case .noHandle:
+            finishCancellation(with: nil)
+        case .finished(let error):
+            continuation.finish()
+            return error
         }
         continuation.finish()
+        return lock.withLock { cancellationError }
+    }
+
+    private func waitForCancellationHandler() async {
+        await withCheckedContinuation { continuation in
+            let resumeImmediately = lock.withLock { () -> Bool in
+                if cancellationHandlerFinished { return true }
+                cancellationHandlerWaiters.append(continuation)
+                return false
+            }
+            if resumeImmediately { continuation.resume() }
+        }
     }
 
     private func waitForCancellation() async {
         await withCheckedContinuation { continuation in
             let resumeImmediately = lock.withLock { () -> Bool in
-                if cancelHandlerFinished || !isOpen { return true }
-                cancelWaiters.append(continuation)
+                if cancellationFinished { return true }
+                cancellationWaiters.append(continuation)
                 return false
             }
             if resumeImmediately { continuation.resume() }
         }
+    }
+
+    private func finishCancellationHandler() {
+        let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            cancellationHandlerFinished = true
+            let pending = cancellationHandlerWaiters
+            cancellationHandlerWaiters.removeAll()
+            return pending
+        }
+        for waiter in waiters { waiter.resume() }
+    }
+
+    private func finishCancellation(with error: KeyboardHIDCaptureError?) {
+        let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            hasOpenHandle = false
+            cancellationError = error
+            cancellationFinished = true
+            let pending = cancellationWaiters
+            cancellationWaiters.removeAll()
+            return pending
+        }
+        for waiter in waiters { waiter.resume() }
     }
 
     private func yield(_ event: KeyboardHIDTransportEvent) {
@@ -376,35 +344,20 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
         }
     }
 
-    private func finishCancellation() {
-        let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
-            cancelHandlerFinished = true
-            isOpen = false
-            let pending = cancelWaiters
-            cancelWaiters.removeAll()
-            return pending
-        }
-        for waiter in waiters { waiter.resume() }
-    }
-
-    private static let inputValueCallback: IOHIDValueCallback = { context, result, _, value in
+    private static let inputReportCallback: IOHIDReportCallback = {
+        context, result, _, reportType, reportID, report, reportLength in
         guard let context else { return }
         let connection = Unmanaged<MacOSKeyboardHIDCaptureConnection>
             .fromOpaque(context)
             .takeUnretainedValue()
-        guard result == kIOReturnSuccess else {
+        guard result == kIOReturnSuccess, reportType == kIOHIDReportTypeInput, reportLength >= 0 else {
             connection.yield(.disconnected)
             return
         }
-        let element = IOHIDValueGetElement(value)
-        let rawValue = KeyboardHIDRawValue(
-            cookie: UInt64(IOHIDElementGetCookie(element)),
-            usagePage: IOHIDElementGetUsagePage(element),
-            elementUsage: IOHIDElementGetUsage(element),
-            isArray: IOHIDElementIsArray(element),
-            integerValue: Int64(IOHIDValueGetIntegerValue(value))
-        )
-        connection.yield(.value(rawValue))
+        let bytes = Array(UnsafeBufferPointer(start: report, count: Int(reportLength)))
+        for value in connection.reportDecoder.consume(reportID: reportID, bytes: bytes) {
+            connection.yield(.value(value))
+        }
     }
 
     private static let deviceRemovalCallback: IOHIDCallback = { context, _, _ in
@@ -421,5 +374,9 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
         var identifier: UInt64 = 0
         guard IORegistryEntryGetRegistryEntryID(service, &identifier) == KERN_SUCCESS else { return nil }
         return identifier
+    }
+
+    private static func reportDescriptor(for device: IOHIDDevice) -> Data? {
+        IOHIDDeviceGetProperty(device, kIOHIDReportDescriptorKey as CFString) as? Data
     }
 }

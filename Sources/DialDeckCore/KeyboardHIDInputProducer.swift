@@ -7,6 +7,16 @@ enum KeyboardHIDTarget {
     static let keyboardApplicationUsage: UInt32 = 0x06
     static let keyboardUsagePage: UInt32 = 0x07
     static let observedUsages: Set<UInt32> = Set(0x6b...0x73)
+    static let rawReportDescriptor = Data([
+        0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01,
+        0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00,
+        0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+        0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x03,
+        0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x03,
+        0x91, 0x02, 0x95, 0x05, 0x75, 0x01, 0x91, 0x01,
+        0x95, 0x06, 0x75, 0x08, 0x26, 0xff, 0x00, 0x05,
+        0x07, 0x19, 0x00, 0x29, 0x91, 0x81, 0x00, 0xc0,
+    ])
 }
 
 struct KeyboardHIDUsagePair: Equatable, Hashable, Comparable, Sendable {
@@ -67,6 +77,18 @@ struct KeyboardHIDElementPlan: Equatable, Sendable {
     }
 
     let inputsByCookie: [UInt64: Input]
+
+    static let observedArrayControlPlan = KeyboardHIDElementPlan(
+        inputsByCookie: Dictionary(
+            uniqueKeysWithValues: KeyboardHIDTarget.observedUsages.map {
+                (UInt64($0), .variable(usage: $0))
+            }
+        )
+    )
+
+    private init(inputsByCookie: [UInt64: Input]) {
+        self.inputsByCookie = inputsByCookie
+    }
 
     init(validating descriptors: [KeyboardHIDElementDescriptor]) throws {
         let pageSeven = descriptors.filter { $0.usagePage == KeyboardHIDTarget.keyboardUsagePage }
@@ -153,12 +175,78 @@ enum KeyboardHIDChildSelection {
     }
 }
 
+enum KeyboardHIDRawReportInterfaceSelection {
+    static func uniqueMatchingIndex(in descriptors: [Data?]) throws -> Int {
+        let matches = descriptors.indices.filter {
+            descriptors[$0] == KeyboardHIDTarget.rawReportDescriptor
+        }
+        guard matches.count == 1 else {
+            if matches.isEmpty {
+                throw KeyboardHIDCaptureError.interfaceMismatch
+            }
+            throw KeyboardHIDCaptureError.ambiguousTarget
+        }
+        return matches[0]
+    }
+}
+
 struct KeyboardHIDRawValue: Equatable, Sendable {
     let cookie: UInt64
     let usagePage: UInt32
     let elementUsage: UInt32
     let isArray: Bool
     let integerValue: Int64
+}
+
+struct KeyboardHIDRawReportDecoder: Sendable {
+    static let expectedReportID: UInt32 = 0x01
+    static let expectedReportLength = 9
+    static let keyArrayRange = 3..<9
+    static let errorRollOverUsage: UInt8 = 0x01
+
+    private(set) var activeUsages: Set<UInt32> = []
+
+    mutating func consume(reportID: UInt32, bytes: [UInt8]) -> [KeyboardHIDRawValue] {
+        guard reportID == Self.expectedReportID,
+              bytes.count == Self.expectedReportLength,
+              bytes[0] == UInt8(Self.expectedReportID) else {
+            return []
+        }
+
+        let keyArray = bytes[Self.keyArrayRange]
+        guard !keyArray.allSatisfy({ $0 == Self.errorRollOverUsage }) else {
+            return []
+        }
+
+        let nextUsages = Set(keyArray.compactMap { usage -> UInt32? in
+            guard usage != 0,
+                  KeyboardHIDTarget.observedUsages.contains(UInt32(usage)) else {
+                return nil
+            }
+            return UInt32(usage)
+        })
+        let released = activeUsages.subtracting(nextUsages).sorted()
+        let pressed = nextUsages.subtracting(activeUsages).sorted()
+        activeUsages = nextUsages
+        return released.map { rawValue(for: $0, pressed: false) }
+            + pressed.map { rawValue(for: $0, pressed: true) }
+    }
+
+    mutating func releaseHeldInputs() -> [KeyboardHIDRawValue] {
+        let released = activeUsages.sorted().map { rawValue(for: $0, pressed: false) }
+        activeUsages.removeAll()
+        return released
+    }
+
+    private func rawValue(for usage: UInt32, pressed: Bool) -> KeyboardHIDRawValue {
+        KeyboardHIDRawValue(
+            cookie: UInt64(usage),
+            usagePage: KeyboardHIDTarget.keyboardUsagePage,
+            elementUsage: usage,
+            isArray: false,
+            integerValue: pressed ? 1 : 0
+        )
+    }
 }
 
 enum KeyboardHIDTransportEvent: Sendable {
@@ -170,7 +258,7 @@ enum KeyboardHIDTransportEvent: Sendable {
 protocol KeyboardHIDCaptureConnection: Sendable {
     var elementPlan: KeyboardHIDElementPlan { get }
     var events: AsyncStream<KeyboardHIDTransportEvent> { get }
-    func cancel() async
+    func cancel() async -> KeyboardHIDCaptureError?
 }
 
 protocol KeyboardHIDCaptureTransport: Sendable {
@@ -184,6 +272,8 @@ enum KeyboardHIDCaptureError: Error, Equatable, Sendable, LocalizedError {
     case ambiguousInterface
     case interfaceMismatch
     case openFailed
+    case managerCloseFailed(Int32)
+    case deviceCloseFailed(Int32)
 
     var errorDescription: String? {
         switch self {
@@ -199,6 +289,10 @@ enum KeyboardHIDCaptureError: Error, Equatable, Sendable, LocalizedError {
             "The matching keyboard collection does not expose the complete observed input set"
         case .openFailed:
             "The matching keyboard collection could not be opened read-only"
+        case .managerCloseFailed(let result):
+            "The temporary HID manager failed to close with IOReturn \(String(format: "0x%08X", UInt32(bitPattern: result)))"
+        case .deviceCloseFailed(let result):
+            "The keyboard HID device failed to close with IOReturn \(String(format: "0x%08X", UInt32(bitPattern: result)))"
         }
     }
 
@@ -207,6 +301,8 @@ enum KeyboardHIDCaptureError: Error, Equatable, Sendable, LocalizedError {
         case .targetUnavailable, .ambiguousTarget:
             true
         case .permissionUnavailable, .ambiguousInterface, .interfaceMismatch, .openFailed:
+            false
+        case .managerCloseFailed, .deviceCloseFailed:
             false
         }
     }
@@ -422,12 +518,12 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
     func start() async throws {
         let connection = try await transport.connectToUniqueTarget()
         guard !isClosed else {
-            await connection.cancel()
+            if let closeError = await connection.cancel() { throw closeError }
             throw CancellationError()
         }
         await consumer.sessionLifecycleChanged(.started(generation))
         guard !isClosed else {
-            await connection.cancel()
+            if let closeError = await connection.cancel() { throw closeError }
             throw CancellationError()
         }
         install(connection)
@@ -505,8 +601,12 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
         await releaseHeldInputs()
         await announceStoppingIfNeeded()
         decoder = nil
-        await oldConnection.connection.cancel()
+        let closeError = await oldConnection.connection.cancel()
         finishConnectionTeardown()
+        if let closeError {
+            await terminate(with: .failed(closeError.localizedDescription))
+            return
+        }
         if !isClosed, !isPaused {
             scheduleReconnect(immediately: false)
         }
@@ -547,8 +647,11 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
         let connectionToClose = activeConnection
         activeConnection = nil
         decoder = nil
+        var finalOutcome = outcome
         if let connectionToClose {
-            await connectionToClose.connection.cancel()
+            if let closeError = await connectionToClose.connection.cancel() {
+                finalOutcome = .failed(closeError.localizedDescription)
+            }
             if connectionToClose.id != readerConnectionID {
                 connectionToClose.reader.cancel()
                 await connectionToClose.reader.value
@@ -559,7 +662,7 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
         }
         await waitForConnectionTeardowns()
 
-        switch outcome {
+        switch finalOutcome {
         case .cancelled:
             await consumer.sessionLifecycleChanged(.stopped(generation))
         case .failed(let reason):
@@ -599,10 +702,13 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
         activeConnection = nil
         decoder = nil
         pendingConnectionTeardowns += 1
-        await oldConnection.connection.cancel()
+        let closeError = await oldConnection.connection.cancel()
         oldConnection.reader.cancel()
         await oldConnection.reader.value
         finishConnectionTeardown()
+        if let closeError {
+            await terminate(with: .failed(closeError.localizedDescription))
+        }
     }
 
     private func announceStoppingIfNeeded() async {
@@ -641,12 +747,22 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
         do {
             let connection = try await transport.connectToUniqueTarget()
             guard reconnectTaskID == taskID, !isClosed, !isPaused, activeConnection == nil else {
-                await connection.cancel()
+                if let closeError = await connection.cancel() {
+                    await terminate(
+                        with: .failed(closeError.localizedDescription),
+                        currentReconnectID: taskID
+                    )
+                }
                 return false
             }
             await consumer.sessionLifecycleChanged(.started(generation))
             guard reconnectTaskID == taskID, !isClosed, !isPaused, activeConnection == nil else {
-                await connection.cancel()
+                if let closeError = await connection.cancel() {
+                    await terminate(
+                        with: .failed(closeError.localizedDescription),
+                        currentReconnectID: taskID
+                    )
+                }
                 return false
             }
             install(connection)
