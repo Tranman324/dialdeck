@@ -58,7 +58,7 @@ The nine F16–F24 vectors are now in the observed capability catalog for this u
 
 The C transport holds one process-wide lock from discovery through release, so separate service instances cannot interleave report sequences. It rejects a report-buffer length mismatch before reading the buffer, re-enumerates for exactly one matching VID/PID unit, validates its four-interface topology, opens that same device, claims interface 1, and checks the full Report ID 3 descriptor again on the open handle before output. All reports go only to endpoint `0x02`. It never switches to an unobserved fallback route. Same-ID, same-topology replacement hardware without serial identity remains indistinguishable.
 
-The C bridge loads `libusb-1.0.dylib` at runtime from `/opt/homebrew/lib` or `/usr/local/lib`. If neither exists, programming returns unavailable. The app does not bundle libusb; standalone distribution remains incomplete until the dependency and its license/packaging are addressed. Separately approved lighting writes are recorded in `.apm/evidence/hardware/led-mode2-write-2026-10-06.md` and `.apm/evidence/hardware/led-mode1-write-2026-10-06.md`.
+The C bridge loads `libusb-1.0.dylib` at runtime from `/opt/homebrew/lib` or `/usr/local/lib`. If neither exists, programming returns unavailable. The app does not bundle libusb. Under Jeremy's 2026-10-07 personal-Mac v1 scope, bundling or replacing this Homebrew dependency and standalone distribution are post-v1; no further v1 packaging work is planned. Separately approved lighting writes are recorded in `.apm/evidence/hardware/led-mode2-write-2026-10-06.md` and `.apm/evidence/hardware/led-mode1-write-2026-10-06.md`.
 
 ## Evidence and references
 

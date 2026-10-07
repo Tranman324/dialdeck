@@ -2034,10 +2034,18 @@ final class ActionRuntimeTests: XCTestCase {
         func runKnobSpinWorkload() async throws -> (RuntimeTimingSnapshot, RuntimeMeasurementRecorder, any HostActionServicing) {
             let service = RecordingActionService()
             let (runtime, input, metrics, event) = try await makeRuntimeForWorkload(service: service)
+            let clock = ContinuousClock()
+            let start = clock.now
+            var deliveries: [Task<Void, Never>] = []
             for index in 0..<40 {
-                await input.emit(event)
-                if index < 39 { try await Task.sleep(for: .milliseconds(50)) }
+                let scheduledAt = start + .milliseconds(index * 50)
+                let now = clock.now
+                if now < scheduledAt {
+                    try await Task.sleep(for: now.duration(to: scheduledAt))
+                }
+                deliveries.append(await input.enqueue(event))
             }
+            for delivery in deliveries { await delivery.value }
             let snapshot = metrics.snapshot()
             _ = await runtime.submit(.stop)
             return (snapshot, metrics, service)

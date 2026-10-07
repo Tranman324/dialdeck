@@ -2,6 +2,12 @@
 
 This is a proposed implementation plan, not a description of shipped functionality.
 
+## V1 scope — 2026-10-07
+
+Jeremy set v1 as a personal tool on his Mac. Post-v1 items are signing, notarization, distribution, bundling or replacing the Homebrew `libusb` dependency, formal energy sampling, scripted five-minute resource windows, and bundle tamper protection. No further v1 work is planned on these items.
+
+At the final supervised hardware session, replace formal resource and energy sampling with one manual Activity Monitor check: five minutes with the keypad plugged in and five minutes unplugged. Pass means CPU near 0% while idle and memory flat across both periods.
+
 ## Controls and actions
 
 | Control | Planned actions |
@@ -68,7 +74,7 @@ Use macOS APIs for keyboard and scroll events and application launching. Run App
 - Test repeated rotation and held keys without stuck modifiers or duplicate actions.
 - Report missing applications and Shortcuts without crashing.
 - Document supported macOS versions, supported hardware, installation, and permission setup based on actual tests.
-- Establish signing and distribution before describing a build as ready for general installation.
+- [Post-v1] Establish signing and distribution before describing a build as ready for general installation.
 
 ## Open decisions
 
@@ -76,7 +82,7 @@ Use macOS APIs for keyboard and scroll events and application launching. Run App
 - Exact physical key layout and dial orientation.
 - Minimum supported macOS version.
 - Whether a device programming step is necessary.
-- Distribution and code-signing approach.
+- [Post-v1] Distribution, signing, and notarization approach.
 
 ## Outside the initial scope
 

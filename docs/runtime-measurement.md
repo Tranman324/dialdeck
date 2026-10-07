@@ -23,7 +23,7 @@ Run the simulated timing and focus-contract workload with:
 swift test --package-path . --arch arm64 --filter ActionRuntimeTests
 ```
 
-`testRuntimeMeasurementHarnessSeparatesDispatchServiceAndSequenceTiming` reports p50, p95, and maximum queue wait, pre-dispatch routing, full event handling, and service-call timings for a no-gap backlog and a 40-event, 20 Hz simulated knob spin. The backlog result decomposes its slowest receipt-to-dispatch sample into queue wait and routing time. Output is labeled `SIMULATED_RUNTIME_METRICS`; it measures the runtime and test doubles, not HID callback latency, host input, target-app behavior, CPU, memory, or energy.
+`testRuntimeMeasurementHarnessSeparatesDispatchServiceAndSequenceTiming` reports p50, p95, and maximum queue wait, pre-dispatch routing, full event handling, and service-call timings for a no-gap backlog and a 40-event simulated knob spin scheduled at fixed 50 ms intervals (20 Hz). The spin enqueues each event on schedule without waiting for the previous handler, then joins all deliveries before reporting. The backlog result decomposes its slowest receipt-to-dispatch sample into queue wait and routing time. Output is labeled `SIMULATED_RUNTIME_METRICS`; it measures the runtime and test doubles, not HID callback latency, host input, target-app behavior, CPU, memory, or energy.
 
 ## Final supervised hardware session
 
