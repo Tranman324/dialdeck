@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import csv
+import hashlib
 import math
 import os
 import plistlib
@@ -21,7 +22,39 @@ WINDOW_SECONDS = 300
 SAMPLE_INTERVAL_SECONDS = 1
 DIALDECK_PROCESS_IDENTITY = "com.dialdeck.app (DialDeck.app/Contents/MacOS/DialDeckApp)"
 _proc_pidpath: Callable[..., int] | None = None
+_proc_pidinfo: Callable[..., int] | None = None
 _libproc: ctypes.CDLL | None = None
+PROC_PIDTBSDINFO = 3
+MAXCOMLEN = 16
+
+
+class _ProcBSDInfo(ctypes.Structure):
+    """Fields used from macOS sys/proc_info.h's proc_bsdinfo."""
+
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * MAXCOMLEN),
+        ("pbi_name", ctypes.c_char * (2 * MAXCOMLEN)),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
 
 
 def parse_cpu_seconds(value: str) -> float:
@@ -62,6 +95,39 @@ def process_executable_path(pid: int) -> str:
     return os.fsdecode(buffer.value)
 
 
+def process_instance_identity(pid: int) -> tuple[int, int]:
+    """Return the process start time, without retaining it in evidence."""
+    global _libproc, _proc_pidinfo
+    if sys.platform != "darwin":
+        raise RuntimeError("Process instance verification requires macOS libproc")
+    try:
+        if _proc_pidinfo is None:
+            _libproc = _libproc or ctypes.CDLL("/usr/lib/libproc.dylib")
+            function = _libproc.proc_pidinfo
+            function.argtypes = (
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            )
+            function.restype = ctypes.c_int
+            _proc_pidinfo = function
+        info = _ProcBSDInfo()
+        result = _proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+    except (AttributeError, OSError) as error:
+        raise RuntimeError("DialDeck process instance could not be verified") from error
+    if result != ctypes.sizeof(info) or info.pbi_pid != pid:
+        raise RuntimeError("DialDeck process instance could not be verified")
+    return int(info.pbi_start_tvsec), int(info.pbi_start_tvusec)
+
+
 def verify_dialdeck_process(
     pid: int,
     candidate_sha: str,
@@ -78,6 +144,10 @@ def verify_dialdeck_process(
     try:
         with info_path.open("rb") as bundle_info:
             info = plistlib.load(bundle_info)
+        executable_digest = hashlib.sha256()
+        with executable_path.open("rb") as executable:
+            for chunk in iter(lambda: executable.read(1024 * 1024), b""):
+                executable_digest.update(chunk)
     except (OSError, plistlib.InvalidFileException, ValueError) as error:
         raise RuntimeError("DialDeck app bundle identity could not be verified") from error
     if (
@@ -88,11 +158,20 @@ def verify_dialdeck_process(
         raise RuntimeError("Selected process does not match the DialDeck app bundle identity")
     if info.get("DialDeckBuildSHA") != candidate_sha.lower():
         raise RuntimeError("Selected process does not match the requested candidate SHA")
+    if info.get("DialDeckExecutableSHA256") != executable_digest.hexdigest():
+        raise RuntimeError("Selected process executable does not match its bundle digest")
     return DIALDECK_PROCESS_IDENTITY
 
 
-def read_process_sample(pid: int, candidate_sha: str) -> tuple[float, int]:
-    identity_before = verify_dialdeck_process(pid, candidate_sha)
+def read_process_sample(
+    pid: int,
+    candidate_sha: str,
+    *,
+    instance_reader: Callable[[int], tuple[int, int]] = process_instance_identity,
+    identity_verifier: Callable[[int, str], str] = verify_dialdeck_process,
+) -> tuple[float, int, tuple[int, int]]:
+    instance_before = instance_reader(pid)
+    identity_before = identity_verifier(pid, candidate_sha)
     result = subprocess.run(
         ["/bin/ps", "-p", str(pid), "-o", "cputime=", "-o", "rss="],
         check=False,
@@ -105,10 +184,13 @@ def read_process_sample(pid: int, candidate_sha: str) -> tuple[float, int]:
     if len(fields) != 2:
         raise RuntimeError("The process sampler returned an unexpected counter format")
     cpu_seconds, rss_kib = parse_cpu_seconds(fields[0]), int(fields[1])
-    identity_after = verify_dialdeck_process(pid, candidate_sha)
+    identity_after = identity_verifier(pid, candidate_sha)
+    instance_after = instance_reader(pid)
+    if instance_after != instance_before:
+        raise RuntimeError("The selected process instance changed during sampling")
     if identity_after != identity_before:
         raise RuntimeError("The selected process identity changed during sampling")
-    return cpu_seconds, rss_kib
+    return cpu_seconds, rss_kib, instance_before
 
 
 def collect_samples(
@@ -117,7 +199,7 @@ def collect_samples(
     *,
     window_seconds: float = WINDOW_SECONDS,
     sample_interval_seconds: float = SAMPLE_INTERVAL_SECONDS,
-    read_sample: Callable[[int, str], tuple[float, int]] = read_process_sample,
+    read_sample: Callable[[int, str], tuple[float, int, tuple[int, int]]] = read_process_sample,
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
     sleep: Callable[[float], None] = time.sleep,
 ) -> list[tuple[float, float, int]]:
@@ -126,7 +208,7 @@ def collect_samples(
     window_ns = math.ceil(window_seconds * 1_000_000_000)
     interval_ns = max(1, math.ceil(sample_interval_seconds * 1_000_000_000))
 
-    first_cpu, first_rss = read_sample(pid, candidate_sha)
+    first_cpu, first_rss, process_instance = read_sample(pid, candidate_sha)
     first_observed_ns = monotonic_ns()
     samples = [(0.0, first_cpu, first_rss)]
     interval_count = math.ceil(window_ns / interval_ns)
@@ -138,7 +220,11 @@ def collect_samples(
             if remaining_ns <= 0:
                 break
             sleep(remaining_ns / 1_000_000_000)
-        cpu_seconds, rss_kib = read_sample(pid, candidate_sha)
+        cpu_seconds, rss_kib, observed_instance = read_sample(pid, candidate_sha)
+        if observed_instance != process_instance:
+            raise RuntimeError("The selected process instance changed during sampling")
+        if cpu_seconds < samples[-1][1]:
+            raise RuntimeError("The selected process CPU counter decreased during sampling")
         observed_ns = monotonic_ns()
         elapsed_seconds = (observed_ns - first_observed_ns) / 1_000_000_000
         samples.append((elapsed_seconds, cpu_seconds, rss_kib))
@@ -213,7 +299,7 @@ def run() -> int:
     if elapsed < WINDOW_SECONDS:
         print("Measurement stopped: observed counter samples did not span 300 seconds", file=sys.stderr)
         return 2
-    cpu_delta = max(0.0, samples[-1][1] - samples[0][1])
+    cpu_delta = samples[-1][1] - samples[0][1]
     one_core_percent = 100.0 * cpu_delta / elapsed
     host_percent = one_core_percent / logical_cpu_count
     rss_values = [sample[2] for sample in samples]
@@ -239,7 +325,7 @@ def run() -> int:
         previous_elapsed, previous_cpu, _ = samples[0]
         for elapsed_seconds, cpu_seconds, rss_kib in samples:
             interval = elapsed_seconds - previous_elapsed
-            cpu_delta_interval = max(0.0, cpu_seconds - previous_cpu)
+            cpu_delta_interval = cpu_seconds - previous_cpu
             interval_one_core = 100.0 * cpu_delta_interval / interval if interval > 0 else 0.0
             writer.writerow((
                 f"{elapsed_seconds:.3f}",
