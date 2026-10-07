@@ -863,6 +863,8 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         let reconnectConfirmationOnly = ProcessInfo.processInfo.environment[
             PhysicalVerificationHarness.confirmationOnlyEnvironmentKey
         ] == "1"
+        let candidateSHA = ProcessInfo.processInfo.environment["DIALDECK_CANDIDATE_SHA"] ?? ""
+        let candidateSHAIsValid = candidateSHA.count == 40 && candidateSHA.allSatisfy(\.isHexDigit)
 
         let actionService = PhysicalVerificationNoOpActionService()
         let profileID = ProfileID()
@@ -1046,6 +1048,7 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         }
         let passed = captureFailure == nil
             && sequencePassed
+            && candidateSHAIsValid
             && allOneGeneration
             && selectedIDs.count >= 4
             && Set(selectedIDs.prefix(2)).count == 1
