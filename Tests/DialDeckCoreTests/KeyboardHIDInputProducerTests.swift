@@ -731,7 +731,9 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         do {
             _ = await runtime.submit(.start)
             guard case .running = await runtime.currentStatus() else {
-                throw PhysicalVerificationHarnessError.sessionDidNotStart
+                throw PhysicalVerificationHarnessError.sessionDidNotStart(
+                    await runtime.currentStatus()
+                )
             }
 
             let recorded = try await PhysicalVerificationHarness.waitForReconnectSequence(
@@ -1383,8 +1385,15 @@ private enum PhysicalVerificationHarness {
     }
 }
 
-private enum PhysicalVerificationHarnessError: Error {
-    case sessionDidNotStart
+private enum PhysicalVerificationHarnessError: Error, LocalizedError {
+    case sessionDidNotStart(RuntimeStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .sessionDidNotStart(let status):
+            "Input session did not start; ActionRuntime status: \(String(describing: status))"
+        }
+    }
 }
 
 private struct CaptureRuntimeCapabilities: DeviceCapabilityProviding {
