@@ -1,4 +1,7 @@
 import XCTest
+import IOKit
+import IOKit.hid
+import IOKit.hidsystem
 @testable import DialDeckCore
 
 final class KeyboardHIDInputProducerTests: XCTestCase {
@@ -674,6 +677,13 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
             throw XCTSkip("Set DIALDECK_RUN_PHYSICAL_HID_VERIFICATION=1 for supervised physical verification.")
         }
 
+        let openProbe = PhysicalHIDOpenProbe.collect()
+        print("Physical capture process: \(PhysicalHIDProcessIdentity.current)")
+        print("Physical capture I/O probe: \(openProbe)")
+        guard openProbe.accessGranted else {
+            throw PhysicalVerificationHarnessError.inputMonitoringUnavailable(openProbe)
+        }
+
         let actionService = PhysicalVerificationNoOpActionService()
         let profileID = ProfileID()
         let modeID = DialModeID()
@@ -730,9 +740,11 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
 
         do {
             _ = await runtime.submit(.start)
-            guard case .running = await runtime.currentStatus() else {
+            let startupStatus = await runtime.currentStatus()
+            guard case .running = startupStatus else {
                 throw PhysicalVerificationHarnessError.sessionDidNotStart(
-                    await runtime.currentStatus()
+                    status: startupStatus,
+                    openProbe: openProbe
                 )
             }
 
@@ -1386,13 +1398,133 @@ private enum PhysicalVerificationHarness {
 }
 
 private enum PhysicalVerificationHarnessError: Error, LocalizedError {
-    case sessionDidNotStart(RuntimeStatus)
+    case inputMonitoringUnavailable(PhysicalHIDOpenProbe)
+    case sessionDidNotStart(status: RuntimeStatus, openProbe: PhysicalHIDOpenProbe)
 
     var errorDescription: String? {
         switch self {
-        case .sessionDidNotStart(let status):
-            "Input session did not start; ActionRuntime status: \(String(describing: status))"
+        case .inputMonitoringUnavailable(let openProbe):
+            "Input Monitoring is not already granted. \(openProbe)"
+        case .sessionDidNotStart(let status, let openProbe):
+            "Input session did not start; ActionRuntime status: \(String(describing: status)); I/O probe: \(openProbe)"
         }
+    }
+}
+
+private struct PhysicalHIDOpenProbe: CustomStringConvertible {
+    struct DeviceResult {
+        let label: String
+        let withoutSeize: IOReturn
+        let withSeize: IOReturn
+    }
+
+    let accessResult: IOHIDAccessType
+    let managerWithoutSeize: IOReturn?
+    let managerWithSeize: IOReturn?
+    let deviceResults: [DeviceResult]
+
+    var accessGranted: Bool { accessResult == kIOHIDAccessTypeGranted }
+
+    var description: String {
+        let managerResults = "IOHIDManagerOpen withoutSeize=\(Self.format(managerWithoutSeize)) withSeize=\(Self.format(managerWithSeize))"
+        let devices = deviceResults.map {
+            "\($0.label) IOHIDDeviceOpen withoutSeize=\(Self.format($0.withoutSeize)) withSeize=\(Self.format($0.withSeize))"
+        }.joined(separator: "; ")
+        return "IOHIDCheckAccess(ListenEvent)=\(accessResult.rawValue) granted=\(accessGranted); \(managerResults); devices=[\(devices)]"
+    }
+
+    static func collect() -> Self {
+        let accessResult = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
+        guard accessResult == kIOHIDAccessTypeGranted else {
+            return Self(
+                accessResult: accessResult,
+                managerWithoutSeize: nil,
+                managerWithSeize: nil,
+                deviceResults: []
+            )
+        }
+
+        let enumerationManager = makeTargetManager()
+        let managerWithoutSeize = IOHIDManagerOpen(
+            enumerationManager,
+            IOOptionBits(kIOHIDOptionsTypeNone)
+        )
+        var devices: [IOHIDDevice] = []
+        if managerWithoutSeize == kIOReturnSuccess,
+           let deviceSet = IOHIDManagerCopyDevices(enumerationManager) {
+            devices = (deviceSet as NSSet).allObjects as! [IOHIDDevice]
+        }
+        _ = IOHIDManagerClose(enumerationManager, IOOptionBits(kIOHIDOptionsTypeNone))
+
+        let deviceResults = devices.filter(isTargetKeyboard).enumerated().map { index, device -> DeviceResult in
+            let withoutSeize = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
+            if withoutSeize == kIOReturnSuccess {
+                _ = IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+            }
+            let withSeize = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
+            if withSeize == kIOReturnSuccess {
+                _ = IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+            }
+            return DeviceResult(
+                label: "target-keyboard-child-\(index)",
+                withoutSeize: withoutSeize,
+                withSeize: withSeize
+            )
+        }
+
+        let seizeManager = makeTargetManager()
+        let managerWithSeize = IOHIDManagerOpen(
+            seizeManager,
+            IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
+        )
+        _ = IOHIDManagerClose(seizeManager, IOOptionBits(kIOHIDOptionsTypeNone))
+
+        return Self(
+            accessResult: accessResult,
+            managerWithoutSeize: managerWithoutSeize,
+            managerWithSeize: managerWithSeize,
+            deviceResults: deviceResults
+        )
+    }
+
+    private static func makeTargetManager() -> IOHIDManager {
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, 0)
+        let matching: [String: Any] = [
+            kIOHIDVendorIDKey as String: NSNumber(value: KeyboardHIDTarget.vendorID),
+            kIOHIDProductIDKey as String: NSNumber(value: KeyboardHIDTarget.productID),
+            kIOHIDTransportKey as String: kIOHIDTransportUSBValue,
+            kIOHIDDeviceUsagePageKey as String: NSNumber(value: KeyboardHIDTarget.genericDesktopUsagePage),
+            kIOHIDDeviceUsageKey as String: NSNumber(value: KeyboardHIDTarget.keyboardApplicationUsage),
+        ]
+        IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
+        return manager
+    }
+
+    private static func isTargetKeyboard(_ device: IOHIDDevice) -> Bool {
+        let vendor = (IOHIDDeviceGetProperty(device, kIOHIDVendorIDKey as CFString) as? NSNumber)?.uint32Value
+        let product = (IOHIDDeviceGetProperty(device, kIOHIDProductIDKey as CFString) as? NSNumber)?.uint32Value
+        let transport = IOHIDDeviceGetProperty(device, kIOHIDTransportKey as CFString) as? String
+        return vendor == KeyboardHIDTarget.vendorID
+            && product == KeyboardHIDTarget.productID
+            && transport == kIOHIDTransportUSBValue
+            && IOHIDDeviceConformsTo(
+                device,
+                KeyboardHIDTarget.genericDesktopUsagePage,
+                KeyboardHIDTarget.keyboardApplicationUsage
+            )
+    }
+
+    private static func format(_ result: IOReturn?) -> String {
+        guard let result else { return "not-attempted" }
+        return String(format: "0x%08X (%d)", UInt32(bitPattern: result), result)
+    }
+}
+
+private enum PhysicalHIDProcessIdentity {
+    static var current: String {
+        let bundle = Bundle.main
+        let executable = ProcessInfo.processInfo.arguments.first ?? "unknown"
+        return "bundlePath=\(bundle.bundlePath); bundleIdentifier=\(bundle.bundleIdentifier ?? "unknown"); executable=\(executable)"
     }
 }
 
