@@ -588,6 +588,30 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         ]))
     }
 
+    func testDescriptorDumpContinuesAfterElementCopyFailureAndReturnsIncompleteResult() {
+        struct SyntheticElementCopyFailure: Error, LocalizedError {
+            var errorDescription: String? { "synthetic element-list copy failure" }
+        }
+
+        var inspectedChildren: [Int] = []
+        var failedChildren: [Int] = []
+        let failures = HIDDescriptorDumpHarness.inspectChildren(
+            [10, 20, 30],
+            inspect: { index, _ in
+                inspectedChildren.append(index)
+                if index == 1 { throw SyntheticElementCopyFailure() }
+            },
+            onFailure: { index, _, _ in
+                failedChildren.append(index)
+            }
+        )
+
+        XCTAssertEqual(inspectedChildren, [0, 1, 2])
+        XCTAssertEqual(failedChildren, [1])
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertTrue(failures[0].hasPrefix("child 2: synthetic element-list copy failure"))
+    }
+
     /// This is a dump-only diagnostic. The target-filtered manager is opened
     /// non-seizing for enumeration, which opens matching devices per IOKit;
     /// this path installs no callbacks and captures no input.
@@ -1490,6 +1514,7 @@ private enum HIDDescriptorDumpHarness {
             guard closeResult == kIOReturnSuccess else {
                 throw DumpError.operationAndCloseFailed(operation: operation, closeResult: closeResult)
             }
+            print("Target-only HID manager close after dump error succeeded with IOReturn 0x00000000.")
             throw error
         }
 
@@ -1512,22 +1537,23 @@ private enum HIDDescriptorDumpHarness {
 
         print("HID descriptor dump: \(targetDevices.count) matching target keyboard child(ren); manager open is non-seizing and has opened matching target devices; no callbacks were registered.")
         var identities: [KeyboardHIDChildIdentity] = []
-        var elementListFailures: [String] = []
-        for (index, device) in targetDevices.enumerated() {
-            print("HID descriptor child \(index + 1)/\(targetDevices.count): target USB keyboard 0x1189:0x8890")
-            do {
+        let elementListFailures = inspectChildren(
+            targetDevices,
+            inspect: { index, device in
+                print("HID descriptor child \(index + 1)/\(targetDevices.count): target USB keyboard 0x1189:0x8890")
                 let elements = try copyAllElements(from: device)
                 for (elementIndex, element) in elements.enumerated() {
                     print("  element[\(elementIndex)]: \(describe(element))")
                 }
                 identities.append(describeEligibility(of: device, elements: elements, childIndex: index))
-            } catch {
+            },
+            onFailure: { index, device, error in
+                print("HID descriptor child \(index + 1)/\(targetDevices.count): target USB keyboard 0x1189:0x8890")
                 let failure = "child \(index + 1): \(error.localizedDescription) [\(String(describing: error))]"
                 print("  element list: incomplete; exact error: \(failure)")
-                elementListFailures.append(failure)
                 identities.append(ineligibleIdentity(for: device))
             }
-        }
+        )
 
         guard elementListFailures.isEmpty else {
             print("HID descriptor selection not evaluated because at least one matching child has no complete element list.")
@@ -1540,6 +1566,23 @@ private enum HIDDescriptorDumpHarness {
         } catch {
             print("HID descriptor selection: no unique eligible keyboard child; exact reason: \(error.localizedDescription)")
         }
+    }
+
+    static func inspectChildren<Child>(
+        _ children: [Child],
+        inspect: (Int, Child) throws -> Void,
+        onFailure: (Int, Child, Error) -> Void
+    ) -> [String] {
+        var failures: [String] = []
+        for (index, child) in children.enumerated() {
+            do {
+                try inspect(index, child)
+            } catch {
+                failures.append("child \(index + 1): \(error.localizedDescription) [\(String(describing: error))]")
+                onFailure(index, child, error)
+            }
+        }
+        return failures
     }
 
     private static func copyAllElements(from device: IOHIDDevice) throws -> [IOHIDElement] {
