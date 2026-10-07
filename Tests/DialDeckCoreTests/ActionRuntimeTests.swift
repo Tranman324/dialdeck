@@ -1756,6 +1756,195 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertEqual(count(.keyboard(.up, .key(try XCTUnwrap(MacVirtualKeyCode(8)))), in: intents), 2)
     }
 
+    func testForegroundContextChangeReleasesHeldInputAndInvalidatesPendingRoute() async throws {
+        let chord = KeyboardChord(key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: [.command])
+        let fixture = try makeConfiguration(defaultButton: .primitive(.holdKeys(chord)), appButton: .inherit)
+        let service = RecordingActionService()
+        let foreground = GatedForeground(value: nil)
+        let input = ManualInputProducer()
+        let firstKey = try key("fixture-button-1")
+        let pendingKey = try key("fixture-button-2")
+        let runtime = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: service,
+            foreground: foreground,
+            input: input,
+            mapping: [firstKey: .button1, pendingKey: .button1]
+        )
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+
+        await input.emit(try XCTUnwrap(NormalizedInputEvent.keyDown(control: firstKey, generation: generation)))
+        await foreground.pauseNext()
+        let pendingEvent = try XCTUnwrap(NormalizedInputEvent.keyDown(control: pendingKey, generation: generation))
+        let staleRoute = Task {
+            await input.emit(pendingEvent)
+        }
+        await foreground.waitUntilEntered()
+        await runtime.foregroundContextDidChange()
+        let cleanedBeforeRouteResumed = await service.intents
+        XCTAssertEqual(count(.keyboard(.up, .key(try XCTUnwrap(MacVirtualKeyCode(8)))), in: cleanedBeforeRouteResumed), 1)
+        XCTAssertEqual(count(.keyboard(.up, .modifier(.command)), in: cleanedBeforeRouteResumed), 1)
+        await foreground.resume()
+        await staleRoute.value
+
+        let intents = await service.intents
+        XCTAssertEqual(count(.keyboard(.down, .key(try XCTUnwrap(MacVirtualKeyCode(8)))), in: intents), 1)
+        XCTAssertEqual(count(.keyboard(.up, .key(try XCTUnwrap(MacVirtualKeyCode(8)))), in: intents), 1)
+        XCTAssertEqual(count(.keyboard(.down, .modifier(.command)), in: intents), 1)
+        XCTAssertEqual(count(.keyboard(.up, .modifier(.command)), in: intents), 1)
+        XCTAssertEqual(intents.count, 4, "The route paused across a focus invalidation must not dispatch")
+    }
+
+    func testForegroundInvalidationDoesNotWaitOnInputOrConfigurationMutationGates() async throws {
+        let chord = KeyboardChord(key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: [.command])
+        let fixture = try makeConfiguration(defaultButton: .primitive(.holdKeys(chord)), appButton: .inherit)
+        let files = GatedBackupConfigurationFiles()
+        let store = ConfigurationStore(
+            primaryURL: URL(fileURLWithPath: "/virtual/focus-gates-\(UUID().uuidString).json"),
+            fileAccess: files
+        )
+        try await store.save(fixture.configuration)
+        files.blockNextBackupWrite()
+
+        let service = RecordingActionService()
+        let foreground = GatedForeground(value: nil)
+        let input = ManualInputProducer()
+        let firstKey = try key("fixture-button-1")
+        let pendingKey = try key("fixture-button-2")
+        let runtime = ActionRuntime(
+            inputProducer: input,
+            capabilities: FixtureCapabilities(),
+            programmer: FixtureProgrammer(),
+            foregroundApplication: foreground,
+            controlMapping: FixtureMapping([firstKey: .button1, pendingKey: .button1]),
+            configurationStore: store,
+            actionService: service
+        )
+        _ = await runtime.submit(.start)
+        let generationValue = await input.currentGeneration
+        let generation = try XCTUnwrap(generationValue)
+        await input.emit(try XCTUnwrap(NormalizedInputEvent.keyDown(control: firstKey, generation: generation)))
+
+        await foreground.pauseNext()
+        let pendingEvent = try XCTUnwrap(NormalizedInputEvent.keyDown(control: pendingKey, generation: generation))
+        let staleRoute = Task { await input.emit(pendingEvent) }
+        await foreground.waitUntilEntered()
+
+        let mutation = Task { try await runtime.installConfiguration(fixture.configuration) }
+        let backupWriteBlocked = files.waitForBlockedBackup()
+        XCTAssertTrue(backupWriteBlocked, "Configuration mutation should reach its injected backup-write gate")
+        let focusInvalidationFinished = AsyncTestFlag()
+        let invalidation = Task {
+            await runtime.foregroundContextDidChange()
+            await focusInvalidationFinished.mark()
+        }
+        try await Task.sleep(for: .milliseconds(40))
+        let invalidationCompletedWhileBothGatesWereHeld = await focusInvalidationFinished.isMarked
+        XCTAssertTrue(invalidationCompletedWhileBothGatesWereHeld)
+        let cleanupIntents = await service.intents
+        XCTAssertTrue(cleanupIntents.contains(.keyboard(.up, .key(try XCTUnwrap(MacVirtualKeyCode(8))))))
+        XCTAssertTrue(cleanupIntents.contains(.keyboard(.up, .modifier(.command))))
+
+        files.releaseBlockedBackup()
+        try await mutation.value
+        await invalidation.value
+        await foreground.resume()
+        await staleRoute.value
+
+        let finalIntents = await service.intents
+        XCTAssertEqual(count(.keyboard(.down, .key(try XCTUnwrap(MacVirtualKeyCode(8)))), in: finalIntents), 1)
+        XCTAssertEqual(count(.keyboard(.up, .key(try XCTUnwrap(MacVirtualKeyCode(8)))), in: finalIntents), 1)
+        XCTAssertEqual(finalIntents.count, 4, "A route invalidated across both gates must not dispatch")
+    }
+
+    func testRuntimeMeasurementHarnessSeparatesDispatchServiceAndSequenceTiming() async throws {
+        let application = try XCTUnwrap(ApplicationBundleIdentifier("com.example.measurement"))
+        let sequence = try ActionSequence(steps: [
+            .action(.openApplication(application)),
+            .pause(milliseconds: 2),
+            .action(.scroll(axis: .horizontal, speed: try XCTUnwrap(ScrollSpeed(2)))),
+        ])
+        let fixture = try makeConfiguration(
+            defaultButton: .primitive(.doNothing),
+            appButton: .inherit,
+            clockwiseAction: .sequence(sequence)
+        )
+        func runWorkload(
+            spaced: Bool
+        ) async throws -> (RuntimeTimingSnapshot, RuntimeMeasurementRecorder, RecordingActionService) {
+            let service = RecordingActionService()
+            let input = ManualInputProducer()
+            let metrics = RuntimeMeasurementRecorder(capacity: 1_024)
+            let runtime = try await makeRuntime(
+                configuration: fixture.configuration,
+                service: service,
+                foreground: MutableForeground(),
+                input: input,
+                mapping: [:],
+                measurementRecorder: metrics
+            )
+            _ = await runtime.submit(.start)
+            let generationValue = await input.currentGeneration
+            let generation = try XCTUnwrap(generationValue)
+            let dial = try XCTUnwrap(PhysicalControlID(rawValue: "fixture-dial", kind: .dial))
+            let event = try XCTUnwrap(NormalizedInputEvent.dialRotation(control: dial, delta: 1, generation: generation))
+            for index in 0..<50 {
+                await input.emit(event)
+                if spaced && index < 49 { try await Task.sleep(for: .milliseconds(10)) }
+            }
+            let snapshot = metrics.snapshot()
+            _ = await runtime.submit(.stop)
+            return (snapshot, metrics, service)
+        }
+        func timingLine(_ name: String, _ snapshot: RuntimeTimingSnapshot) -> String {
+            let dispatch = snapshot.percentiles(for: .receiptToDispatch, inputClass: .dialRotation)
+            let adapter = snapshot.percentiles(for: .serviceCall, inputClass: .dialRotation)
+            let sequenceActions = snapshot.percentiles(for: .sequenceAction, inputClass: .dialRotation)
+            let sequencePauses = snapshot.percentiles(for: .sequencePause, inputClass: .dialRotation)
+            return "SIMULATED_RUNTIME_METRICS workload=\(name) events=\(dispatch.count) " +
+                "dispatch_ms_p50=\(Double(dispatch.p50Nanoseconds) / 1_000_000) " +
+                "p95=\(Double(dispatch.p95Nanoseconds) / 1_000_000) p99=\(Double(dispatch.p99Nanoseconds) / 1_000_000) " +
+                "max=\(Double(dispatch.maximumNanoseconds) / 1_000_000) under_50ms=\(dispatch.maximumNanoseconds < 50_000_000) " +
+                "service_call_ms_p50=\(Double(adapter.p50Nanoseconds) / 1_000_000) " +
+                "p95=\(Double(adapter.p95Nanoseconds) / 1_000_000) p99=\(Double(adapter.p99Nanoseconds) / 1_000_000) " +
+                "max=\(Double(adapter.maximumNanoseconds) / 1_000_000) " +
+                "sequence_action_ms_p50=\(Double(sequenceActions.p50Nanoseconds) / 1_000_000) " +
+                "p95=\(Double(sequenceActions.p95Nanoseconds) / 1_000_000) p99=\(Double(sequenceActions.p99Nanoseconds) / 1_000_000) " +
+                "max=\(Double(sequenceActions.maximumNanoseconds) / 1_000_000) " +
+                "sequence_pause_ms_p50=\(Double(sequencePauses.p50Nanoseconds) / 1_000_000) " +
+                "p95=\(Double(sequencePauses.p95Nanoseconds) / 1_000_000) p99=\(Double(sequencePauses.p99Nanoseconds) / 1_000_000) " +
+                "max=\(Double(sequencePauses.maximumNanoseconds) / 1_000_000)"
+        }
+
+        let normal = try await runWorkload(spaced: true)
+        let burst = try await runWorkload(spaced: false)
+        for snapshot in [normal.0, burst.0] {
+            let dispatch = snapshot.percentiles(for: .receiptToDispatch, inputClass: .dialRotation)
+            let adapter = snapshot.percentiles(for: .serviceCall, inputClass: .dialRotation)
+            let sequenceActions = snapshot.percentiles(for: .sequenceAction, inputClass: .dialRotation)
+            let sequencePauses = snapshot.percentiles(for: .sequencePause, inputClass: .dialRotation)
+            XCTAssertEqual(dispatch.count, 50)
+            XCTAssertEqual(adapter.count, 100)
+            XCTAssertEqual(sequenceActions.count, 100)
+            XCTAssertEqual(sequencePauses.count, 50)
+            XCTAssertEqual(snapshot.droppedSampleCount, 0)
+            XCTAssertTrue(snapshot.samples.allSatisfy { $0.durationNanoseconds < 10_000_000_000 })
+        }
+        print(timingLine("normal-spaced-10ms", normal.0))
+        print(timingLine("burst-no-gap", burst.0))
+        let independentExecutor = HostActionExecutor(service: burst.2)
+        _ = await independentExecutor.executeDialAction(
+            .primitive(.openApplication(application)),
+            profileID: fixture.configuration.defaultProfile.id,
+            dialMagnitude: 1,
+            advanceMode: noModeChange,
+            admissionRevision: 0
+        )
+        XCTAssertEqual(burst.1.snapshot().samples.count, burst.0.samples.count, "A standalone executor task must not inherit runtime event attribution")
+    }
+
     func testLifecycleStopReleasesRuntimeOwnedInputs() async throws {
         let fixture = try makeConfiguration(defaultButton: .primitive(.holdKeys(KeyboardChord(
             key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: [.command]
@@ -1784,7 +1973,8 @@ final class ActionRuntimeTests: XCTestCase {
         mapping: [PhysicalControlID: ActionAssignmentTarget],
         capabilities: any DeviceCapabilityProviding = FixtureCapabilities(),
         lightingProgrammer: (any DeviceLightingProgramming)? = nil,
-        keyAssignmentProgrammer: (any DeviceKeyAssignmentProgramming)? = nil
+        keyAssignmentProgrammer: (any DeviceKeyAssignmentProgramming)? = nil,
+        measurementRecorder: RuntimeMeasurementRecorder? = nil
     ) async throws -> ActionRuntime {
         let url = URL(fileURLWithPath: "/virtual/action-runtime-\(UUID().uuidString).json")
         let store = ConfigurationStore(primaryURL: url, fileAccess: MemoryConfigurationFiles())
@@ -1799,7 +1989,8 @@ final class ActionRuntimeTests: XCTestCase {
             actionService: service,
             executionLimits: ActionExecutionLimits(perActionTimeout: .seconds(1), sequenceDeadline: .seconds(2)),
             lightingProgrammer: lightingProgrammer,
-            keyAssignmentProgrammer: keyAssignmentProgrammer
+            keyAssignmentProgrammer: keyAssignmentProgrammer,
+            measurementRecorder: measurementRecorder
         )
     }
 

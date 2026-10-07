@@ -52,6 +52,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     private let controlMapping: any PhysicalActionMappingProviding
     private let configurationStore: ConfigurationStore
     private let executor: HostActionExecutor
+    private let measurementRecorder: RuntimeMeasurementRecorder?
     private var configuration: Configuration?
     private var session: (any InputSessionHandle)?
     private var generation: SessionGeneration?
@@ -78,7 +79,8 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         actionService: any HostActionServicing,
         executionLimits: ActionExecutionLimits = .init(),
         lightingProgrammer: (any DeviceLightingProgramming)? = nil,
-        keyAssignmentProgrammer: (any DeviceKeyAssignmentProgramming)? = nil
+        keyAssignmentProgrammer: (any DeviceKeyAssignmentProgramming)? = nil,
+        measurementRecorder: RuntimeMeasurementRecorder? = nil
     ) {
         self.inputProducer = inputProducer
         self.capabilities = capabilities
@@ -89,6 +91,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         self.controlMapping = controlMapping
         self.configurationStore = configurationStore
         self.executor = HostActionExecutor(service: actionService, limits: executionLimits)
+        self.measurementRecorder = measurementRecorder
     }
 
     public func submit(_ command: RuntimeCommand) async -> RuntimeCommandCompletion {
@@ -238,6 +241,17 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         }
     }
 
+    /// The app-level foreground observer should call this when focus changes,
+    /// including when no keypad event is arriving. It invalidates pending routes
+    /// and releases every synthetic input owned by the previous route.
+    public func foregroundContextDidChange() async {
+        routingRevision &+= 1
+        foregroundBundleIdentifier = nil
+        activeProfileID = nil
+        selectedDialModeID = nil
+        await cancelExecutorAndRecordCleanupFailure()
+    }
+
     /// The accepted normalized event contract has no dial-button payload yet.
     /// Device adapters may call this explicit entry point when they have a
     /// validated dial-press event; it does not infer a physical mapping.
@@ -246,15 +260,22 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         control: PhysicalControlID,
         generation eventGeneration: SessionGeneration
     ) async -> ActionExecutionResult {
+        let receivedAt = ContinuousClock.now
+        let observation = makeObservation(receivedAt: receivedAt, inputClass: .dialPress)
         await inputGate.acquire()
-        let result = await performDialPressed(control: control, generation: eventGeneration)
+        let result = await performDialPressed(
+            control: control,
+            generation: eventGeneration,
+            observation: observation
+        )
         await inputGate.release()
         return record(result)
     }
 
     private func performDialPressed(
         control: PhysicalControlID,
-        generation eventGeneration: SessionGeneration
+        generation eventGeneration: SessionGeneration,
+        observation: RuntimeDispatchObservation?
     ) async -> ActionExecutionResult {
         guard control.kind == .dial else {
             return ActionExecutionResult(outcome: .failed(.invalidInput))
@@ -271,18 +292,21 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 bundleIdentifier: bundleID,
                 in: config
             )
-            updateRoute(bundleID: bundleID, profile: profile)
-            guard routeIsCurrent(permit) else { return ActionExecutionResult(outcome: .ignored) }
-            let result = await executor.executeDialAction(
-                profile.selectedDialMode.press,
-                profileID: profile.id,
-                dialMagnitude: 1,
-                application: bundleID,
-                advanceMode: modeAdvanceHandler(for: permit),
-                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit),
-                admissionRevision: permit.revision
-            )
-            return routeIsCurrent(permit) ? result : ActionExecutionResult(requestID: result.requestID, outcome: .ignored)
+            guard let currentPermit = await updateRoute(bundleID: bundleID, profile: profile, permit: permit) else {
+                return ActionExecutionResult(outcome: .ignored)
+            }
+            let result = await RuntimeDispatchContext.$observation.withValue(observation) {
+                await executor.executeDialAction(
+                    profile.selectedDialMode.press,
+                    profileID: profile.id,
+                    dialMagnitude: 1,
+                    application: bundleID,
+                    advanceMode: modeAdvanceHandler(for: currentPermit),
+                    sequenceAdvanceMode: sequenceModeAdvanceHandler(for: currentPermit),
+                    admissionRevision: currentPermit.revision
+                )
+            }
+            return routeIsCurrent(currentPermit) ? result : ActionExecutionResult(requestID: result.requestID, outcome: .ignored)
         } catch {
             guard routeIsCurrent(permit) else { return ActionExecutionResult(outcome: .ignored) }
             return ActionExecutionResult(outcome: .failed(.modePersistenceFailed(RuntimeFailureText.sanitize(String(describing: error)))))
@@ -290,6 +314,14 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     }
 
     public func consume(_ event: NormalizedInputEvent) async {
+        let receivedAt = ContinuousClock.now
+        let inputClass: RuntimeInputClass
+        switch event.payload {
+        case .keyDown: inputClass = .keyDown
+        case .keyUp: inputClass = .keyUp
+        case .dialRotation: inputClass = .dialRotation
+        }
+        let observation = makeObservation(receivedAt: receivedAt, inputClass: inputClass)
         await inputGate.acquire()
         guard event.generation == generation,
               case .running(let runningGeneration) = status,
@@ -301,16 +333,18 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
 
         switch event.payload {
         case .keyDown:
-            await routeKeyDown(event)
+            await routeKeyDown(event, observation: observation)
         case .keyUp:
-            let result = await executor.keyUp(
-                control: event.control,
-                generation: event.generation,
-                admissionRevision: routingRevision
-            )
+            let result = await RuntimeDispatchContext.$observation.withValue(observation) {
+                await executor.keyUp(
+                    control: event.control,
+                    generation: event.generation,
+                    admissionRevision: routingRevision
+                )
+            }
             setActionResult(result)
         case .dialRotation(let delta):
-            await routeDialRotation(event, delta: delta)
+            await routeDialRotation(event, delta: delta, observation: observation)
         }
         await inputGate.release()
     }
@@ -430,7 +464,10 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         }
     }
 
-    private func routeKeyDown(_ event: NormalizedInputEvent) async {
+    private func routeKeyDown(
+        _ event: NormalizedInputEvent,
+        observation: RuntimeDispatchObservation?
+    ) async {
         guard let permit = routePermit(for: event.generation) else { return }
         guard let target = await controlMapping.actionTarget(for: event.control) else {
             guard routeIsCurrent(permit) else { return }
@@ -454,18 +491,21 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 profileID = id
             }
             let profile = config.profile(id: profileID) ?? config.defaultProfile
-            updateRoute(bundleID: bundleID, profile: profile)
-            guard routeIsCurrent(permit) else { return }
-            let result = await executor.keyDown(
-                control: event.control,
-                generation: event.generation,
-                action: resolved.action,
-                profileID: profileID,
-                application: bundleID,
-                advanceMode: modeAdvanceHandler(for: permit),
-                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit),
-                admissionRevision: permit.revision
-            )
+            guard let currentPermit = await updateRoute(bundleID: bundleID, profile: profile, permit: permit) else {
+                return
+            }
+            let result = await RuntimeDispatchContext.$observation.withValue(observation) {
+                await executor.keyDown(
+                    control: event.control,
+                    generation: event.generation,
+                    action: resolved.action,
+                    profileID: profileID,
+                    application: bundleID,
+                    advanceMode: modeAdvanceHandler(for: currentPermit),
+                    sequenceAdvanceMode: sequenceModeAdvanceHandler(for: currentPermit),
+                    admissionRevision: currentPermit.revision
+                )
+            }
             setActionResult(result)
         } catch {
             guard routeIsCurrent(permit) else { return }
@@ -475,7 +515,11 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         }
     }
 
-    private func routeDialRotation(_ event: NormalizedInputEvent, delta: Int) async {
+    private func routeDialRotation(
+        _ event: NormalizedInputEvent,
+        delta: Int,
+        observation: RuntimeDispatchObservation?
+    ) async {
         guard let permit = routePermit(for: event.generation) else { return }
         guard delta != 0, absSafely(delta) <= 100 else {
             if delta != 0 { setActionResult(ActionExecutionResult(outcome: .failed(.invalidInput))) }
@@ -493,17 +537,20 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
                 in: config
             )
             guard let profile = config.profile(id: resolved.profileID) else { return }
-            updateRoute(bundleID: bundleID, profile: profile)
-            guard routeIsCurrent(permit) else { return }
-            let result = await executor.executeDialAction(
-                resolved.action,
-                profileID: resolved.profileID,
-                dialMagnitude: delta,
-                application: bundleID,
-                advanceMode: modeAdvanceHandler(for: permit),
-                sequenceAdvanceMode: sequenceModeAdvanceHandler(for: permit),
-                admissionRevision: permit.revision
-            )
+            guard let currentPermit = await updateRoute(bundleID: bundleID, profile: profile, permit: permit) else {
+                return
+            }
+            let result = await RuntimeDispatchContext.$observation.withValue(observation) {
+                await executor.executeDialAction(
+                    resolved.action,
+                    profileID: resolved.profileID,
+                    dialMagnitude: delta,
+                    application: bundleID,
+                    advanceMode: modeAdvanceHandler(for: currentPermit),
+                    sequenceAdvanceMode: sequenceModeAdvanceHandler(for: currentPermit),
+                    admissionRevision: currentPermit.revision
+                )
+            }
             setActionResult(result)
         } catch {
             guard routeIsCurrent(permit) else { return }
@@ -637,10 +684,39 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         return loaded
     }
 
-    private func updateRoute(bundleID: ApplicationBundleIdentifier?, profile: Profile) {
+    private func updateRoute(
+        bundleID: ApplicationBundleIdentifier?,
+        profile: Profile,
+        permit: RoutePermit
+    ) async -> RoutePermit? {
+        guard routeIsCurrent(permit) else { return nil }
+        let focusChanged = activeProfileID != nil
+            && (foregroundBundleIdentifier != bundleID || activeProfileID != profile.id)
+        let currentPermit: RoutePermit
+        if focusChanged {
+            routingRevision &+= 1
+            currentPermit = RoutePermit(generation: permit.generation, revision: routingRevision)
+            await cancelExecutorAndRecordCleanupFailure()
+            guard routeIsCurrent(currentPermit) else { return nil }
+        } else {
+            currentPermit = permit
+        }
         foregroundBundleIdentifier = bundleID
         activeProfileID = profile.id
         selectedDialModeID = profile.selectedDialMode.id
+        return currentPermit
+    }
+
+    private func makeObservation(
+        receivedAt: ContinuousClock.Instant,
+        inputClass: RuntimeInputClass
+    ) -> RuntimeDispatchObservation? {
+        guard let measurementRecorder else { return nil }
+        return RuntimeDispatchObservation(
+            recorder: measurementRecorder,
+            receivedAt: receivedAt,
+            inputClass: inputClass
+        )
     }
 
     private func refreshSelectedModeSnapshot() {

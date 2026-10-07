@@ -43,6 +43,167 @@ public protocol HostActionServicing: Sendable {
     func perform(_ intent: HostActionIntent) async -> HostActionServiceResult
 }
 
+/// Input event classes are intentionally normalized and contain no control IDs,
+/// key values, text, or application content.
+public enum RuntimeInputClass: String, Equatable, Sendable {
+    case keyDown
+    case keyUp
+    case dialRotation
+    case dialPress
+}
+
+/// Runtime timings keep dispatch, adapter response, sequence work, and pauses
+/// separate so configured delays are not mistaken for dispatch latency.
+public enum RuntimeTimingKind: String, Equatable, Sendable {
+    case receiptToDispatch
+    case serviceCall
+    case sequenceAction
+    case sequencePause
+}
+
+public struct RuntimeTimingSample: Equatable, Sendable {
+    public let kind: RuntimeTimingKind
+    public let inputClass: RuntimeInputClass
+    public let durationNanoseconds: UInt64
+
+    public init(kind: RuntimeTimingKind, inputClass: RuntimeInputClass, durationNanoseconds: UInt64) {
+        self.kind = kind
+        self.inputClass = inputClass
+        self.durationNanoseconds = durationNanoseconds
+    }
+}
+
+public struct RuntimeTimingPercentiles: Equatable, Sendable {
+    public let count: Int
+    public let p50Nanoseconds: UInt64
+    public let p95Nanoseconds: UInt64
+    public let p99Nanoseconds: UInt64
+    public let maximumNanoseconds: UInt64
+
+    public init(samples: [UInt64]) {
+        let sorted = samples.sorted()
+        count = sorted.count
+        guard !sorted.isEmpty else {
+            p50Nanoseconds = 0
+            p95Nanoseconds = 0
+            p99Nanoseconds = 0
+            maximumNanoseconds = 0
+            return
+        }
+        func nearestRank(_ percentile: Double) -> UInt64 {
+            let index = max(0, Int((Double(sorted.count) * percentile).rounded(.up)) - 1)
+            return sorted[index]
+        }
+        p50Nanoseconds = nearestRank(0.50)
+        p95Nanoseconds = nearestRank(0.95)
+        p99Nanoseconds = nearestRank(0.99)
+        maximumNanoseconds = sorted[sorted.count - 1]
+    }
+}
+
+public struct RuntimeTimingSnapshot: Equatable, Sendable {
+    public let samples: [RuntimeTimingSample]
+    public let droppedSampleCount: Int
+
+    public init(samples: [RuntimeTimingSample], droppedSampleCount: Int) {
+        self.samples = samples
+        self.droppedSampleCount = droppedSampleCount
+    }
+
+    public func percentiles(for kind: RuntimeTimingKind, inputClass: RuntimeInputClass? = nil) -> RuntimeTimingPercentiles {
+        RuntimeTimingPercentiles(samples: samples.compactMap { sample in
+            guard sample.kind == kind, inputClass == nil || sample.inputClass == inputClass else { return nil }
+            return sample.durationNanoseconds
+        })
+    }
+}
+
+/// Thread-safe, bounded, privacy-safe runtime instrumentation. Samples retain
+/// only normalized event classes and monotonic durations.
+public final class RuntimeMeasurementRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let capacity: Int
+    private var samples: [RuntimeTimingSample] = []
+    private var droppedSampleCount = 0
+
+    public init(capacity: Int = 4_096) {
+        self.capacity = max(1, capacity)
+    }
+
+    public func snapshot() -> RuntimeTimingSnapshot {
+        lock.withLock {
+            RuntimeTimingSnapshot(samples: samples, droppedSampleCount: droppedSampleCount)
+        }
+    }
+
+    fileprivate func record(
+        kind: RuntimeTimingKind,
+        inputClass: RuntimeInputClass,
+        duration: Duration
+    ) {
+        let components = duration.components
+        let seconds = max(0, components.seconds)
+        let attoseconds = max(0, components.attoseconds)
+        let secondsNanos = UInt64(seconds).multipliedReportingOverflow(by: 1_000_000_000)
+        let durationNanos: UInt64
+        if secondsNanos.overflow {
+            durationNanos = UInt64.max
+        } else {
+            let addition = UInt64(attoseconds / 1_000_000_000)
+            let total = secondsNanos.partialValue.addingReportingOverflow(addition)
+            durationNanos = total.overflow ? UInt64.max : total.partialValue
+        }
+        let sample = RuntimeTimingSample(
+            kind: kind,
+            inputClass: inputClass,
+            durationNanoseconds: durationNanos
+        )
+        lock.withLock {
+            if samples.count == capacity {
+                samples.removeFirst()
+                droppedSampleCount += 1
+            }
+            samples.append(sample)
+        }
+    }
+}
+
+final class RuntimeDispatchObservation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let recorder: RuntimeMeasurementRecorder
+    private let receivedAt: ContinuousClock.Instant
+    private let inputClass: RuntimeInputClass
+    private var didRecordDispatch = false
+
+    init(
+        recorder: RuntimeMeasurementRecorder,
+        receivedAt: ContinuousClock.Instant,
+        inputClass: RuntimeInputClass
+    ) {
+        self.recorder = recorder
+        self.receivedAt = receivedAt
+        self.inputClass = inputClass
+    }
+
+    func recordDispatch(at instant: ContinuousClock.Instant = .now) {
+        let shouldRecord = lock.withLock { () -> Bool in
+            guard !didRecordDispatch else { return false }
+            didRecordDispatch = true
+            return true
+        }
+        guard shouldRecord else { return }
+        recorder.record(kind: .receiptToDispatch, inputClass: inputClass, duration: receivedAt.duration(to: instant))
+    }
+
+    func record(_ kind: RuntimeTimingKind, duration: Duration) {
+        recorder.record(kind: kind, inputClass: inputClass, duration: duration)
+    }
+}
+
+enum RuntimeDispatchContext {
+    @TaskLocal static var observation: RuntimeDispatchObservation?
+}
+
 enum RuntimeFailureText {
     static func sanitize(_ message: String) -> String {
         let safeScalars = message.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
@@ -584,6 +745,17 @@ public actor HostActionExecutor {
                 failure = stop
                 break
             }
+            let stepStartedAt = ContinuousClock.now
+            let stepTimingKind: RuntimeTimingKind = {
+                if case .pause = step { return .sequencePause }
+                return .sequenceAction
+            }()
+            defer {
+                RuntimeDispatchContext.observation?.record(
+                    stepTimingKind,
+                    duration: stepStartedAt.duration(to: .now)
+                )
+            }
             switch step {
             case .pause(let milliseconds):
                 let remaining = ContinuousClock.now.duration(to: deadline)
@@ -896,7 +1068,12 @@ public actor HostActionExecutor {
         let timed = await race(timeout: timeout) { [service, beforeServiceInvocation] in
             if let beforeServiceInvocation { await beforeServiceInvocation() }
             guard !Task.isCancelled else { return nil as HostActionServiceResult? }
-            return await service.perform(intent)
+            let observation = RuntimeDispatchContext.observation
+            observation?.recordDispatch()
+            let serviceCallStartedAt = ContinuousClock.now
+            let result = await service.perform(intent)
+            observation?.record(.serviceCall, duration: serviceCallStartedAt.duration(to: .now))
+            return result
         }
         switch timed {
         case .timedOut(let lateResult):
