@@ -23,7 +23,15 @@ Run the simulated timing and focus-contract workload with:
 swift test --package-path . --arch arm64 --filter ActionRuntimeTests
 ```
 
-`testRuntimeMeasurementHarnessSeparatesDispatchServiceAndSequenceTiming` reports p50, p95, and maximum queue wait, pre-dispatch routing, full event handling, and service-call timings for a no-gap backlog and a 40-event simulated knob spin scheduled at fixed 50 ms intervals (20 Hz). The spin enqueues each event on schedule without waiting for the previous handler, then joins all deliveries before reporting. The backlog result decomposes its slowest receipt-to-dispatch sample into queue wait and routing time. Output is labeled `SIMULATED_RUNTIME_METRICS`; it measures the runtime and test doubles, not HID callback latency, host input, target-app behavior, CPU, memory, or energy.
+`testRuntimeMeasurementHarnessSeparatesDispatchServiceAndSequenceTiming` reports p50, p95, and maximum queue wait, pre-dispatch routing, full event handling, and service-call timings for a no-gap backlog and a simulated knob spin. Each cadence must enqueue events on schedule without waiting for the previous handler, then join all deliveries before reporting. The backlog result decomposes its slowest receipt-to-dispatch sample into queue wait and routing time. Output is labeled `SIMULATED_RUNTIME_METRICS`; it measures the runtime and test doubles, not HID callback latency, host input, target-app behavior, CPU, memory, or energy.
+
+## Task 4.1 latency acceptance
+
+At realistic knob cadences of 20 Hz and 60 Hz, p95 receipt-to-dispatch must be below 50 ms for each cadence. Measure and report the two rates separately. The accepted candidate has a simulated 20 Hz p95 of 0.179 ms; no 60 Hz measurement has been recorded, so the latency criterion remains open. These simulated timings are not physical-input or target-app response measurements.
+
+The 50-event instant burst is a non-regression check only: all 50 events must arrive without loss or reordering, and the queue must drain fully after the blocked action is released. Its latency percentiles are diagnostic and are not compared with the 50 ms gate. The current fixture verifies all 50 receipts and joins every delivery, but uses identical rotation events, so it does not distinguish reordering; an order-sensitive assertion remains needed.
+
+Rotation-tick coalescing is post-v1 unless supervised hardware evidence shows perceptible lag.
 
 ## Final supervised hardware session
 
