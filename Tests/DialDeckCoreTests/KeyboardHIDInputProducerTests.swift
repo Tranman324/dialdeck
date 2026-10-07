@@ -577,22 +577,45 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
 
     func testPhysicalVerificationRecorderBoundsAndForwardsNormalizedEvents() async throws {
         let generation = SessionGeneration(91)
-        let key = try XCTUnwrap(PhysicalControlID(rawValue: "bottom-left", kind: .key))
         let dial = try XCTUnwrap(PhysicalControlID(rawValue: "knob", kind: .dial))
-        let keyDown = try XCTUnwrap(NormalizedInputEvent.keyDown(control: key, generation: generation))
-        let keyUp = try XCTUnwrap(NormalizedInputEvent.keyUp(control: key, generation: generation))
-        let rotation = try XCTUnwrap(NormalizedInputEvent.dialRotation(
+        let keyIdentifiers = [
+            "bottom-left", "middle-left", "top-left",
+            "bottom-right", "middle-right", "top-right",
+        ]
+        let keyEvents = try keyIdentifiers.flatMap { identifier -> [NormalizedInputEvent] in
+            let control = try XCTUnwrap(PhysicalControlID(rawValue: identifier, kind: .key))
+            return [
+                try XCTUnwrap(NormalizedInputEvent.keyDown(control: control, generation: generation)),
+                try XCTUnwrap(NormalizedInputEvent.keyUp(control: control, generation: generation)),
+            ]
+        }
+        let counterclockwise = try XCTUnwrap(NormalizedInputEvent.dialRotation(
             control: dial,
-            delta: 7,
+            delta: -1,
             generation: generation
         ))
-        let replayEvents = Array(repeating: keyDown, count: 16) + [keyUp, rotation]
+        let clockwise = try XCTUnwrap(NormalizedInputEvent.dialRotation(
+            control: dial,
+            delta: 1,
+            generation: generation
+        ))
+        let bottomLeft = try XCTUnwrap(PhysicalControlID(rawValue: "bottom-left", kind: .key))
+        let afterReconnect = [
+            try XCTUnwrap(NormalizedInputEvent.keyDown(control: bottomLeft, generation: generation)),
+            try XCTUnwrap(NormalizedInputEvent.keyUp(control: bottomLeft, generation: generation)),
+        ]
+        let overflow = [try XCTUnwrap(NormalizedInputEvent.keyDown(
+            control: bottomLeft,
+            generation: generation
+        ))]
+        let replayEvents = keyEvents + [counterclockwise, clockwise] + afterReconnect + overflow
         let downstream = RecordingInputConsumer()
         let recorder = PhysicalVerificationEventRecorder()
         let producer = PhysicalVerificationRecordingProducer(
             base: PhysicalVerificationReplayProducer(
-                events: replayEvents,
-                reconnectAfterEventCount: 16,
+                eventsBeforeReconnect: keyEvents + [counterclockwise, clockwise],
+                eventsAfterReconnect: afterReconnect,
+                eventsAfterLimit: overflow,
                 dialPress: dial
             ),
             recorder: recorder
@@ -604,13 +627,28 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         await session.cancel()
 
         XCTAssertEqual(recorded.events.count, PhysicalVerificationHarness.maximumEvents)
-        XCTAssertEqual(recorded.reconnectEventCount, 16)
+        XCTAssertEqual(recorded.reconnectEventCount, 15)
         XCTAssertEqual(
             Set(recorded.events),
+            Set(keyIdentifiers.flatMap { identifier in
+                [
+                    PhysicalVerificationRecordedEvent(controlID: identifier, kind: .keyDown),
+                    PhysicalVerificationRecordedEvent(controlID: identifier, kind: .keyUp),
+                ]
+            } + [
+                PhysicalVerificationRecordedEvent(controlID: "knob", kind: .dialRotation(delta: -1)),
+                PhysicalVerificationRecordedEvent(controlID: "knob", kind: .dialRotation(delta: 1)),
+                PhysicalVerificationRecordedEvent(controlID: "knob", kind: .dialPress),
+            ])
+        )
+        XCTAssertEqual(
+            Array(recorded.events.suffix(5)),
             [
-                PhysicalVerificationRecordedEvent(controlID: "bottom-left", kind: .keyDown),
-                PhysicalVerificationRecordedEvent(controlID: "bottom-left", kind: .keyUp),
-                PhysicalVerificationRecordedEvent(controlID: "knob", kind: .dialRotation),
+                .init(controlID: "knob", kind: .dialRotation(delta: -1)),
+                .init(controlID: "knob", kind: .dialRotation(delta: 1)),
+                .init(controlID: "knob", kind: .dialPress),
+                .init(controlID: "bottom-left", kind: .keyDown),
+                .init(controlID: "bottom-left", kind: .keyUp),
             ]
         )
         XCTAssertEqual(forwarded.events, replayEvents)
@@ -624,10 +662,11 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         ])
     }
 
-    /// Opt-in supervised check: press and release each of six keys, press the
-    /// dial once, rotate it three detents, unplug/reconnect the keypad, then
-    /// press and release bottom-left once more. The recorder stores only
-    /// normalized control IDs and event kinds, never report values or direction.
+    /// Opt-in supervised check: press and release each of six keys, rotate the
+    /// dial once counterclockwise then once clockwise, press it once, unplug/
+    /// reconnect the keypad, then press and release bottom-left once more. The
+    /// recorder stores normalized control IDs, event kinds, and signed dial
+    /// deltas, never raw HID values or text.
     /// Read-only monitoring does not suppress normal macOS keyboard delivery;
     /// any later supervised run must use a safe foreground context.
     func testOptInPhysicalKeyboardHIDVerificationRoutesToNoOpRuntime() async throws {
@@ -702,7 +741,7 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
             _ = await runtime.submit(.stop)
 
             XCTAssertEqual(recorded.events.count, PhysicalVerificationHarness.maximumEvents)
-            XCTAssertEqual(recorded.reconnectEventCount, 16)
+            XCTAssertEqual(recorded.reconnectEventCount, 15)
             for (identifier, _) in keyTargets {
                 let expectedPairs = identifier == "bottom-left" ? 2 : 1
                 XCTAssertEqual(
@@ -719,12 +758,19 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
                 1
             )
             XCTAssertEqual(
-                recorded.events.filter { $0 == .init(controlID: "knob", kind: .dialRotation) }.count,
-                3
+                recorded.events.filter { $0 == .init(controlID: "knob", kind: .dialRotation(delta: -1)) }.count,
+                1
             )
             XCTAssertEqual(
-                Array(recorded.events.suffix(2)),
+                recorded.events.filter { $0 == .init(controlID: "knob", kind: .dialRotation(delta: 1)) }.count,
+                1
+            )
+            XCTAssertEqual(
+                Array(recorded.events.suffix(5)),
                 [
+                    .init(controlID: "knob", kind: .dialRotation(delta: -1)),
+                    .init(controlID: "knob", kind: .dialRotation(delta: 1)),
+                    .init(controlID: "knob", kind: .dialPress),
                     .init(controlID: "bottom-left", kind: .keyDown),
                     .init(controlID: "bottom-left", kind: .keyUp),
                 ]
@@ -1172,7 +1218,7 @@ private actor CaptureRuntimeActionService: HostActionServicing {
 private enum PhysicalVerificationEventKind: Hashable, Sendable {
     case keyDown
     case keyUp
-    case dialRotation
+    case dialRotation(delta: Int)
     case dialPress
 }
 
@@ -1250,7 +1296,7 @@ private actor PhysicalVerificationRecordingConsumer: NormalizedInputConsumer {
         switch event.payload {
         case .keyDown: kind = .keyDown
         case .keyUp: kind = .keyUp
-        case .dialRotation: kind = .dialRotation
+        case .dialRotation(let delta): kind = .dialRotation(delta: delta)
         }
         await recorder.record(.init(controlID: event.control.rawValue, kind: kind))
         await downstream.consume(event)
@@ -1271,8 +1317,9 @@ private actor PhysicalVerificationRecordingConsumer: NormalizedInputConsumer {
 }
 
 private struct PhysicalVerificationReplayProducer: InputEventProducing {
-    let events: [NormalizedInputEvent]
-    let reconnectAfterEventCount: Int?
+    let eventsBeforeReconnect: [NormalizedInputEvent]
+    let eventsAfterReconnect: [NormalizedInputEvent]
+    let eventsAfterLimit: [NormalizedInputEvent]
     let dialPress: PhysicalControlID
 
     func start(
@@ -1280,14 +1327,12 @@ private struct PhysicalVerificationReplayProducer: InputEventProducing {
         consumer: any NormalizedInputConsumer
     ) async throws -> any InputSessionHandle {
         await consumer.sessionLifecycleChanged(.started(generation))
-        for (index, event) in events.enumerated() {
-            await consumer.consume(event)
-            if let reconnectAfterEventCount, index + 1 == reconnectAfterEventCount {
-                await consumer.sessionLifecycleChanged(.stopping(generation))
-                await consumer.sessionLifecycleChanged(.started(generation))
-            }
-        }
+        for event in eventsBeforeReconnect { await consumer.consume(event) }
         _ = await consumer.dialPressed(control: dialPress, generation: generation)
+        await consumer.sessionLifecycleChanged(.stopping(generation))
+        await consumer.sessionLifecycleChanged(.started(generation))
+        for event in eventsAfterReconnect { await consumer.consume(event) }
+        for event in eventsAfterLimit { await consumer.consume(event) }
         return PhysicalVerificationReplaySession(generation: generation)
     }
 }
@@ -1313,7 +1358,7 @@ private actor PhysicalVerificationNoOpActionService: HostActionServicing {
 
 private enum PhysicalVerificationHarness {
     static let environmentKey = "DIALDECK_RUN_PHYSICAL_HID_VERIFICATION"
-    static let maximumEvents = 18
+    static let maximumEvents = 17
 
     static func isEnabled(environment: [String: String]) -> Bool {
         environment[environmentKey] == "1"
