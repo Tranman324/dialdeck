@@ -588,9 +588,9 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         ]))
     }
 
-    /// This is a dump-only diagnostic. It checks existing ListenEvent access,
-    /// enumerates only target keyboard children, reads their static element
-    /// descriptors, and never registers callbacks or opens a device.
+    /// This is a dump-only diagnostic. The target-filtered manager is opened
+    /// non-seizing for enumeration, which opens matching devices per IOKit;
+    /// this path installs no callbacks and captures no input.
     func testOptInTargetKeyboardHIDDescriptorDump() throws {
         guard HIDDescriptorDumpHarness.isEnabled(environment: ProcessInfo.processInfo.environment) else {
             throw XCTSkip("Set DIALDECK_RUN_HID_DESCRIPTOR_DUMP=1 to dump target keyboard descriptors.")
@@ -1432,6 +1432,7 @@ private enum HIDDescriptorDumpHarness {
         case operationAndCloseFailed(operation: String, closeResult: IOReturn)
         case noMatchingKeyboardChildren
         case elementListUnavailable
+        case elementListFailures([String])
 
         var errorDescription: String? {
             switch self {
@@ -1447,6 +1448,8 @@ private enum HIDDescriptorDumpHarness {
                 "No target USB keyboard children matched VID 0x1189, PID 0x8890, and the keyboard application usage"
             case .elementListUnavailable:
                 "IOHIDDeviceCopyMatchingElements returned no complete element list for a matching keyboard child"
+            case .elementListFailures(let failures):
+                "Descriptor dump is incomplete because element copying failed for matching child(ren): \(failures.joined(separator: "; "))"
             }
         }
 
@@ -1477,6 +1480,7 @@ private enum HIDDescriptorDumpHarness {
         guard openResult == kIOReturnSuccess else {
             throw DumpError.managerOpenFailed(openResult)
         }
+        print("Target-only IOHIDManagerOpen returned IOReturn 0x00000000 with kIOHIDOptionsTypeNone; per the macOS SDK, this opens matching current and future target devices. No seize option, callbacks, event capture, or output/device writes are used.")
 
         do {
             try inspectMatchingChildren(manager)
@@ -1493,6 +1497,7 @@ private enum HIDDescriptorDumpHarness {
         guard closeResult == kIOReturnSuccess else {
             throw DumpError.managerCloseFailed(closeResult)
         }
+        print("Target-only HID manager close succeeded with IOReturn 0x00000000.")
     }
 
     private static func inspectMatchingChildren(_ manager: IOHIDManager) throws {
@@ -1505,8 +1510,9 @@ private enum HIDDescriptorDumpHarness {
             throw DumpError.noMatchingKeyboardChildren
         }
 
-        print("HID descriptor dump: \(targetDevices.count) matching target keyboard child(ren); no device was opened and no callbacks were registered.")
+        print("HID descriptor dump: \(targetDevices.count) matching target keyboard child(ren); manager open is non-seizing and has opened matching target devices; no callbacks were registered.")
         var identities: [KeyboardHIDChildIdentity] = []
+        var elementListFailures: [String] = []
         for (index, device) in targetDevices.enumerated() {
             print("HID descriptor child \(index + 1)/\(targetDevices.count): target USB keyboard 0x1189:0x8890")
             do {
@@ -1514,16 +1520,23 @@ private enum HIDDescriptorDumpHarness {
                 for (elementIndex, element) in elements.enumerated() {
                     print("  element[\(elementIndex)]: \(describe(element))")
                 }
-                identities.append(try describeEligibility(of: device, elements: elements, childIndex: index))
+                identities.append(describeEligibility(of: device, elements: elements, childIndex: index))
             } catch {
-                print("  element list/validator result: ineligible; exact reason: \(String(describing: error))")
+                let failure = "child \(index + 1): \(error.localizedDescription) [\(String(describing: error))]"
+                print("  element list: incomplete; exact error: \(failure)")
+                elementListFailures.append(failure)
                 identities.append(ineligibleIdentity(for: device))
             }
         }
 
+        guard elementListFailures.isEmpty else {
+            print("HID descriptor selection not evaluated because at least one matching child has no complete element list.")
+            throw DumpError.elementListFailures(elementListFailures)
+        }
+
         do {
             let selectedIndex = try KeyboardHIDChildSelection.uniqueEligibleIndex(in: identities)
-            print("HID descriptor selection: exactly one eligible keyboard child at index \(selectedIndex + 1). No child was opened.")
+            print("HID descriptor selection: exactly one eligible keyboard child at index \(selectedIndex + 1); this is an eligibility result after non-seizing manager enumeration.")
         } catch {
             print("HID descriptor selection: no unique eligible keyboard child; exact reason: \(error.localizedDescription)")
         }
@@ -1544,7 +1557,7 @@ private enum HIDDescriptorDumpHarness {
         of device: IOHIDDevice,
         elements: [IOHIDElement],
         childIndex: Int
-    ) throws -> KeyboardHIDChildIdentity {
+    ) -> KeyboardHIDChildIdentity {
         let collectionCount = Set(elements.filter(isKeyboardApplicationCollection).map {
             UInt32(IOHIDElementGetCookie($0))
         }).count
