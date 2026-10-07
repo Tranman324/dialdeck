@@ -20,6 +20,7 @@ sampler = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = sampler
 SPEC.loader.exec_module(sampler)
 CANDIDATE_SHA = "a" * 40
+CANDIDATE_BUILD_ID = "b" * 32
 
 
 class FakeClock:
@@ -33,7 +34,7 @@ class FakeClock:
     def sleep(self, seconds: float) -> None:
         self.now_ns += round(seconds * 1_000_000_000)
 
-    def read_sample(self, _pid: int, _candidate_sha: str) -> tuple[float, int, tuple[int, int]]:
+    def read_sample(self, _pid: int, _candidate_sha: str, _candidate_build_id: str) -> tuple[float, int, tuple[int, int]]:
         self.sample_count += 1
         # Make the initial counter read slower than later reads. Scheduling from
         # before that first observation would leave the observed span short.
@@ -48,7 +49,7 @@ class ChangingProcessClock(FakeClock):
         self.change_instance = change_instance
         self.decrease_cpu = decrease_cpu
 
-    def read_sample(self, _pid: int, _candidate_sha: str) -> tuple[float, int, tuple[int, int]]:
+    def read_sample(self, _pid: int, _candidate_sha: str, _candidate_build_id: str) -> tuple[float, int, tuple[int, int]]:
         self.sample_count += 1
         if self.sample_count == 1:
             self.now_ns += 50_000_000
@@ -64,8 +65,8 @@ def create_app_bundle(
     bundle_executable: str = "DialDeckApp",
     bundle_identifier: str = "com.dialdeck.app",
     build_sha: str = CANDIDATE_SHA,
+    build_id: str = CANDIDATE_BUILD_ID,
     executable_sha256: str | None = None,
-    build_epoch_ns: int = 0,
 ) -> Path:
     executable = Path(directory) / "DialDeck.app" / "Contents" / "MacOS" / path_executable
     executable.parent.mkdir(parents=True)
@@ -78,8 +79,8 @@ def create_app_bundle(
                 "CFBundleExecutable": bundle_executable,
                 "CFBundleIdentifier": bundle_identifier,
                 "DialDeckBuildSHA": build_sha,
+                "DialDeckBuildID": build_id,
                 "DialDeckExecutableSHA256": executable_sha256 or actual_sha256,
-                "DialDeckBuildEpochNS": build_epoch_ns,
             },
             bundle_info,
         )
@@ -100,8 +101,8 @@ class ProcessSamplerTests(unittest.TestCase):
             identity = sampler.verify_dialdeck_process(
                 4321,
                 CANDIDATE_SHA,
+                CANDIDATE_BUILD_ID,
                 path_reader=lambda _pid: str(executable),
-                process_start_identity=(1, 0),
             )
             self.assertEqual(
                 identity.canonical_identity,
@@ -109,15 +110,15 @@ class ProcessSamplerTests(unittest.TestCase):
             )
             self.assertNotIn(directory, repr(identity))
 
-    def test_process_started_before_bundle_build_is_rejected(self) -> None:
+    def test_dialdeck_build_id_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            executable = create_app_bundle(directory, build_epoch_ns=2_000_000_000_000)
-            with self.assertRaisesRegex(RuntimeError, "started before"):
+            executable = create_app_bundle(directory, build_id="c" * 32)
+            with self.assertRaisesRegex(RuntimeError, "candidate build ID"):
                 sampler.verify_dialdeck_process(
                     4321,
                     CANDIDATE_SHA,
+                    CANDIDATE_BUILD_ID,
                     path_reader=lambda _pid: str(executable),
-                    process_start_identity=(1999, 999_999),
                 )
 
     def test_dialdeck_executable_with_wrong_bundle_identifier_is_rejected(self) -> None:
@@ -127,6 +128,7 @@ class ProcessSamplerTests(unittest.TestCase):
                 sampler.verify_dialdeck_process(
                     4321,
                     CANDIDATE_SHA,
+                    CANDIDATE_BUILD_ID,
                     path_reader=lambda _pid: str(executable),
                 )
 
@@ -137,6 +139,7 @@ class ProcessSamplerTests(unittest.TestCase):
                 sampler.verify_dialdeck_process(
                     4321,
                     CANDIDATE_SHA,
+                    CANDIDATE_BUILD_ID,
                     path_reader=lambda _pid: str(executable),
                 )
 
@@ -147,6 +150,7 @@ class ProcessSamplerTests(unittest.TestCase):
                 sampler.verify_dialdeck_process(
                     4321,
                     CANDIDATE_SHA,
+                    CANDIDATE_BUILD_ID,
                     path_reader=lambda _pid: str(executable),
                 )
 
@@ -157,6 +161,7 @@ class ProcessSamplerTests(unittest.TestCase):
                 sampler.verify_dialdeck_process(
                     4321,
                     CANDIDATE_SHA,
+                    CANDIDATE_BUILD_ID,
                     path_reader=lambda _pid: str(executable),
                 )
 
@@ -165,6 +170,7 @@ class ProcessSamplerTests(unittest.TestCase):
             sampler.verify_dialdeck_process(
                 4321,
                 CANDIDATE_SHA,
+                CANDIDATE_BUILD_ID,
                 path_reader=lambda _pid: "/usr/bin/python3",
             )
 
@@ -172,6 +178,11 @@ class ProcessSamplerTests(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             sampler.validate_candidate_sha("unknown")
         self.assertEqual(sampler.validate_candidate_sha("a" * 40), "a" * 40)
+
+    def test_candidate_build_id_must_be_concrete(self) -> None:
+        with self.assertRaises(argparse.ArgumentTypeError):
+            sampler.validate_candidate_build_id("unknown")
+        self.assertEqual(sampler.validate_candidate_build_id(CANDIDATE_BUILD_ID), CANDIDATE_BUILD_ID)
 
     def test_cli_rejects_arbitrary_process_and_missing_sha_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -186,6 +197,8 @@ class ProcessSamplerTests(unittest.TestCase):
                     "idle-connected",
                     "--candidate-sha",
                     CANDIDATE_SHA,
+                    "--candidate-build-id",
+                    CANDIDATE_BUILD_ID,
                     "--output",
                     str(output),
                 ],
@@ -221,6 +234,7 @@ class ProcessSamplerTests(unittest.TestCase):
         samples = sampler.collect_samples(
             4321,
             CANDIDATE_SHA,
+            CANDIDATE_BUILD_ID,
             window_seconds=300,
             sample_interval_seconds=1,
             read_sample=clock.read_sample,
@@ -238,6 +252,7 @@ class ProcessSamplerTests(unittest.TestCase):
             sampler.collect_samples(
                 4321,
                 CANDIDATE_SHA,
+                CANDIDATE_BUILD_ID,
                 window_seconds=2,
                 sample_interval_seconds=1,
                 read_sample=clock.read_sample,
@@ -251,6 +266,7 @@ class ProcessSamplerTests(unittest.TestCase):
             sampler.collect_samples(
                 4321,
                 CANDIDATE_SHA,
+                CANDIDATE_BUILD_ID,
                 window_seconds=1,
                 sample_interval_seconds=1,
                 read_sample=clock.read_sample,
@@ -265,6 +281,7 @@ class ProcessSamplerTests(unittest.TestCase):
             sampler.collect_samples(
                 4321,
                 CANDIDATE_SHA,
+                CANDIDATE_BUILD_ID,
                 window_seconds=2,
                 sample_interval_seconds=1,
                 read_sample=clock.read_sample,
@@ -282,8 +299,9 @@ class ProcessSamplerTests(unittest.TestCase):
                 sampler.read_process_sample(
                     4321,
                     CANDIDATE_SHA,
+                    CANDIDATE_BUILD_ID,
                     instance_reader=lambda _pid: next(instance_values),
-                    identity_verifier=lambda _pid, _sha: sampler.DIALDECK_PROCESS_IDENTITY,
+                    identity_verifier=lambda _pid, _sha, _build_id: sampler.DIALDECK_PROCESS_IDENTITY,
                 )
 
     def test_cpu_threshold_is_labeled_as_counter_only(self) -> None:
