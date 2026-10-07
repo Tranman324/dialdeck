@@ -14,6 +14,7 @@ import statistics
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -55,6 +56,13 @@ class _ProcBSDInfo(ctypes.Structure):
         ("pbi_start_tvsec", ctypes.c_uint64),
         ("pbi_start_tvusec", ctypes.c_uint64),
     ]
+
+
+@dataclass(frozen=True)
+class VerifiedDialDeckProcess:
+    canonical_identity: str
+    executable_sha256: str
+    build_epoch_ns: int
 
 
 def parse_cpu_seconds(value: str) -> float:
@@ -132,7 +140,9 @@ def verify_dialdeck_process(
     pid: int,
     candidate_sha: str,
     path_reader: Callable[[int], str] | None = None,
-) -> str:
+    *,
+    process_start_identity: tuple[int, int] | None = None,
+) -> VerifiedDialDeckProcess:
     reader = path_reader or process_executable_path
     try:
         executable_path = Path(reader(pid))
@@ -160,7 +170,18 @@ def verify_dialdeck_process(
         raise RuntimeError("Selected process does not match the requested candidate SHA")
     if info.get("DialDeckExecutableSHA256") != executable_digest.hexdigest():
         raise RuntimeError("Selected process executable does not match its bundle digest")
-    return DIALDECK_PROCESS_IDENTITY
+    build_epoch_ns = info.get("DialDeckBuildEpochNS")
+    if not isinstance(build_epoch_ns, int) or isinstance(build_epoch_ns, bool) or build_epoch_ns < 0:
+        raise RuntimeError("Selected process bundle has no valid build timestamp")
+    if process_start_identity is not None:
+        process_start_ns = process_start_identity[0] * 1_000_000_000 + process_start_identity[1] * 1_000
+        if process_start_ns <= build_epoch_ns:
+            raise RuntimeError("Selected process started before the verified bundle was built")
+    return VerifiedDialDeckProcess(
+        canonical_identity=DIALDECK_PROCESS_IDENTITY,
+        executable_sha256=executable_digest.hexdigest(),
+        build_epoch_ns=build_epoch_ns,
+    )
 
 
 def read_process_sample(
@@ -168,7 +189,7 @@ def read_process_sample(
     candidate_sha: str,
     *,
     instance_reader: Callable[[int], tuple[int, int]] = process_instance_identity,
-    identity_verifier: Callable[[int, str], str] = verify_dialdeck_process,
+    identity_verifier: Callable[[int, str], VerifiedDialDeckProcess] = verify_dialdeck_process,
 ) -> tuple[float, int, tuple[int, int]]:
     instance_before = instance_reader(pid)
     identity_before = identity_verifier(pid, candidate_sha)
@@ -202,6 +223,7 @@ def collect_samples(
     read_sample: Callable[[int, str], tuple[float, int, tuple[int, int]]] = read_process_sample,
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
     sleep: Callable[[float], None] = time.sleep,
+    expected_process_instance: tuple[int, int] | None = None,
 ) -> list[tuple[float, float, int]]:
     if window_seconds <= 0 or sample_interval_seconds <= 0:
         raise ValueError("Sampling window and interval must be positive")
@@ -209,6 +231,8 @@ def collect_samples(
     interval_ns = max(1, math.ceil(sample_interval_seconds * 1_000_000_000))
 
     first_cpu, first_rss, process_instance = read_sample(pid, candidate_sha)
+    if expected_process_instance is not None and process_instance != expected_process_instance:
+        raise RuntimeError("The selected process instance changed after bundle verification")
     first_observed_ns = monotonic_ns()
     samples = [(0.0, first_cpu, first_rss)]
     interval_count = math.ceil(window_ns / interval_ns)
@@ -283,14 +307,25 @@ def run() -> int:
     if args.output.exists():
         parser.error("--output must not already exist")
     try:
-        process_identity = verify_dialdeck_process(args.pid, args.candidate_sha)
+        process_instance = process_instance_identity(args.pid)
+        process_identity = verify_dialdeck_process(
+            args.pid,
+            args.candidate_sha,
+            process_start_identity=process_instance,
+        )
+        if process_instance_identity(args.pid) != process_instance:
+            raise RuntimeError("The selected process instance changed during bundle verification")
     except RuntimeError as error:
         parser.error(str(error))
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     logical_cpu_count = os.cpu_count() or 1
     try:
-        samples = collect_samples(args.pid, args.candidate_sha)
+        samples = collect_samples(
+            args.pid,
+            args.candidate_sha,
+            expected_process_instance=process_instance,
+        )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"Measurement stopped: {error}", file=sys.stderr)
         return 2
@@ -308,7 +343,12 @@ def run() -> int:
 
     with args.output.open("x", newline="", encoding="utf-8") as evidence:
         evidence.write(f"# candidate_sha={args.candidate_sha}\n")
-        evidence.write(f"# process_identity={process_identity} (verified; full executable path not retained)\n")
+        evidence.write(
+            f"# process_identity={process_identity.canonical_identity} "
+            "(verified; full executable path not retained)\n"
+        )
+        evidence.write(f"# executable_sha256={process_identity.executable_sha256}\n")
+        evidence.write(f"# bundle_build_epoch_ns={process_identity.build_epoch_ns}\n")
         evidence.write(f"# scenario={args.scenario}\n")
         if args.cycle_count is not None:
             evidence.write(f"# operator_reported_completed_cycles={args.cycle_count}\n")
@@ -345,7 +385,8 @@ def run() -> int:
         evidence.write("# energy=not captured by this process sampler; see docs/runtime-measurement.md\n")
 
     print(f"Scenario: {args.scenario}")
-    print(f"Process identity: {process_identity} (verified; full path omitted)")
+    print(f"Process identity: {process_identity.canonical_identity} (verified; full path omitted)")
+    print(f"Executable SHA256: {process_identity.executable_sha256}")
     print(f"Window: {elapsed:.3f}s (required >=300s)")
     print(f"CPU average: {one_core_percent:.4f}% of one logical CPU; {host_percent:.4f}% host-normalized")
     print(f"CPU counter threshold (<1% of one logical CPU): {threshold_result}")

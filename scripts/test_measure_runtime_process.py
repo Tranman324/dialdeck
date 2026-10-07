@@ -17,6 +17,7 @@ SCRIPT = Path(__file__).with_name("measure-runtime-process.py")
 SPEC = importlib.util.spec_from_file_location("measure_runtime_process", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 sampler = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = sampler
 SPEC.loader.exec_module(sampler)
 CANDIDATE_SHA = "a" * 40
 
@@ -64,6 +65,7 @@ def create_app_bundle(
     bundle_identifier: str = "com.dialdeck.app",
     build_sha: str = CANDIDATE_SHA,
     executable_sha256: str | None = None,
+    build_epoch_ns: int = 0,
 ) -> Path:
     executable = Path(directory) / "DialDeck.app" / "Contents" / "MacOS" / path_executable
     executable.parent.mkdir(parents=True)
@@ -77,6 +79,7 @@ def create_app_bundle(
                 "CFBundleIdentifier": bundle_identifier,
                 "DialDeckBuildSHA": build_sha,
                 "DialDeckExecutableSHA256": executable_sha256 or actual_sha256,
+                "DialDeckBuildEpochNS": build_epoch_ns,
             },
             bundle_info,
         )
@@ -98,12 +101,24 @@ class ProcessSamplerTests(unittest.TestCase):
                 4321,
                 CANDIDATE_SHA,
                 path_reader=lambda _pid: str(executable),
+                process_start_identity=(1, 0),
             )
             self.assertEqual(
-                identity,
+                identity.canonical_identity,
                 "com.dialdeck.app (DialDeck.app/Contents/MacOS/DialDeckApp)",
             )
-            self.assertNotIn(directory, identity)
+            self.assertNotIn(directory, repr(identity))
+
+    def test_process_started_before_bundle_build_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = create_app_bundle(directory, build_epoch_ns=2_000_000_000_000)
+            with self.assertRaisesRegex(RuntimeError, "started before"):
+                sampler.verify_dialdeck_process(
+                    4321,
+                    CANDIDATE_SHA,
+                    path_reader=lambda _pid: str(executable),
+                    process_start_identity=(1999, 999_999),
+                )
 
     def test_dialdeck_executable_with_wrong_bundle_identifier_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -228,6 +243,20 @@ class ProcessSamplerTests(unittest.TestCase):
                 read_sample=clock.read_sample,
                 monotonic_ns=clock.monotonic_ns,
                 sleep=clock.sleep,
+            )
+
+    def test_sampling_rejects_process_replaced_after_bundle_preflight(self) -> None:
+        clock = FakeClock()
+        with self.assertRaisesRegex(RuntimeError, "changed after bundle verification"):
+            sampler.collect_samples(
+                4321,
+                CANDIDATE_SHA,
+                window_seconds=1,
+                sample_interval_seconds=1,
+                read_sample=clock.read_sample,
+                monotonic_ns=clock.monotonic_ns,
+                sleep=clock.sleep,
+                expected_process_instance=(9, 9),
             )
 
     def test_sampling_rejects_a_decreasing_cpu_counter(self) -> None:

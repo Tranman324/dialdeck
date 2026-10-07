@@ -22,10 +22,14 @@ class BuildAppStampTests(unittest.TestCase):
         sources.mkdir()
         shutil.copy2(SCRIPT, scripts / "build-app.sh")
         (sources / "main.swift").write_text("print(\"fixture\")\n", encoding="utf-8")
+        (root / ".gitignore").write_text("Sources/ignored.swift\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q", str(root)], check=True)
         subprocess.run(["git", "-C", str(root), "config", "user.name", "Build Test"], check=True)
         subprocess.run(["git", "-C", str(root), "config", "user.email", "build-test@example.invalid"], check=True)
-        subprocess.run(["git", "-C", str(root), "add", "scripts/build-app.sh", "Sources/main.swift"], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "add", ".gitignore", "scripts/build-app.sh", "Sources/main.swift"],
+            check=True,
+        )
         subprocess.run(["git", "-C", str(root), "commit", "-qm", "test fixture"], check=True)
 
         fake_bin = Path(directory) / "fake-bin"
@@ -90,6 +94,7 @@ class BuildAppStampTests(unittest.TestCase):
                 info = plistlib.load(bundle)
             executable = root / ".build/DialDeck.app/Contents/MacOS/DialDeckApp"
             self.assertEqual(info["DialDeckBuildSHA"], expected_commit)
+            self.assertGreater(info["DialDeckBuildEpochNS"], 0)
             self.assertEqual(
                 info["DialDeckExecutableSHA256"],
                 hashlib.sha256(executable.read_bytes()).hexdigest(),
@@ -120,6 +125,22 @@ class BuildAppStampTests(unittest.TestCase):
             self.assertIn("dirty worktree", result.stderr)
             self.assertTrue(result.swift_marker.exists())  # type: ignore[attr-defined]
             self.assertFalse((root / ".build/DialDeck.app/Contents/Info.plist").exists())
+
+    def test_ignored_source_file_is_rejected_before_build(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, fake_bin, app_binary_dir = self.make_project(directory)
+            ignored_source = root / "Sources/ignored.swift"
+            ignored_source.write_text("print(\"ignored\")\n", encoding="utf-8")
+            git_status = subprocess.check_output(
+                ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
+                text=True,
+            )
+            self.assertEqual(git_status, "")
+
+            result = self.run_build(root, fake_bin, app_binary_dir)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("untracked source input", result.stderr)
+            self.assertFalse(result.swift_marker.exists())  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":
