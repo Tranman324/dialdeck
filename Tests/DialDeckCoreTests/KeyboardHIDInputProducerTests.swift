@@ -565,6 +565,142 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         _ = await runtime.submit(.stop)
     }
 
+    func testPhysicalVerificationHarnessIsDisabledUnlessExplicitlyEnabled() {
+        XCTAssertFalse(PhysicalVerificationHarness.isEnabled(environment: [:]))
+        XCTAssertFalse(PhysicalVerificationHarness.isEnabled(environment: [
+            PhysicalVerificationHarness.environmentKey: "true",
+        ]))
+        XCTAssertTrue(PhysicalVerificationHarness.isEnabled(environment: [
+            PhysicalVerificationHarness.environmentKey: "1",
+        ]))
+    }
+
+    func testPhysicalVerificationRecorderBoundsAndForwardsNormalizedEvents() async throws {
+        let generation = SessionGeneration(91)
+        let key = try XCTUnwrap(PhysicalControlID(rawValue: "bottom-left", kind: .key))
+        let dial = try XCTUnwrap(PhysicalControlID(rawValue: "knob", kind: .dial))
+        let replayEvents = try (0..<20).map { _ in
+            try XCTUnwrap(NormalizedInputEvent.keyDown(control: key, generation: generation))
+        }
+        let downstream = RecordingInputConsumer()
+        let recorder = PhysicalVerificationEventRecorder()
+        let producer = PhysicalVerificationRecordingProducer(
+            base: PhysicalVerificationReplayProducer(
+                events: replayEvents,
+                dialPress: dial
+            ),
+            recorder: recorder
+        )
+
+        let session = try await producer.start(generation: generation, consumer: downstream)
+        let recorded = await recorder.snapshot()
+        let forwarded = await downstream.snapshot()
+        await session.cancel()
+
+        XCTAssertEqual(recorded.count, PhysicalVerificationHarness.maximumEvents)
+        XCTAssertEqual(
+            Set(recorded),
+            [PhysicalVerificationRecordedEvent(controlID: "bottom-left", kind: .keyDown)]
+        )
+        XCTAssertEqual(forwarded.events, replayEvents)
+        XCTAssertEqual(forwarded.dialPresses.count, 1)
+        XCTAssertEqual(forwarded.dialPresses.first?.0, dial)
+        XCTAssertEqual(forwarded.dialPresses.first?.1, generation)
+        XCTAssertEqual(forwarded.lifecycle, [.started(generation)])
+    }
+
+    /// Opt-in supervised check: press and release each of six keys, press the
+    /// dial once, then rotate it three detents. The recorder stores only
+    /// normalized control IDs and event kinds, never report values or direction.
+    func testOptInPhysicalKeyboardHIDVerificationRoutesToNoOpRuntime() async throws {
+        guard PhysicalVerificationHarness.isEnabled(environment: ProcessInfo.processInfo.environment) else {
+            throw XCTSkip("Set DIALDECK_RUN_PHYSICAL_HID_VERIFICATION=1 for supervised physical verification.")
+        }
+
+        let actionService = PhysicalVerificationNoOpActionService()
+        let profileID = ProfileID()
+        let modeID = DialModeID()
+        let noOp = ConfiguredAction.primitive(.doNothing)
+        let mode = DialMode(
+            id: modeID,
+            name: DisplayName("Physical Verification")!,
+            counterclockwise: noOp,
+            clockwise: noOp,
+            press: noOp
+        )
+        let profile = try Profile(
+            id: profileID,
+            name: DisplayName("Default")!,
+            scope: .default,
+            assignments: Dictionary(uniqueKeysWithValues: ActionAssignmentTarget.allCases.map {
+                ($0, .set(noOp))
+            }),
+            dialModes: [mode],
+            defaultDialModeID: modeID
+        )
+        let configuration = try Configuration(defaultProfileID: profileID, profiles: [profile])
+        let store = ConfigurationStore(
+            primaryURL: URL(fileURLWithPath: "/virtual/physical-verification-\(UUID().uuidString).json"),
+            fileAccess: CaptureRuntimeMemoryFiles()
+        )
+        try await store.save(configuration)
+
+        let keyTargets: [(String, ActionAssignmentTarget)] = [
+            ("bottom-left", .button1),
+            ("middle-left", .button2),
+            ("top-left", .button3),
+            ("bottom-right", .button4),
+            ("middle-right", .button5),
+            ("top-right", .button6),
+        ]
+        let mapping = Dictionary(uniqueKeysWithValues: try keyTargets.map { identifier, target in
+            (try XCTUnwrap(PhysicalControlID(rawValue: identifier, kind: .key)), target)
+        })
+        let recorder = PhysicalVerificationEventRecorder()
+        let producer = PhysicalVerificationRecordingProducer(
+            base: KeyboardHIDInputEventProducer(),
+            recorder: recorder
+        )
+        let runtime = ActionRuntime(
+            inputProducer: producer,
+            capabilities: CaptureRuntimeCapabilities(),
+            programmer: CaptureRuntimeProgrammer(),
+            foregroundApplication: CaptureRuntimeForeground(),
+            controlMapping: CaptureRuntimeMapping(mapping),
+            configurationStore: store,
+            actionService: actionService
+        )
+
+        do {
+            _ = await runtime.submit(.start)
+            guard case .running = await runtime.currentStatus() else {
+                throw PhysicalVerificationHarnessError.sessionDidNotStart
+            }
+
+            let recorded = try await PhysicalVerificationHarness.waitForMaximumEvents(
+                from: recorder,
+                timeout: .seconds(120)
+            )
+            _ = await runtime.submit(.stop)
+
+            XCTAssertEqual(recorded.count, PhysicalVerificationHarness.maximumEvents)
+            for (identifier, _) in keyTargets {
+                XCTAssertTrue(recorded.contains(.init(controlID: identifier, kind: .keyDown)))
+                XCTAssertTrue(recorded.contains(.init(controlID: identifier, kind: .keyUp)))
+            }
+            XCTAssertTrue(recorded.contains(.init(controlID: "knob", kind: .dialPress)))
+            XCTAssertEqual(
+                recorded.filter { $0 == .init(controlID: "knob", kind: .dialRotation) }.count,
+                3
+            )
+            let serviceCalls = await actionService.callCount
+            XCTAssertEqual(serviceCalls, 0, "The no-op service must never synthesize host input.")
+        } catch {
+            _ = await runtime.submit(.stop)
+            throw error
+        }
+    }
+
     func testElementPlanFailsClosedForMissingOrAmbiguousInputLayouts() throws {
         var missing = variableDescriptors()
         missing.removeLast()
@@ -995,6 +1131,143 @@ private actor CaptureRuntimeActionService: HostActionServicing {
         intents.append(intent)
         return .acceptedUnverified
     }
+}
+
+private enum PhysicalVerificationEventKind: Hashable, Sendable {
+    case keyDown
+    case keyUp
+    case dialRotation
+    case dialPress
+}
+
+private struct PhysicalVerificationRecordedEvent: Hashable, Sendable {
+    let controlID: String
+    let kind: PhysicalVerificationEventKind
+}
+
+private actor PhysicalVerificationEventRecorder {
+    private(set) var events: [PhysicalVerificationRecordedEvent] = []
+
+    func record(_ event: PhysicalVerificationRecordedEvent) {
+        guard events.count < PhysicalVerificationHarness.maximumEvents else { return }
+        events.append(event)
+    }
+
+    func eventCount() -> Int { events.count }
+    func snapshot() -> [PhysicalVerificationRecordedEvent] { events }
+}
+
+private struct PhysicalVerificationRecordingProducer: InputEventProducing {
+    let base: any InputEventProducing
+    let recorder: PhysicalVerificationEventRecorder
+
+    func start(
+        generation: SessionGeneration,
+        consumer: any NormalizedInputConsumer
+    ) async throws -> any InputSessionHandle {
+        try await base.start(
+            generation: generation,
+            consumer: PhysicalVerificationRecordingConsumer(
+                recorder: recorder,
+                downstream: consumer
+            )
+        )
+    }
+}
+
+private actor PhysicalVerificationRecordingConsumer: NormalizedInputConsumer {
+    private let recorder: PhysicalVerificationEventRecorder
+    private let downstream: any NormalizedInputConsumer
+
+    init(recorder: PhysicalVerificationEventRecorder, downstream: any NormalizedInputConsumer) {
+        self.recorder = recorder
+        self.downstream = downstream
+    }
+
+    func consume(_ event: NormalizedInputEvent) async {
+        let kind: PhysicalVerificationEventKind
+        switch event.payload {
+        case .keyDown: kind = .keyDown
+        case .keyUp: kind = .keyUp
+        case .dialRotation: kind = .dialRotation
+        }
+        await recorder.record(.init(controlID: event.control.rawValue, kind: kind))
+        await downstream.consume(event)
+    }
+
+    func sessionLifecycleChanged(_ event: SessionLifecycleEvent) async {
+        await downstream.sessionLifecycleChanged(event)
+    }
+
+    func dialPressed(
+        control: PhysicalControlID,
+        generation: SessionGeneration
+    ) async -> ActionExecutionResult {
+        await recorder.record(.init(controlID: control.rawValue, kind: .dialPress))
+        return await downstream.dialPressed(control: control, generation: generation)
+    }
+}
+
+private struct PhysicalVerificationReplayProducer: InputEventProducing {
+    let events: [NormalizedInputEvent]
+    let dialPress: PhysicalControlID
+
+    func start(
+        generation: SessionGeneration,
+        consumer: any NormalizedInputConsumer
+    ) async throws -> any InputSessionHandle {
+        await consumer.sessionLifecycleChanged(.started(generation))
+        for event in events { await consumer.consume(event) }
+        _ = await consumer.dialPressed(control: dialPress, generation: generation)
+        return PhysicalVerificationReplaySession(generation: generation)
+    }
+}
+
+private actor PhysicalVerificationReplaySession: InputSessionHandle {
+    let generation: SessionGeneration
+
+    init(generation: SessionGeneration) {
+        self.generation = generation
+    }
+
+    func cancel() async {}
+}
+
+private actor PhysicalVerificationNoOpActionService: HostActionServicing {
+    private(set) var callCount = 0
+
+    func perform(_ intent: HostActionIntent) async -> HostActionServiceResult {
+        callCount += 1
+        return .unsupported(reason: "Physical verification service does not synthesize host input")
+    }
+}
+
+private enum PhysicalVerificationHarness {
+    static let environmentKey = "DIALDECK_RUN_PHYSICAL_HID_VERIFICATION"
+    static let maximumEvents = 16
+
+    static func isEnabled(environment: [String: String]) -> Bool {
+        environment[environmentKey] == "1"
+    }
+
+    static func waitForMaximumEvents(
+        from recorder: PhysicalVerificationEventRecorder,
+        timeout: Duration
+    ) async throws -> [PhysicalVerificationRecordedEvent] {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while await recorder.eventCount() < maximumEvents {
+            try Task.checkCancellation()
+            let now = clock.now
+            guard now < deadline else { break }
+            try await Task.sleep(for: min(.milliseconds(50), now.duration(to: deadline)))
+        }
+        return await recorder.snapshot()
+    }
+}
+
+private enum PhysicalVerificationHarnessError: Error {
+    case sessionDidNotStart
 }
 
 private struct CaptureRuntimeCapabilities: DeviceCapabilityProviding {
