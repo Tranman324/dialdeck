@@ -27,7 +27,6 @@ struct KeyboardHIDElementDescriptor: Equatable, Sendable {
 struct KeyboardHIDElementPlan: Equatable, Sendable {
     enum Input: Equatable, Sendable {
         case variable(usage: UInt32)
-        case array
     }
 
     let inputsByCookie: [UInt64: Input]
@@ -35,15 +34,9 @@ struct KeyboardHIDElementPlan: Equatable, Sendable {
     init(validating descriptors: [KeyboardHIDElementDescriptor]) throws {
         let pageSeven = descriptors.filter { $0.usagePage == KeyboardHIDTarget.keyboardUsagePage }
         var candidates: [UInt64: Input] = [:]
-        var arrayGroups = Set<ArrayGroup>()
         var variableUsages: [UInt32: Int] = [:]
 
         for descriptor in pageSeven {
-            guard descriptor.logicalMinimum <= 0,
-                  descriptor.logicalMaximum >= 1 else {
-                continue
-            }
-
             switch descriptor.representation {
             case .variable(let usage) where KeyboardHIDTarget.observedUsages.contains(usage):
                 guard descriptor.logicalMinimum <= 0, descriptor.logicalMaximum >= 1 else {
@@ -56,82 +49,28 @@ struct KeyboardHIDElementPlan: Equatable, Sendable {
                 candidates[descriptor.cookie] = .variable(usage: usage)
             case .array(let minimum, let maximum)
                 where KeyboardHIDTarget.observedUsages.contains(where: { minimum <= $0 && $0 <= maximum }):
-                guard descriptor.logicalMinimum <= 0,
-                      descriptor.logicalMaximum >= Int64(maximum),
-                      descriptor.reportCount > 0 else {
-                    throw KeyboardHIDCaptureError.interfaceMismatch
-                }
-                guard candidates[descriptor.cookie] == nil else {
-                    throw KeyboardHIDCaptureError.ambiguousInterface
-                }
-                arrayGroups.insert(ArrayGroup(
-                    reportID: descriptor.reportID,
-                    reportCount: descriptor.reportCount,
-                    minimumUsage: minimum,
-                    maximumUsage: maximum,
-                    logicalMinimum: descriptor.logicalMinimum,
-                    logicalMaximum: descriptor.logicalMaximum
-                ))
-                candidates[descriptor.cookie] = .array
+                // Value callbacks do not expose a report boundary. Without the
+                // full report, a usage moving between array slots can look like
+                // an up/down pair in either callback order. Fail closed until
+                // the transport can validate and decode complete array reports.
+                throw KeyboardHIDCaptureError.ambiguousInterface
             default:
                 continue
             }
         }
 
-        guard arrayGroups.count <= 1 else {
-            throw KeyboardHIDCaptureError.ambiguousInterface
-        }
-
-        if let arrayGroup = arrayGroups.first {
-            guard KeyboardHIDTarget.observedUsages.allSatisfy({
-                arrayGroup.minimumUsage <= $0 && $0 <= arrayGroup.maximumUsage
-            }) else {
+        for usage in KeyboardHIDTarget.observedUsages {
+            guard variableUsages[usage] == 1 else {
                 throw KeyboardHIDCaptureError.interfaceMismatch
             }
-            let arrayCookies = descriptors.compactMap { descriptor -> UInt64? in
-                guard descriptor.usagePage == KeyboardHIDTarget.keyboardUsagePage,
-                      case .array(let minimum, let maximum) = descriptor.representation,
-                      minimum == arrayGroup.minimumUsage,
-                      maximum == arrayGroup.maximumUsage,
-                      descriptor.reportID == arrayGroup.reportID,
-                      descriptor.reportCount == arrayGroup.reportCount,
-                      descriptor.logicalMinimum == arrayGroup.logicalMinimum,
-                      descriptor.logicalMaximum == arrayGroup.logicalMaximum else {
-                    return nil
-                }
-                return descriptor.cookie
-            }
-            guard Set(arrayCookies).count == arrayCookies.count else {
-                throw KeyboardHIDCaptureError.ambiguousInterface
-            }
-            guard variableUsages.isEmpty, !arrayCookies.isEmpty else {
-                throw KeyboardHIDCaptureError.ambiguousInterface
-            }
-            candidates = Dictionary(uniqueKeysWithValues: arrayCookies.map { ($0, .array) })
-        } else {
-            for usage in KeyboardHIDTarget.observedUsages {
-                guard variableUsages[usage] == 1 else {
-                    throw KeyboardHIDCaptureError.interfaceMismatch
-                }
-            }
         }
 
-        guard candidates.values.contains(where: { if case .array = $0 { true } else { false } })
-                || KeyboardHIDTarget.observedUsages.allSatisfy({ usage in
-                    candidates.values.contains(.variable(usage: usage))
-                }) else {
+        guard KeyboardHIDTarget.observedUsages.allSatisfy({ usage in
+            candidates.values.contains(.variable(usage: usage))
+        }) else {
             throw KeyboardHIDCaptureError.interfaceMismatch
         }
         inputsByCookie = candidates
-    }
-
-    private struct ArrayGroup: Hashable {
-        let reportID: UInt32
-        let reportCount: UInt32
-        let minimumUsage: UInt32
-        let maximumUsage: UInt32
-        let logicalMinimum: Int64
-        let logicalMaximum: Int64
     }
 }
 
@@ -227,19 +166,6 @@ struct KeyboardHIDUsageDecoder {
                 newUsage = expectedUsage
             default:
                 return []
-            }
-        case .array:
-            // IOHID array elements retain the descriptor's usage (often the
-            // first usage in the range); the value itself carries the active
-            // usage. The validated cookie and page pin the selected slot.
-            guard input.isArray else { return [] }
-            if input.integerValue >= 0,
-               KeyboardHIDTarget.observedUsages.contains(UInt32(input.integerValue)) {
-                newUsage = UInt32(input.integerValue)
-            } else {
-                // Non-target values are inspected only to recognize the selected
-                // array slot's transition. They are not retained or delivered.
-                newUsage = nil
             }
         }
 
@@ -391,8 +317,14 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
     private var decoder: KeyboardHIDUsageDecoder?
     private var activeConnection: ActiveConnection?
     private var reconnectTask: Task<Void, Never>?
+    private var reconnectTaskID: UUID?
     private var isPaused = false
     private var isClosed = false
+    private var terminationStarted = false
+    private var terminationFinished = false
+    private var terminationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var pendingConnectionTeardowns = 0
+    private var connectionTeardownWaiters: [CheckedContinuation<Void, Never>] = []
     private var hasAnnouncedStopping = false
     private var queuedDeliveries: [KeyboardHIDDelivery] = []
     private var isDrainingDeliveries = false
@@ -427,8 +359,11 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
         guard !isClosed, isPaused != paused else { return }
         isPaused = paused
         if paused {
-            reconnectTask?.cancel()
+            let pendingReconnect = reconnectTask
             reconnectTask = nil
+            reconnectTaskID = nil
+            pendingReconnect?.cancel()
+            if let pendingReconnect { await pendingReconnect.value }
             await detachActiveConnection(announceStopping: true)
         } else {
             scheduleReconnect(immediately: true)
@@ -436,19 +371,7 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
     }
 
     func cancel() async {
-        guard !isClosed else { return }
-        isClosed = true
-        reconnectTask?.cancel()
-        reconnectTask = nil
-        await releaseHeldInputs()
-        await consumer.sessionLifecycleChanged(.stopping(generation))
-        if let activeConnection {
-            self.activeConnection = nil
-            await activeConnection.connection.cancel()
-            activeConnection.reader.cancel()
-            await activeConnection.reader.value
-        }
-        await consumer.sessionLifecycleChanged(.stopped(generation))
+        await terminate(with: .cancelled)
     }
 
     private func install(_ connection: any KeyboardHIDCaptureConnection) {
@@ -489,23 +412,105 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
 
     private func transportInterrupted(connectionID: UUID, permissionLost: Bool) async {
         guard !isClosed, activeConnection?.id == connectionID else { return }
-        await releaseHeldInputs()
-        await announceStoppingIfNeeded()
+        if permissionLost {
+            await terminate(
+                with: .failed(KeyboardHIDCaptureError.permissionUnavailable.localizedDescription),
+                readerConnectionID: connectionID
+            )
+            return
+        }
+
         guard let oldConnection = activeConnection, oldConnection.id == connectionID else { return }
         activeConnection = nil
+        pendingConnectionTeardowns += 1
+        await releaseHeldInputs()
+        await announceStoppingIfNeeded()
         decoder = nil
         await oldConnection.connection.cancel()
-        if permissionLost {
-            isClosed = true
-            reconnectTask?.cancel()
-            reconnectTask = nil
-            await consumer.sessionLifecycleChanged(.failed(
-                generation,
-                reason: KeyboardHIDCaptureError.permissionUnavailable.localizedDescription
-            ))
-        } else if !isPaused {
+        finishConnectionTeardown()
+        if !isClosed, !isPaused {
             scheduleReconnect(immediately: false)
         }
+    }
+
+    private enum TerminationOutcome {
+        case cancelled
+        case failed(String)
+    }
+
+    /// Closes input immediately, then makes every later cancellation caller
+    /// join the same release and transport teardown. Permission loss uses this
+    /// path too, so it cannot strand waiters in a half-closed session.
+    private func terminate(
+        with outcome: TerminationOutcome,
+        readerConnectionID: UUID? = nil,
+        currentReconnectID: UUID? = nil
+    ) async {
+        if terminationFinished { return }
+        if terminationStarted {
+            await waitForTerminationCompletion()
+            return
+        }
+
+        terminationStarted = true
+        isClosed = true
+        let pendingReconnect = reconnectTask
+        let pendingReconnectID = reconnectTaskID
+        reconnectTask = nil
+        reconnectTaskID = nil
+        let isCurrentReconnectTask = currentReconnectID != nil
+            && currentReconnectID == pendingReconnectID
+        if !isCurrentReconnectTask { pendingReconnect?.cancel() }
+
+        await releaseHeldInputs()
+        await announceStoppingIfNeeded()
+
+        let connectionToClose = activeConnection
+        activeConnection = nil
+        decoder = nil
+        if let connectionToClose {
+            await connectionToClose.connection.cancel()
+            if connectionToClose.id != readerConnectionID {
+                connectionToClose.reader.cancel()
+                await connectionToClose.reader.value
+            }
+        }
+        if let pendingReconnect, !isCurrentReconnectTask {
+            await pendingReconnect.value
+        }
+        await waitForConnectionTeardowns()
+
+        switch outcome {
+        case .cancelled:
+            await consumer.sessionLifecycleChanged(.stopped(generation))
+        case .failed(let reason):
+            await consumer.sessionLifecycleChanged(.failed(generation, reason: reason))
+        }
+
+        terminationFinished = true
+        let waiters = terminationWaiters
+        terminationWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    private func waitForTerminationCompletion() async {
+        guard !terminationFinished else { return }
+        await withCheckedContinuation { terminationWaiters.append($0) }
+    }
+
+    private func waitForConnectionTeardowns() async {
+        while pendingConnectionTeardowns > 0 {
+            await withCheckedContinuation { connectionTeardownWaiters.append($0) }
+        }
+    }
+
+    private func finishConnectionTeardown() {
+        precondition(pendingConnectionTeardowns > 0)
+        pendingConnectionTeardowns -= 1
+        guard pendingConnectionTeardowns == 0 else { return }
+        let waiters = connectionTeardownWaiters
+        connectionTeardownWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
     }
 
     private func detachActiveConnection(announceStopping: Bool) async {
@@ -514,9 +519,11 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
         guard let oldConnection = activeConnection else { return }
         activeConnection = nil
         decoder = nil
+        pendingConnectionTeardowns += 1
         await oldConnection.connection.cancel()
         oldConnection.reader.cancel()
         await oldConnection.reader.value
+        finishConnectionTeardown()
     }
 
     private func announceStoppingIfNeeded() async {
@@ -527,6 +534,8 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
 
     private func scheduleReconnect(immediately: Bool) {
         guard !isClosed, !isPaused, activeConnection == nil, reconnectTask == nil else { return }
+        let taskID = UUID()
+        reconnectTaskID = taskID
         reconnectTask = Task { [weak self] in
             if !immediately {
                 do {
@@ -535,40 +544,51 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
                     return
                 }
             }
-            await self?.attemptReconnect()
+            await self?.runReconnect(taskID: taskID)
         }
     }
 
-    private func attemptReconnect() async {
+    private func runReconnect(taskID: UUID) async {
+        guard reconnectTaskID == taskID else { return }
+        let shouldRetry = await attemptReconnect(taskID: taskID)
+        guard reconnectTaskID == taskID else { return }
         reconnectTask = nil
-        guard !isClosed, !isPaused, activeConnection == nil else { return }
+        reconnectTaskID = nil
+        if shouldRetry { scheduleReconnect(immediately: false) }
+    }
+
+    private func attemptReconnect(taskID: UUID) async -> Bool {
+        guard !isClosed, !isPaused, activeConnection == nil else { return false }
         do {
             let connection = try await transport.connectToUniqueTarget()
-            guard !isClosed, !isPaused, activeConnection == nil else {
+            guard reconnectTaskID == taskID, !isClosed, !isPaused, activeConnection == nil else {
                 await connection.cancel()
-                return
+                return false
             }
             await consumer.sessionLifecycleChanged(.started(generation))
-            guard !isClosed, !isPaused, activeConnection == nil else {
+            guard reconnectTaskID == taskID, !isClosed, !isPaused, activeConnection == nil else {
                 await connection.cancel()
-                return
+                return false
             }
             install(connection)
             hasAnnouncedStopping = false
+            return false
         } catch let error as KeyboardHIDCaptureError where error.canRetry {
-            scheduleReconnect(immediately: false)
+            return true
         } catch let error as KeyboardHIDCaptureError where error == .permissionUnavailable {
-            isClosed = true
-            await consumer.sessionLifecycleChanged(.failed(generation, reason: error.localizedDescription))
+            await terminate(
+                with: .failed(error.localizedDescription),
+                currentReconnectID: taskID
+            )
+            return false
         } catch is CancellationError {
-            return
+            return false
         } catch {
-            guard !isClosed, !isPaused else { return }
-            isClosed = true
-            await consumer.sessionLifecycleChanged(.failed(
-                generation,
-                reason: "The target keyboard collection could not be safely reconnected"
-            ))
+            guard !isClosed, !isPaused else { return false }
+            await terminate(with: .failed(
+                "The target keyboard collection could not be safely reconnected"
+            ), currentReconnectID: taskID)
+            return false
         }
     }
 

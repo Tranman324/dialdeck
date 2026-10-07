@@ -78,32 +78,21 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         await session.cancel()
     }
 
-    func testArraySlotsDecodeOnlyObservedValuesAndReleaseOnSlotReplacement() throws {
-        let descriptors = [arrayDescriptor(cookie: 90), arrayDescriptor(cookie: 91)]
-        let plan = try KeyboardHIDElementPlan(validating: descriptors)
-        var decoder = KeyboardHIDUsageDecoder(generation: SessionGeneration(13), plan: plan)
+    func testMultiSlotArraysFailClosedWhenReportCoverageAndMigrationOrderAreUnknown() {
+        let sixSlotLayout = (0..<6).map { slot in
+            arrayDescriptor(cookie: UInt64(90 + slot), reportID: 3, reportCount: 6)
+        }
+        XCTAssertThrowsError(try KeyboardHIDElementPlan(validating: sixSlotLayout))
 
-        XCTAssertTrue(decoder.consume(arrayValue(cookie: 90, usage: 0x04)).isEmpty)
-        XCTAssertEqual(
-            decoder.consume(arrayValue(cookie: 90, usage: 0x6b)),
-            [.event(try keyEvent("bottom-left", down: true, generation: 13))]
-        )
-        XCTAssertEqual(
-            decoder.consume(arrayValue(cookie: 91, usage: 0x6b)),
-            []
-        )
-        XCTAssertEqual(
-            decoder.consume(arrayValue(cookie: 90, usage: 0x6c)),
-            [.event(try keyEvent("middle-left", down: true, generation: 13))]
-        )
-        XCTAssertEqual(
-            decoder.consume(arrayValue(cookie: 91, usage: 0x00)),
-            [.event(try keyEvent("bottom-left", down: false, generation: 13))]
-        )
-        XCTAssertEqual(
-            decoder.consume(arrayValue(cookie: 90, usage: 0x00)),
-            [.event(try keyEvent("middle-left", down: false, generation: 13))]
-        )
+        let twoCookiesForSixReportedSlots = [
+            arrayDescriptor(cookie: 90, reportID: 3, reportCount: 6),
+            arrayDescriptor(cookie: 91, reportID: 3, reportCount: 6),
+        ]
+        XCTAssertThrowsError(try KeyboardHIDElementPlan(validating: twoCookiesForSixReportedSlots))
+
+        var mixed = variableDescriptors()
+        mixed.append(arrayDescriptor(cookie: 90, reportID: 3, reportCount: 6))
+        XCTAssertThrowsError(try KeyboardHIDElementPlan(validating: mixed))
     }
 
     func testHeldKeysAreReleasedWhenDecoderIsReset() throws {
@@ -144,6 +133,264 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         await session.cancel()
         let snapshotAfterRepeatedCancel = await consumer.snapshot()
         XCTAssertEqual(snapshotAfterRepeatedCancel, snapshot)
+    }
+
+    func testConcurrentCancelAndReplacementStartJoinHeldInputAndConnectionTeardown() async throws {
+        let keyUpEntered = TestAsyncBarrier()
+        let allowKeyUp = TestAsyncBarrier()
+        let connectionCancelEntered = TestAsyncBarrier()
+        let allowConnectionCancel = TestAsyncBarrier()
+        let firstConnection = TestKeyboardHIDConnection(
+            plan: try variablePlan(),
+            cancelEntered: connectionCancelEntered,
+            cancelBarrier: allowConnectionCancel
+        )
+        let replacementConnection = TestKeyboardHIDConnection(plan: try variablePlan())
+        let transport = TestKeyboardHIDTransport(connections: [firstConnection, replacementConnection])
+        let consumer = BarrierInputConsumer(keyUpEntered: keyUpEntered, allowKeyUp: allowKeyUp)
+        let producer = KeyboardHIDInputEventProducer(transport: transport)
+        let firstGeneration = SessionGeneration(141)
+        let session = try await producer.start(generation: firstGeneration, consumer: consumer)
+
+        firstConnection.send(.value(variableValue(usage: 0x6b, value: 1)))
+        await assertEventually { await consumer.eventCount == 1 }
+
+        let firstCancelFinished = TestAsyncBarrier()
+        let firstCancel = Task {
+            await session.cancel()
+            await firstCancelFinished.open()
+        }
+        await keyUpEntered.wait()
+
+        let secondCancelStarted = TestAsyncBarrier()
+        let secondCancelFinished = TestAsyncBarrier()
+        let secondCancel = Task {
+            await secondCancelStarted.open()
+            await session.cancel()
+            await secondCancelFinished.open()
+        }
+        let replacementStarted = TestAsyncBarrier()
+        let replacementFinished = TestAsyncBarrier()
+        let replacementGeneration = SessionGeneration(142)
+        let replacementStart = Task<any InputSessionHandle, Error> {
+            await replacementStarted.open()
+            let newSession = try await producer.start(generation: replacementGeneration, consumer: consumer)
+            await replacementFinished.open()
+            return newSession
+        }
+
+        await secondCancelStarted.wait()
+        await replacementStarted.wait()
+        try await Task.sleep(for: .milliseconds(30))
+        let secondCancelReturnedBeforeRelease = await secondCancelFinished.isOpen
+        let replacementReturnedBeforeRelease = await replacementFinished.isOpen
+        let attemptsBeforeRelease = await transport.connectionAttempts
+        XCTAssertFalse(secondCancelReturnedBeforeRelease)
+        XCTAssertFalse(replacementReturnedBeforeRelease)
+        XCTAssertEqual(attemptsBeforeRelease, 1)
+
+        await allowKeyUp.open()
+        await connectionCancelEntered.wait()
+        try await Task.sleep(for: .milliseconds(30))
+        let firstCancelReturnedBeforeConnectionClose = await firstCancelFinished.isOpen
+        let secondCancelReturnedBeforeConnectionClose = await secondCancelFinished.isOpen
+        let replacementReturnedBeforeConnectionClose = await replacementFinished.isOpen
+        let attemptsBeforeConnectionClose = await transport.connectionAttempts
+        XCTAssertFalse(firstCancelReturnedBeforeConnectionClose)
+        XCTAssertFalse(secondCancelReturnedBeforeConnectionClose)
+        XCTAssertFalse(replacementReturnedBeforeConnectionClose)
+        XCTAssertEqual(attemptsBeforeConnectionClose, 1)
+
+        await allowConnectionCancel.open()
+        await firstCancel.value
+        await secondCancel.value
+        let newSession = try await replacementStart.value
+        let finalSnapshot = await consumer.snapshot()
+        XCTAssertEqual(finalSnapshot.events.map(\.payload), [.keyDown, .keyUp])
+        XCTAssertEqual(finalSnapshot.lifecycle, [
+            .started(firstGeneration),
+            .stopping(firstGeneration),
+            .stopped(firstGeneration),
+            .started(replacementGeneration),
+        ])
+        let attemptsAfterReplacement = await transport.connectionAttempts
+        XCTAssertEqual(attemptsAfterReplacement, 2)
+        XCTAssertTrue(firstConnection.wasCancelled)
+
+        await session.cancel()
+        let snapshotAfterOldCancel = await consumer.snapshot()
+        XCTAssertEqual(snapshotAfterOldCancel, finalSnapshot)
+        await newSession.cancel()
+    }
+
+    func testCancellationJoinsPermissionFailureCleanupWithoutWaitingOnItsReader() async throws {
+        let keyUpEntered = TestAsyncBarrier()
+        let allowKeyUp = TestAsyncBarrier()
+        let connectionCancelEntered = TestAsyncBarrier()
+        let allowConnectionCancel = TestAsyncBarrier()
+        let connection = TestKeyboardHIDConnection(
+            plan: try variablePlan(),
+            cancelEntered: connectionCancelEntered,
+            cancelBarrier: allowConnectionCancel
+        )
+        let consumer = BarrierInputConsumer(keyUpEntered: keyUpEntered, allowKeyUp: allowKeyUp)
+        let producer = KeyboardHIDInputEventProducer(
+            transport: TestKeyboardHIDTransport(connections: [connection])
+        )
+        let generation = SessionGeneration(143)
+        let session = try await producer.start(generation: generation, consumer: consumer)
+        connection.send(.value(variableValue(usage: 0x6b, value: 1)))
+        await assertEventually { await consumer.eventCount == 1 }
+
+        connection.send(.permissionLost)
+        await keyUpEntered.wait()
+        let cancelStarted = TestAsyncBarrier()
+        let cancelFinished = TestAsyncBarrier()
+        let cancelTask = Task {
+            await cancelStarted.open()
+            await session.cancel()
+            await cancelFinished.open()
+        }
+        await cancelStarted.wait()
+        try await Task.sleep(for: .milliseconds(30))
+        let cancellationReturnedBeforeKeyRelease = await cancelFinished.isOpen
+        XCTAssertFalse(cancellationReturnedBeforeKeyRelease)
+
+        await allowKeyUp.open()
+        await connectionCancelEntered.wait()
+        try await Task.sleep(for: .milliseconds(30))
+        let cancellationReturnedBeforeConnectionClose = await cancelFinished.isOpen
+        XCTAssertFalse(cancellationReturnedBeforeConnectionClose)
+
+        await allowConnectionCancel.open()
+        await cancelTask.value
+        let snapshot = await consumer.snapshot()
+        XCTAssertEqual(snapshot.events.map(\.payload), [.keyDown, .keyUp])
+        XCTAssertEqual(snapshot.lifecycle, [
+            .started(generation),
+            .stopping(generation),
+            .failed(generation, reason: KeyboardHIDCaptureError.permissionUnavailable.localizedDescription),
+        ])
+    }
+
+    func testReplacementStartWaitsForInFlightReconnectCandidateTeardown() async throws {
+        let reconnectGate = TestConnectionGate()
+        let candidateCancelEntered = TestAsyncBarrier()
+        let allowCandidateCancel = TestAsyncBarrier()
+        let firstConnection = TestKeyboardHIDConnection(plan: try variablePlan())
+        let reconnectCandidate = TestKeyboardHIDConnection(
+            plan: try variablePlan(),
+            cancelEntered: candidateCancelEntered,
+            cancelBarrier: allowCandidateCancel
+        )
+        let replacementConnection = TestKeyboardHIDConnection(plan: try variablePlan())
+        let transport = TestKeyboardHIDTransport(
+            connections: [firstConnection, reconnectCandidate, replacementConnection],
+            gatedAttempts: [1: reconnectGate]
+        )
+        let consumer = RecordingInputConsumer()
+        let producer = KeyboardHIDInputEventProducer(transport: transport)
+        let firstGeneration = SessionGeneration(144)
+        let session = try await producer.start(generation: firstGeneration, consumer: consumer)
+
+        firstConnection.send(.disconnected)
+        await reconnectGate.waitUntilEntered()
+
+        let replacementStarted = TestAsyncBarrier()
+        let replacementFinished = TestAsyncBarrier()
+        let replacementGeneration = SessionGeneration(145)
+        let replacementStart = Task<any InputSessionHandle, Error> {
+            await replacementStarted.open()
+            let newSession = try await producer.start(generation: replacementGeneration, consumer: consumer)
+            await replacementFinished.open()
+            return newSession
+        }
+        await replacementStarted.wait()
+        try await Task.sleep(for: .milliseconds(30))
+        let replacementReturnedBeforeReconnectResolved = await replacementFinished.isOpen
+        let attemptsDuringReconnect = await transport.connectionAttempts
+        XCTAssertFalse(replacementReturnedBeforeReconnectResolved)
+        XCTAssertEqual(attemptsDuringReconnect, 2)
+
+        await reconnectGate.open()
+        await candidateCancelEntered.wait()
+        try await Task.sleep(for: .milliseconds(30))
+        let replacementReturnedBeforeCandidateClosed = await replacementFinished.isOpen
+        let attemptsBeforeCandidateClose = await transport.connectionAttempts
+        XCTAssertFalse(replacementReturnedBeforeCandidateClosed)
+        XCTAssertEqual(attemptsBeforeCandidateClose, 2)
+
+        await allowCandidateCancel.open()
+        let newSession = try await replacementStart.value
+        await assertEventually { await transport.connectionAttempts == 3 }
+        let snapshot = await consumer.snapshot()
+        XCTAssertEqual(snapshot.lifecycle, [
+            .started(firstGeneration),
+            .stopping(firstGeneration),
+            .stopped(firstGeneration),
+            .started(replacementGeneration),
+        ])
+        XCTAssertTrue(firstConnection.wasCancelled)
+        XCTAssertTrue(reconnectCandidate.wasCancelled)
+
+        await newSession.cancel()
+        await session.cancel()
+    }
+
+    func testCaptureProducerRoutesNormalizedKeyAndDialPressThroughActionRuntime() async throws {
+        let actionService = CaptureRuntimeActionService()
+        let modeID = DialModeID()
+        let mode = DialMode(
+            id: modeID,
+            name: DisplayName("Capture Test")!,
+            counterclockwise: .primitive(.doNothing),
+            clockwise: .primitive(.doNothing),
+            press: .primitive(.zoom(.in))
+        )
+        let profileID = ProfileID()
+        let profile = try Profile(
+            id: profileID,
+            name: DisplayName("Default")!,
+            scope: .default,
+            assignments: [.button1: .set(.primitive(.zoom(.out)))],
+            dialModes: [mode],
+            defaultDialModeID: modeID
+        )
+        let configuration = try Configuration(defaultProfileID: profileID, profiles: [profile])
+        let store = ConfigurationStore(
+            primaryURL: URL(fileURLWithPath: "/virtual/capture-runtime-\(UUID().uuidString).json"),
+            fileAccess: CaptureRuntimeMemoryFiles()
+        )
+        try await store.save(configuration)
+
+        let connection = TestKeyboardHIDConnection(plan: try variablePlan())
+        let producer = KeyboardHIDInputEventProducer(
+            transport: TestKeyboardHIDTransport(connections: [connection])
+        )
+        let bottomLeft = try XCTUnwrap(PhysicalControlID(rawValue: "bottom-left", kind: .key))
+        let runtime = ActionRuntime(
+            inputProducer: producer,
+            capabilities: CaptureRuntimeCapabilities(),
+            programmer: CaptureRuntimeProgrammer(),
+            foregroundApplication: CaptureRuntimeForeground(),
+            controlMapping: CaptureRuntimeMapping([bottomLeft: .button1]),
+            configurationStore: store,
+            actionService: actionService
+        )
+
+        _ = await runtime.submit(.start)
+        connection.send(.value(variableValue(usage: 0x6b, value: 1)))
+        connection.send(.value(variableValue(usage: 0x6b, value: 0)))
+        connection.send(.value(variableValue(usage: 0x72, value: 1)))
+        connection.send(.value(variableValue(usage: 0x72, value: 1)))
+        connection.send(.value(variableValue(usage: 0x72, value: 0)))
+
+        await assertEventually { await actionService.intents.count == 2 }
+        let intents = await actionService.intents
+        XCTAssertEqual(intents.filter { $0 == .zoom(.out, steps: 1, application: nil) }.count, 1)
+        XCTAssertEqual(intents.filter { $0 == .zoom(.in, steps: 1, application: nil) }.count, 1)
+
+        _ = await runtime.submit(.stop)
     }
 
     func testElementPlanFailsClosedForMissingOrAmbiguousInputLayouts() throws {
@@ -299,13 +546,17 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         }
     }
 
-    private func arrayDescriptor(cookie: UInt64, reportID: UInt32 = 3) -> KeyboardHIDElementDescriptor {
+    private func arrayDescriptor(
+        cookie: UInt64,
+        reportID: UInt32 = 3,
+        reportCount: UInt32 = 6
+    ) -> KeyboardHIDElementDescriptor {
         KeyboardHIDElementDescriptor(
             cookie: cookie,
             usagePage: KeyboardHIDTarget.keyboardUsagePage,
             representation: .array(minimumUsage: 0, maximumUsage: 0xe7),
             reportID: reportID,
-            reportCount: 6,
+            reportCount: reportCount,
             logicalMinimum: 0,
             logicalMaximum: 0xe7
         )
@@ -318,16 +569,6 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
             elementUsage: usage,
             isArray: false,
             integerValue: value
-        )
-    }
-
-    private func arrayValue(cookie: UInt64, usage: Int64) -> KeyboardHIDRawValue {
-        KeyboardHIDRawValue(
-            cookie: cookie,
-            usagePage: KeyboardHIDTarget.keyboardUsagePage,
-            elementUsage: 0,
-            isArray: true,
-            integerValue: usage
         )
     }
 
@@ -375,16 +616,42 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
 
 private actor TestKeyboardHIDTransport: KeyboardHIDCaptureTransport {
     private var connections: [TestKeyboardHIDConnection]
+    private let gatedAttempts: [Int: TestConnectionGate]
     private(set) var connectionAttempts = 0
 
-    init(connections: [TestKeyboardHIDConnection]) {
+    init(
+        connections: [TestKeyboardHIDConnection],
+        gatedAttempts: [Int: TestConnectionGate] = [:]
+    ) {
         self.connections = connections
+        self.gatedAttempts = gatedAttempts
     }
 
     func connectToUniqueTarget() async throws -> any KeyboardHIDCaptureConnection {
+        let attempt = connectionAttempts
         connectionAttempts += 1
         guard !connections.isEmpty else { throw KeyboardHIDCaptureError.targetUnavailable }
-        return connections.removeFirst()
+        let connection = connections.removeFirst()
+        if let gate = gatedAttempts[attempt] { await gate.wait() }
+        return connection
+    }
+}
+
+private actor TestConnectionGate {
+    private let entered = TestAsyncBarrier()
+    private let allowed = TestAsyncBarrier()
+
+    func wait() async {
+        await entered.open()
+        await allowed.wait()
+    }
+
+    func waitUntilEntered() async {
+        await entered.wait()
+    }
+
+    func open() async {
+        await allowed.open()
     }
 }
 
@@ -395,11 +662,20 @@ private final class TestKeyboardHIDConnection: KeyboardHIDCaptureConnection, @un
     private let continuation: AsyncStream<KeyboardHIDTransportEvent>.Continuation
     private let lock = NSLock()
     private let finishesStreamOnCancel: Bool
+    private let cancelEntered: TestAsyncBarrier?
+    private let cancelBarrier: TestAsyncBarrier?
     private var cancelled = false
 
-    init(plan: KeyboardHIDElementPlan, finishesStreamOnCancel: Bool = true) {
+    init(
+        plan: KeyboardHIDElementPlan,
+        finishesStreamOnCancel: Bool = true,
+        cancelEntered: TestAsyncBarrier? = nil,
+        cancelBarrier: TestAsyncBarrier? = nil
+    ) {
         elementPlan = plan
         self.finishesStreamOnCancel = finishesStreamOnCancel
+        self.cancelEntered = cancelEntered
+        self.cancelBarrier = cancelBarrier
         let pair = AsyncStream<KeyboardHIDTransportEvent>.makeStream()
         events = pair.stream
         continuation = pair.continuation
@@ -413,7 +689,29 @@ private final class TestKeyboardHIDConnection: KeyboardHIDCaptureConnection, @un
 
     func cancel() async {
         lock.withLock { cancelled = true }
+        await cancelEntered?.open()
+        await cancelBarrier?.wait()
         if finishesStreamOnCancel { continuation.finish() }
+    }
+}
+
+private actor TestAsyncBarrier {
+    private var opened = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var isOpen: Bool { opened }
+
+    func open() {
+        guard !opened else { return }
+        opened = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+
+    func wait() async {
+        guard !opened else { return }
+        await withCheckedContinuation { waiters.append($0) }
     }
 }
 
@@ -452,5 +750,100 @@ private actor RecordingInputConsumer: NormalizedInputConsumer {
 
     func snapshot() -> Snapshot {
         Snapshot(events: events, lifecycle: lifecycleEvents, dialPresses: dialPresses)
+    }
+}
+
+private actor BarrierInputConsumer: NormalizedInputConsumer {
+    struct Snapshot: Equatable {
+        let events: [NormalizedInputEvent]
+        let lifecycle: [SessionLifecycleEvent]
+    }
+
+    private let keyUpEntered: TestAsyncBarrier
+    private let allowKeyUp: TestAsyncBarrier
+    private(set) var events: [NormalizedInputEvent] = []
+    private(set) var lifecycle: [SessionLifecycleEvent] = []
+    var eventCount: Int { events.count }
+
+    init(keyUpEntered: TestAsyncBarrier, allowKeyUp: TestAsyncBarrier) {
+        self.keyUpEntered = keyUpEntered
+        self.allowKeyUp = allowKeyUp
+    }
+
+    func consume(_ event: NormalizedInputEvent) async {
+        if event.payload == .keyUp {
+            await keyUpEntered.open()
+            await allowKeyUp.wait()
+        }
+        events.append(event)
+    }
+
+    func sessionLifecycleChanged(_ event: SessionLifecycleEvent) async {
+        lifecycle.append(event)
+    }
+
+    func dialPressed(control: PhysicalControlID, generation: SessionGeneration) async -> ActionExecutionResult {
+        ActionExecutionResult(outcome: .ignored)
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(events: events, lifecycle: lifecycle)
+    }
+}
+
+private actor CaptureRuntimeActionService: HostActionServicing {
+    private(set) var intents: [HostActionIntent] = []
+
+    func perform(_ intent: HostActionIntent) async -> HostActionServiceResult {
+        intents.append(intent)
+        return .acceptedUnverified
+    }
+}
+
+private struct CaptureRuntimeCapabilities: DeviceCapabilityProviding {
+    func currentCapabilities() async -> DeviceCapabilities {
+        DeviceCapabilities(detection: .detected, access: .available)
+    }
+}
+
+private struct CaptureRuntimeProgrammer: DeviceProgramming {
+    func program(_ request: ProgrammingRequest) async -> ProgrammingResult {
+        ProgrammingResult(requestID: request.requestID, outcome: .sentUnverified)
+    }
+}
+
+private struct CaptureRuntimeForeground: ForegroundApplicationProviding {
+    func foregroundBundleIdentifier() async -> ApplicationBundleIdentifier? { nil }
+}
+
+private struct CaptureRuntimeMapping: PhysicalActionMappingProviding {
+    let actions: [PhysicalControlID: ActionAssignmentTarget]
+
+    init(_ actions: [PhysicalControlID: ActionAssignmentTarget]) {
+        self.actions = actions
+    }
+
+    func actionTarget(for control: PhysicalControlID) async -> ActionAssignmentTarget? {
+        actions[control]
+    }
+}
+
+private final class CaptureRuntimeMemoryFiles: ConfigurationFileAccess, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data] = [:]
+
+    func exists(at url: URL) -> Bool {
+        lock.withLock { values[url.path] != nil }
+    }
+
+    func read(from url: URL) throws -> Data {
+        try lock.withLock {
+            guard let value = values[url.path] else { throw ConfigurationStoreError.notFound }
+            return value
+        }
+    }
+
+    func writeAtomically(_ data: Data, to url: URL) throws {
+        lock.withLock { values[url.path] = data }
     }
 }
