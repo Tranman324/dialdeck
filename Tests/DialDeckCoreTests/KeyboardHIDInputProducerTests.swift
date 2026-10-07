@@ -39,6 +39,126 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         XCTAssertTrue(decoder.consume(variableValue(usage: 0x73, value: 0)).isEmpty)
     }
 
+    func testChildSelectionChoosesOneCompleteKeyboardAmongTwoCandidates() throws {
+        let incompleteDescriptors = Array(variableDescriptors().dropLast())
+        let candidates = [
+            childIdentity(descriptors: incompleteDescriptors, registryEntryID: 21),
+            childIdentity(registryEntryID: 22),
+        ]
+
+        let selectedIndex = try KeyboardHIDChildSelection.uniqueEligibleIndex(in: candidates)
+
+        XCTAssertEqual(selectedIndex, 1)
+        XCTAssertEqual(candidates[selectedIndex].elementPlan?.inputsByCookie.count, 9)
+    }
+
+    func testChildSelectionFailsWhenNoCandidateHasACompleteVariablePlan() {
+        let candidates = [
+            childIdentity(descriptors: Array(variableDescriptors().dropLast()), registryEntryID: 31),
+            childIdentity(descriptors: [arrayDescriptor(cookie: 90)], registryEntryID: 32),
+        ]
+
+        XCTAssertThrowsError(try KeyboardHIDChildSelection.uniqueEligibleIndex(in: candidates)) { error in
+            XCTAssertEqual(error as? KeyboardHIDCaptureError, .interfaceMismatch)
+        }
+    }
+
+    func testChildSelectionFailsWhenTwoChildrenHaveCompleteVariablePlans() {
+        let candidates = [
+            childIdentity(registryEntryID: 41),
+            childIdentity(registryEntryID: 42, usagePairs: [
+                KeyboardHIDUsagePair(usagePage: KeyboardHIDTarget.genericDesktopUsagePage,
+                                     usage: KeyboardHIDTarget.keyboardApplicationUsage),
+                KeyboardHIDUsagePair(usagePage: 0x0c, usage: 0x01),
+            ]),
+        ]
+
+        XCTAssertThrowsError(try KeyboardHIDChildSelection.uniqueEligibleIndex(in: candidates)) { error in
+            XCTAssertEqual(error as? KeyboardHIDCaptureError, .ambiguousTarget)
+        }
+    }
+
+    func testChildSelectionFailsWhenCandidateCombinesMultipleKeyboardCollections() {
+        let candidate = childIdentity(keyboardApplicationCollectionCount: 2)
+
+        XCTAssertThrowsError(try KeyboardHIDChildSelection.uniqueEligibleIndex(in: [candidate])) { error in
+            XCTAssertEqual(error as? KeyboardHIDCaptureError, .interfaceMismatch)
+        }
+    }
+
+    func testArrayBearingChildIsIneligibleAndNeverMergedIntoVariablePlan() throws {
+        var arrayDescriptors = variableDescriptors()
+        arrayDescriptors.append(arrayDescriptor(cookie: 90))
+        let candidates = [
+            childIdentity(descriptors: arrayDescriptors, registryEntryID: 51),
+            childIdentity(registryEntryID: 52),
+        ]
+
+        let selectedIndex = try KeyboardHIDChildSelection.uniqueEligibleIndex(in: candidates)
+
+        XCTAssertEqual(selectedIndex, 1)
+        XCTAssertEqual(candidates[selectedIndex].elementPlan?.inputsByCookie.count, 9)
+        XCTAssertNil(childIdentity(descriptors: arrayDescriptors).elementPlan)
+        XCTAssertThrowsError(try KeyboardHIDChildSelection.uniqueEligibleIndex(in: [
+            childIdentity(descriptors: arrayDescriptors),
+        ]))
+
+        let unboundedArray = KeyboardHIDElementDescriptor(
+            cookie: 91,
+            usagePage: KeyboardHIDTarget.keyboardUsagePage,
+            representation: .array(minimumUsage: nil, maximumUsage: nil),
+            reportID: 3,
+            reportCount: 6,
+            logicalMinimum: 0,
+            logicalMaximum: 0xe7
+        )
+        XCTAssertNil(childIdentity(descriptors: variableDescriptors() + [unboundedArray]).elementPlan)
+
+        let unrelatedArray = arrayDescriptor(cookie: 92, minimumUsage: 0, maximumUsage: 0x65)
+        XCTAssertNoThrow(try KeyboardHIDElementPlan(validating: variableDescriptors() + [unrelatedArray]))
+    }
+
+    func testChildIdentityComparesFingerprintUsagePairsRegistryIDAndElementPlan() {
+        let baseline = childIdentity(registryEntryID: 61)
+
+        var changedReport = variableDescriptors()
+        changedReport[0] = KeyboardHIDElementDescriptor(
+            cookie: changedReport[0].cookie,
+            usagePage: changedReport[0].usagePage,
+            representation: changedReport[0].representation,
+            reportID: 4,
+            reportCount: changedReport[0].reportCount,
+            logicalMinimum: changedReport[0].logicalMinimum,
+            logicalMaximum: changedReport[0].logicalMaximum
+        )
+        let changedFingerprint = childIdentity(descriptors: changedReport, registryEntryID: 61)
+        let changedUsagePairs = childIdentity(registryEntryID: 61, usagePairs: [
+            KeyboardHIDUsagePair(usagePage: KeyboardHIDTarget.genericDesktopUsagePage,
+                                 usage: KeyboardHIDTarget.keyboardApplicationUsage),
+            KeyboardHIDUsagePair(usagePage: 0x0c, usage: 0x01),
+        ])
+        let changedRegistryID = childIdentity(registryEntryID: 62)
+        let changedCookies = childIdentity(
+            descriptors: variableDescriptors().map { descriptor in
+                KeyboardHIDElementDescriptor(
+                    cookie: descriptor.cookie + 100,
+                    usagePage: descriptor.usagePage,
+                    representation: descriptor.representation,
+                    reportID: descriptor.reportID,
+                    reportCount: descriptor.reportCount,
+                    logicalMinimum: descriptor.logicalMinimum,
+                    logicalMaximum: descriptor.logicalMaximum
+                )
+            },
+            registryEntryID: 61
+        )
+
+        XCTAssertNotEqual(baseline, changedFingerprint)
+        XCTAssertNotEqual(baseline, changedUsagePairs)
+        XCTAssertNotEqual(baseline, changedRegistryID)
+        XCTAssertNotEqual(baseline, changedCookies)
+    }
+
     func testBurstDialTicksRemainDistinctAndF23ReleaseNeverCallsConsumer() throws {
         let plan = try variablePlan()
         var decoder = KeyboardHIDUsageDecoder(generation: SessionGeneration(12), plan: plan)
@@ -583,6 +703,25 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         try KeyboardHIDElementPlan(validating: variableDescriptors())
     }
 
+    private func childIdentity(
+        descriptors suppliedDescriptors: [KeyboardHIDElementDescriptor]? = nil,
+        registryEntryID: UInt64? = 1,
+        keyboardApplicationCollectionCount: Int? = 1,
+        usagePairs suppliedUsagePairs: [KeyboardHIDUsagePair]? = [
+            KeyboardHIDUsagePair(usagePage: KeyboardHIDTarget.genericDesktopUsagePage,
+                                 usage: KeyboardHIDTarget.keyboardApplicationUsage),
+        ]
+    ) -> KeyboardHIDChildIdentity {
+        let descriptors = suppliedDescriptors ?? variableDescriptors()
+        return KeyboardHIDChildIdentity(
+            descriptorFingerprint: KeyboardHIDDescriptorFingerprint(descriptors: descriptors),
+            usagePairs: suppliedUsagePairs?.sorted(),
+            keyboardApplicationCollectionCount: keyboardApplicationCollectionCount,
+            registryEntryID: registryEntryID,
+            elementPlan: try? KeyboardHIDElementPlan(validating: descriptors)
+        )
+    }
+
     private func variableDescriptors() -> [KeyboardHIDElementDescriptor] {
         (UInt32(0x6b)...UInt32(0x73)).enumerated().map { index, usage in
             KeyboardHIDElementDescriptor(
@@ -600,12 +739,14 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
     private func arrayDescriptor(
         cookie: UInt64,
         reportID: UInt32 = 3,
-        reportCount: UInt32 = 6
+        reportCount: UInt32 = 6,
+        minimumUsage: UInt32? = 0,
+        maximumUsage: UInt32? = 0xe7
     ) -> KeyboardHIDElementDescriptor {
         KeyboardHIDElementDescriptor(
             cookie: cookie,
             usagePage: KeyboardHIDTarget.keyboardUsagePage,
-            representation: .array(minimumUsage: 0, maximumUsage: 0xe7),
+            representation: .array(minimumUsage: minimumUsage, maximumUsage: maximumUsage),
             reportID: reportID,
             reportCount: reportCount,
             logicalMinimum: 0,

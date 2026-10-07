@@ -9,10 +9,22 @@ enum KeyboardHIDTarget {
     static let observedUsages: Set<UInt32> = Set(0x6b...0x73)
 }
 
+struct KeyboardHIDUsagePair: Equatable, Hashable, Comparable, Sendable {
+    let usagePage: UInt32
+    let usage: UInt32
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        if lhs.usagePage != rhs.usagePage {
+            return lhs.usagePage < rhs.usagePage
+        }
+        return lhs.usage < rhs.usage
+    }
+}
+
 struct KeyboardHIDElementDescriptor: Equatable, Sendable {
     enum Representation: Equatable, Sendable {
         case variable(usage: UInt32)
-        case array(minimumUsage: UInt32, maximumUsage: UInt32)
+        case array(minimumUsage: UInt32?, maximumUsage: UInt32?)
     }
 
     let cookie: UInt64
@@ -22,6 +34,31 @@ struct KeyboardHIDElementDescriptor: Equatable, Sendable {
     let reportCount: UInt32
     let logicalMinimum: Int64
     let logicalMaximum: Int64
+}
+
+struct KeyboardHIDDescriptorFingerprint: Equatable, Sendable {
+    /// Canonical keyboard-page input descriptor fields; IOHID cookies are only element IDs within a device.
+    let canonicalElements: [String]
+
+    init(descriptors: [KeyboardHIDElementDescriptor]) {
+        canonicalElements = descriptors.map { descriptor in
+            let representation: String
+            switch descriptor.representation {
+            case .variable(let usage):
+                representation = "variable:\(usage)"
+            case .array(let minimum, let maximum):
+                representation = "array:\(minimum.map { String($0) } ?? "?"):\(maximum.map { String($0) } ?? "?")"
+            }
+            return [
+                String(descriptor.usagePage),
+                representation,
+                String(descriptor.reportID),
+                String(descriptor.reportCount),
+                String(descriptor.logicalMinimum),
+                String(descriptor.logicalMaximum),
+            ].joined(separator: "|")
+        }.sorted()
+    }
 }
 
 struct KeyboardHIDElementPlan: Equatable, Sendable {
@@ -47,12 +84,17 @@ struct KeyboardHIDElementPlan: Equatable, Sendable {
                 }
                 variableUsages[usage, default: 0] += 1
                 candidates[descriptor.cookie] = .variable(usage: usage)
-            case .array(let minimum, let maximum)
-                where KeyboardHIDTarget.observedUsages.contains(where: { minimum <= $0 && $0 <= maximum }):
+            case .array(let minimum?, let maximum?) where minimum <= maximum:
+                guard !KeyboardHIDTarget.observedUsages.contains(where: { minimum <= $0 && $0 <= maximum }) else {
+                    // Value callbacks do not expose a report boundary. Without the
+                    // full report, a usage moving between array slots can look like
+                    // an up/down pair in either callback order. Fail closed until
+                    // the transport can validate and decode complete array reports.
+                    throw KeyboardHIDCaptureError.ambiguousInterface
+                }
+            case .array:
                 // Value callbacks do not expose a report boundary. Without the
-                // full report, a usage moving between array slots can look like
-                // an up/down pair in either callback order. Fail closed until
-                // the transport can validate and decode complete array reports.
+                // usage bounds, the array could overlap the target usages.
                 throw KeyboardHIDCaptureError.ambiguousInterface
             default:
                 continue
@@ -71,6 +113,43 @@ struct KeyboardHIDElementPlan: Equatable, Sendable {
             throw KeyboardHIDCaptureError.interfaceMismatch
         }
         inputsByCookie = candidates
+    }
+}
+
+struct KeyboardHIDChildIdentity: Equatable, Sendable {
+    let descriptorFingerprint: KeyboardHIDDescriptorFingerprint
+    let usagePairs: [KeyboardHIDUsagePair]?
+    let keyboardApplicationCollectionCount: Int?
+    let registryEntryID: UInt64?
+    let elementPlan: KeyboardHIDElementPlan?
+
+    var isEligible: Bool {
+        guard !descriptorFingerprint.canonicalElements.isEmpty,
+              keyboardApplicationCollectionCount == 1,
+              let usagePairs,
+              usagePairs.filter({
+                  $0.usagePage == KeyboardHIDTarget.genericDesktopUsagePage
+                      && $0.usage == KeyboardHIDTarget.keyboardApplicationUsage
+              }).count == 1,
+              let registryEntryID,
+              registryEntryID != 0,
+              elementPlan != nil else {
+            return false
+        }
+        return true
+    }
+}
+
+enum KeyboardHIDChildSelection {
+    static func uniqueEligibleIndex(in candidates: [KeyboardHIDChildIdentity]) throws -> Int {
+        let eligibleIndices = candidates.indices.filter { candidates[$0].isEligible }
+        guard eligibleIndices.count == 1 else {
+            if eligibleIndices.isEmpty {
+                throw KeyboardHIDCaptureError.interfaceMismatch
+            }
+            throw KeyboardHIDCaptureError.ambiguousTarget
+        }
+        return eligibleIndices[0]
     }
 }
 
