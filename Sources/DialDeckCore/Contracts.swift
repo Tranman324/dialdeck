@@ -28,6 +28,43 @@ public struct SessionGeneration: Hashable, Sendable {
     }
 }
 
+/// Monotonically increasing foreground-context epoch. Input adapters capture it
+/// at callback time so delivery can reject events buffered across a focus change.
+public struct FocusEpoch: Hashable, Sendable {
+    public let rawValue: UInt64
+
+    public init(_ rawValue: UInt64) {
+        self.rawValue = rawValue
+    }
+
+    public static let initial = Self(0)
+}
+
+/// Synchronous, thread-safe epoch shared by the runtime and input callback.
+/// Snapshot and advance do not suspend, so a HID callback never needs to hop
+/// through the runtime actor to stamp an event.
+public final class FocusEpochClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rawValue: UInt64
+
+    public init(initial: FocusEpoch = .initial) {
+        rawValue = initial.rawValue
+    }
+
+    public func snapshot() -> FocusEpoch {
+        lock.withLock { FocusEpoch(rawValue) }
+    }
+
+    @discardableResult
+    public func advance() -> FocusEpoch {
+        lock.withLock {
+            precondition(rawValue < UInt64.max, "Focus epoch exhausted")
+            rawValue += 1
+            return FocusEpoch(rawValue)
+        }
+    }
+}
+
 /// Normalized input independent of any device's protocol or physical mapping.
 /// Use the validated factories so key events can only carry key IDs and rotation
 /// events can only carry dial IDs.
@@ -42,37 +79,52 @@ public struct NormalizedInputEvent: Equatable, Sendable {
 
     public let control: PhysicalControlID
     public let generation: SessionGeneration
+    public let focusEpoch: FocusEpoch
     public let payload: Payload
 
-    private init(control: PhysicalControlID, generation: SessionGeneration, payload: Payload) {
+    private init(
+        control: PhysicalControlID,
+        generation: SessionGeneration,
+        focusEpoch: FocusEpoch,
+        payload: Payload
+    ) {
         self.control = control
         self.generation = generation
+        self.focusEpoch = focusEpoch
         self.payload = payload
     }
 
     public static func keyDown(
         control: PhysicalControlID,
-        generation: SessionGeneration
+        generation: SessionGeneration,
+        focusEpoch: FocusEpoch = .initial
     ) -> Self? {
         guard control.kind == .key else { return nil }
-        return Self(control: control, generation: generation, payload: .keyDown)
+        return Self(control: control, generation: generation, focusEpoch: focusEpoch, payload: .keyDown)
     }
 
     public static func keyUp(
         control: PhysicalControlID,
-        generation: SessionGeneration
+        generation: SessionGeneration,
+        focusEpoch: FocusEpoch = .initial
     ) -> Self? {
         guard control.kind == .key else { return nil }
-        return Self(control: control, generation: generation, payload: .keyUp)
+        return Self(control: control, generation: generation, focusEpoch: focusEpoch, payload: .keyUp)
     }
 
     public static func dialRotation(
         control: PhysicalControlID,
         delta: Int,
-        generation: SessionGeneration
+        generation: SessionGeneration,
+        focusEpoch: FocusEpoch = .initial
     ) -> Self? {
         guard control.kind == .dial else { return nil }
-        return Self(control: control, generation: generation, payload: .dialRotation(delta: delta))
+        return Self(
+            control: control,
+            generation: generation,
+            focusEpoch: focusEpoch,
+            payload: .dialRotation(delta: delta)
+        )
     }
 }
 
@@ -100,6 +152,12 @@ public protocol NormalizedInputConsumer: Sendable {
         control: PhysicalControlID,
         generation: SessionGeneration
     ) async -> ActionExecutionResult
+    @discardableResult
+    func dialPressed(
+        control: PhysicalControlID,
+        generation: SessionGeneration,
+        focusEpoch: FocusEpoch
+    ) async -> ActionExecutionResult
 }
 
 public extension NormalizedInputConsumer {
@@ -111,13 +169,39 @@ public extension NormalizedInputConsumer {
     ) async -> ActionExecutionResult {
         ActionExecutionResult(outcome: .ignored)
     }
+
+    @discardableResult
+    func dialPressed(
+        control: PhysicalControlID,
+        generation: SessionGeneration,
+        focusEpoch: FocusEpoch
+    ) async -> ActionExecutionResult {
+        await dialPressed(control: control, generation: generation)
+    }
 }
 
 public protocol InputEventProducing: Sendable {
     func start(
         generation: SessionGeneration,
-        consumer: any NormalizedInputConsumer
+        consumer: any NormalizedInputConsumer,
+        focusEpochClock: FocusEpochClock
     ) async throws -> any InputSessionHandle
+}
+
+public extension InputEventProducing {
+    /// Compatibility entry for producers used outside ActionRuntime. Runtime
+    /// sessions should use the shared-clock overload so callbacks and routing
+    /// observe the same epoch.
+    func start(
+        generation: SessionGeneration,
+        consumer: any NormalizedInputConsumer
+    ) async throws -> any InputSessionHandle {
+        try await start(
+            generation: generation,
+            consumer: consumer,
+            focusEpochClock: FocusEpochClock()
+        )
+    }
 }
 
 public enum DeviceDetectionState: Equatable, Sendable {

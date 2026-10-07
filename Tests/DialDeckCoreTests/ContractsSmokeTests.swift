@@ -6,16 +6,38 @@ final class ContractsSmokeTests: XCTestCase {
         let control = try XCTUnwrap(PhysicalControlID(rawValue: "opaque-key-a", kind: .key))
         let dial = try XCTUnwrap(PhysicalControlID(rawValue: "opaque-dial-a", kind: .dial))
         let generation = SessionGeneration(4)
+        let focusEpochClock = FocusEpochClock()
         let consumer = FakeInputConsumer()
         let producer = FakeInputProducer(control: control, dial: dial)
         let expectedEvents = [
-            try XCTUnwrap(NormalizedInputEvent.keyDown(control: control, generation: generation)),
-            try XCTUnwrap(NormalizedInputEvent.keyUp(control: control, generation: generation)),
-            try XCTUnwrap(NormalizedInputEvent.dialRotation(control: dial, delta: 1, generation: generation)),
-            try XCTUnwrap(NormalizedInputEvent.keyDown(control: control, generation: generation)),
+            try XCTUnwrap(NormalizedInputEvent.keyDown(
+                control: control,
+                generation: generation,
+                focusEpoch: focusEpochClock.snapshot()
+            )),
+            try XCTUnwrap(NormalizedInputEvent.keyUp(
+                control: control,
+                generation: generation,
+                focusEpoch: focusEpochClock.snapshot()
+            )),
+            try XCTUnwrap(NormalizedInputEvent.dialRotation(
+                control: dial,
+                delta: 1,
+                generation: generation,
+                focusEpoch: focusEpochClock.snapshot()
+            )),
+            try XCTUnwrap(NormalizedInputEvent.keyDown(
+                control: control,
+                generation: generation,
+                focusEpoch: focusEpochClock.snapshot()
+            )),
         ]
 
-        let session = try await producer.start(generation: generation, consumer: consumer)
+        let session = try await producer.start(
+            generation: generation,
+            consumer: consumer,
+            focusEpochClock: focusEpochClock
+        )
         let events = await consumer.events
         XCTAssertEqual(events, expectedEvents)
         XCTAssertEqual(session.generation, generation)
@@ -210,7 +232,8 @@ private struct FakeInputProducer: InputEventProducing {
 
     func start(
         generation: SessionGeneration,
-        consumer: any NormalizedInputConsumer
+        consumer: any NormalizedInputConsumer,
+        focusEpochClock: FocusEpochClock
     ) async throws -> any InputSessionHandle {
         await consumer.sessionLifecycleChanged(.started(generation))
         let events = [

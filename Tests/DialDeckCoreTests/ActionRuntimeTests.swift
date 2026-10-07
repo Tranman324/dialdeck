@@ -1797,6 +1797,108 @@ final class ActionRuntimeTests: XCTestCase {
         XCTAssertEqual(intents.count, 4, "The route paused across a focus invalidation must not dispatch")
     }
 
+    func testPressCapturedBeforeFocusChangeIsDroppedWhenDeliveredAfterward() async throws {
+        let fixture = try makeConfiguration(
+            defaultButton: .primitive(.zoom(.in)),
+            appButton: .inherit
+        )
+        let service = RecordingActionService()
+        let key = try key("fixture-button-1")
+        let input = ManualInputProducer()
+        let runtime = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: service,
+            foreground: MutableForeground(),
+            input: input,
+            mapping: [key: .button1]
+        )
+        _ = await runtime.submit(.start)
+
+        let capturedBeforeFocusChangeValue = await input.captureKeyDown(control: key)
+        let capturedBeforeFocusChange = try XCTUnwrap(capturedBeforeFocusChangeValue)
+        XCTAssertEqual(capturedBeforeFocusChange.focusEpoch, .initial)
+        await runtime.foregroundContextDidChange()
+        await input.emit(capturedBeforeFocusChange)
+
+        let intents = await service.intents
+        XCTAssertTrue(intents.isEmpty, "A pre-focus press delivered afterward must be dropped")
+        _ = await runtime.submit(.stop)
+    }
+
+    func testHeldKeyIsReleasedAcrossFocusChangeAndStaleRepeatIsNotRefired() async throws {
+        let chord = KeyboardChord(key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: [.command])
+        let fixture = try makeConfiguration(defaultButton: .primitive(.holdKeys(chord)), appButton: .inherit)
+        let service = RecordingActionService()
+        let key = try key("fixture-button-1")
+        let input = ManualInputProducer()
+        let runtime = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: service,
+            foreground: MutableForeground(),
+            input: input,
+            mapping: [key: .button1]
+        )
+        _ = await runtime.submit(.start)
+
+        let heldPress = await input.captureKeyDown(control: key)
+        await input.emit(try XCTUnwrap(heldPress))
+        let repeatedPressValue = await input.captureKeyDown(control: key)
+        let repeatedPressCapturedBeforeFocus = try XCTUnwrap(repeatedPressValue)
+        await runtime.foregroundContextDidChange()
+        await input.emit(repeatedPressCapturedBeforeFocus)
+
+        let intents = await service.intents
+        let heldKey = try XCTUnwrap(MacVirtualKeyCode(8))
+        XCTAssertEqual(count(.keyboard(.down, .key(heldKey)), in: intents), 1)
+        XCTAssertEqual(count(.keyboard(.up, .key(heldKey)), in: intents), 1)
+        XCTAssertEqual(count(.keyboard(.down, .modifier(.command)), in: intents), 1)
+        XCTAssertEqual(count(.keyboard(.up, .modifier(.command)), in: intents), 1)
+        _ = await runtime.submit(.stop)
+    }
+
+    func testBurstSpanningFocusChangeDispatchesOnlyEventsCapturedInCurrentEpoch() async throws {
+        let fixture = try makeConfiguration(
+            defaultButton: .primitive(.zoom(.in)),
+            appButton: .inherit
+        )
+        let service = RecordingActionService()
+        let key = try key("fixture-button-1")
+        let input = ManualInputProducer()
+        let runtime = try await makeRuntime(
+            configuration: fixture.configuration,
+            service: service,
+            foreground: MutableForeground(),
+            input: input,
+            mapping: [key: .button1]
+        )
+        _ = await runtime.submit(.start)
+
+        var beforeFocus: [NormalizedInputEvent] = []
+        for _ in 0..<12 {
+            let capturedDown = await input.captureKeyDown(control: key)
+            let capturedUp = await input.captureKeyUp(control: key)
+            beforeFocus.append(try XCTUnwrap(capturedDown))
+            beforeFocus.append(try XCTUnwrap(capturedUp))
+        }
+        await runtime.foregroundContextDidChange()
+        var afterFocus: [NormalizedInputEvent] = []
+        for _ in 0..<12 {
+            let capturedDown = await input.captureKeyDown(control: key)
+            let capturedUp = await input.captureKeyUp(control: key)
+            afterFocus.append(try XCTUnwrap(capturedDown))
+            afterFocus.append(try XCTUnwrap(capturedUp))
+        }
+        XCTAssertTrue(beforeFocus.allSatisfy { $0.focusEpoch == .initial })
+        XCTAssertTrue(afterFocus.allSatisfy { $0.focusEpoch == FocusEpoch(1) })
+
+        for event in beforeFocus { await input.emit(event) }
+        for event in afterFocus { await input.emit(event) }
+
+        let intents = await service.intents
+        XCTAssertEqual(intents.filter { $0 == .zoom(.in, steps: 1, application: nil) }.count, 12)
+        _ = await runtime.submit(.stop)
+    }
+
     func testForegroundInvalidationDoesNotWaitOnInputOrConfigurationMutationGates() async throws {
         let chord = KeyboardChord(key: try XCTUnwrap(MacVirtualKeyCode(8)), modifiers: [.command])
         let fixture = try makeConfiguration(defaultButton: .primitive(.holdKeys(chord)), appButton: .inherit)
@@ -1929,15 +2031,40 @@ final class ActionRuntimeTests: XCTestCase {
             _ = await runtime.submit(.stop)
             return (snapshot, metrics, service)
         }
+        func runKnobSpinWorkload() async throws -> (RuntimeTimingSnapshot, RuntimeMeasurementRecorder, any HostActionServicing) {
+            let service = RecordingActionService()
+            let (runtime, input, metrics, event) = try await makeRuntimeForWorkload(service: service)
+            for index in 0..<40 {
+                await input.emit(event)
+                if index < 39 { try await Task.sleep(for: .milliseconds(50)) }
+            }
+            let snapshot = metrics.snapshot()
+            _ = await runtime.submit(.stop)
+            return (snapshot, metrics, service)
+        }
         func timingLine(_ name: String, _ snapshot: RuntimeTimingSnapshot) -> String {
             let dispatch = snapshot.percentiles(for: .receiptToDispatch, inputClass: .dialRotation)
+            let queueWait = snapshot.percentiles(for: .inputQueueWait, inputClass: .dialRotation)
+            let routing = snapshot.percentiles(for: .preDispatchRouting, inputClass: .dialRotation)
+            let handling = snapshot.percentiles(for: .eventHandling, inputClass: .dialRotation)
             let adapter = snapshot.percentiles(for: .serviceCall, inputClass: .dialRotation)
             let sequenceActions = snapshot.percentiles(for: .sequenceAction, inputClass: .dialRotation)
             let sequencePauses = snapshot.percentiles(for: .sequencePause, inputClass: .dialRotation)
+            let dispatches = snapshot.dispatchDecompositions.filter { $0.inputClass == .dialRotation }
+            let slowestDispatch = dispatches.max { $0.receiptToDispatchNanoseconds < $1.receiptToDispatchNanoseconds }
             return "SIMULATED_RUNTIME_METRICS workload=\(name) events=\(dispatch.count) " +
                 "dispatch_ms_p50=\(Double(dispatch.p50Nanoseconds) / 1_000_000) " +
                 "p95=\(Double(dispatch.p95Nanoseconds) / 1_000_000) p99=\(Double(dispatch.p99Nanoseconds) / 1_000_000) " +
                 "max=\(Double(dispatch.maximumNanoseconds) / 1_000_000) under_50ms=\(dispatch.maximumNanoseconds < 50_000_000) " +
+                "queue_wait_ms_p50=\(Double(queueWait.p50Nanoseconds) / 1_000_000) " +
+                "p95=\(Double(queueWait.p95Nanoseconds) / 1_000_000) max=\(Double(queueWait.maximumNanoseconds) / 1_000_000) " +
+                "pre_dispatch_routing_ms_p50=\(Double(routing.p50Nanoseconds) / 1_000_000) " +
+                "p95=\(Double(routing.p95Nanoseconds) / 1_000_000) max=\(Double(routing.maximumNanoseconds) / 1_000_000) " +
+                "event_handling_ms_p50=\(Double(handling.p50Nanoseconds) / 1_000_000) " +
+                "p95=\(Double(handling.p95Nanoseconds) / 1_000_000) max=\(Double(handling.maximumNanoseconds) / 1_000_000) " +
+                "slowest_dispatch_queue_ms=\(Double(slowestDispatch?.inputQueueWaitNanoseconds ?? 0) / 1_000_000) " +
+                "slowest_dispatch_routing_ms=\(Double(slowestDispatch?.preDispatchRoutingNanoseconds ?? 0) / 1_000_000) " +
+                "slowest_dispatch_total_ms=\(Double(slowestDispatch?.receiptToDispatchNanoseconds ?? 0) / 1_000_000) " +
                 "service_call_ms_p50=\(Double(adapter.p50Nanoseconds) / 1_000_000) " +
                 "p95=\(Double(adapter.p95Nanoseconds) / 1_000_000) p99=\(Double(adapter.p99Nanoseconds) / 1_000_000) " +
                 "max=\(Double(adapter.maximumNanoseconds) / 1_000_000) " +
@@ -1951,20 +2078,37 @@ final class ActionRuntimeTests: XCTestCase {
 
         let normal = try await runNormalWorkload()
         let burst = try await runBurstWorkload()
-        for snapshot in [normal.0, burst.0] {
+        let knobSpin = try await runKnobSpinWorkload()
+        for (snapshot, expectedEvents) in [(normal.0, 50), (burst.0, 50), (knobSpin.0, 40)] {
             let dispatch = snapshot.percentiles(for: .receiptToDispatch, inputClass: .dialRotation)
+            let queueWait = snapshot.percentiles(for: .inputQueueWait, inputClass: .dialRotation)
+            let routing = snapshot.percentiles(for: .preDispatchRouting, inputClass: .dialRotation)
+            let handling = snapshot.percentiles(for: .eventHandling, inputClass: .dialRotation)
             let adapter = snapshot.percentiles(for: .serviceCall, inputClass: .dialRotation)
             let sequenceActions = snapshot.percentiles(for: .sequenceAction, inputClass: .dialRotation)
             let sequencePauses = snapshot.percentiles(for: .sequencePause, inputClass: .dialRotation)
-            XCTAssertEqual(dispatch.count, 50)
-            XCTAssertEqual(adapter.count, 100)
-            XCTAssertEqual(sequenceActions.count, 100)
-            XCTAssertEqual(sequencePauses.count, 50)
+            XCTAssertEqual(dispatch.count, expectedEvents)
+            XCTAssertEqual(queueWait.count, expectedEvents)
+            XCTAssertEqual(routing.count, expectedEvents)
+            XCTAssertEqual(handling.count, expectedEvents)
+            XCTAssertEqual(adapter.count, expectedEvents * 2)
+            XCTAssertEqual(sequenceActions.count, expectedEvents * 2)
+            XCTAssertEqual(sequencePauses.count, expectedEvents)
+            XCTAssertEqual(snapshot.dispatchDecompositions.count, expectedEvents)
+            for decomposition in snapshot.dispatchDecompositions {
+                let componentSum = decomposition.inputQueueWaitNanoseconds
+                    + decomposition.preDispatchRoutingNanoseconds
+                let roundingDifference = componentSum > decomposition.receiptToDispatchNanoseconds
+                    ? componentSum - decomposition.receiptToDispatchNanoseconds
+                    : decomposition.receiptToDispatchNanoseconds - componentSum
+                XCTAssertLessThanOrEqual(roundingDifference, 2, "Each dispatch sample must decompose into queue wait plus routing")
+            }
             XCTAssertEqual(snapshot.droppedSampleCount, 0)
             XCTAssertTrue(snapshot.samples.allSatisfy { $0.durationNanoseconds < 10_000_000_000 })
         }
         print(timingLine("normal-spaced-10ms", normal.0))
         print(timingLine("burst-no-gap", burst.0))
+        print(timingLine("rapid-knob-spin-20hz", knobSpin.0))
         let independentExecutor = HostActionExecutor(service: burst.2)
         _ = await independentExecutor.executeDialAction(
             .primitive(.openApplication(application)),
@@ -2595,18 +2739,40 @@ private struct MismatchedLightingProgrammer: DeviceLightingProgramming {
 private actor ManualInputProducer: InputEventProducing {
     private var consumer: (any NormalizedInputConsumer)?
     private var session: ManualInputSession?
+    private var focusEpochClock: FocusEpochClock?
     private(set) var currentGeneration: SessionGeneration?
+    var currentFocusEpoch: FocusEpoch { focusEpochClock?.snapshot() ?? .initial }
 
     func start(
         generation: SessionGeneration,
-        consumer: any NormalizedInputConsumer
+        consumer: any NormalizedInputConsumer,
+        focusEpochClock: FocusEpochClock
     ) async throws -> any InputSessionHandle {
         let session = ManualInputSession(generation: generation, consumer: consumer)
         self.consumer = consumer
         self.session = session
+        self.focusEpochClock = focusEpochClock
         currentGeneration = generation
         await consumer.sessionLifecycleChanged(.started(generation))
         return session
+    }
+
+    func captureKeyDown(control: PhysicalControlID) -> NormalizedInputEvent? {
+        guard let currentGeneration else { return nil }
+        return NormalizedInputEvent.keyDown(
+            control: control,
+            generation: currentGeneration,
+            focusEpoch: focusEpochClock?.snapshot() ?? .initial
+        )
+    }
+
+    func captureKeyUp(control: PhysicalControlID) -> NormalizedInputEvent? {
+        guard let currentGeneration else { return nil }
+        return NormalizedInputEvent.keyUp(
+            control: control,
+            generation: currentGeneration,
+            focusEpoch: focusEpochClock?.snapshot() ?? .initial
+        )
     }
 
     func emit(_ event: NormalizedInputEvent) async {

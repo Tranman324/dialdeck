@@ -41,6 +41,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     private struct RoutePermit: Sendable {
         let generation: SessionGeneration
         let revision: UInt64
+        let focusEpoch: FocusEpoch
     }
 
     private let inputProducer: any InputEventProducing
@@ -52,6 +53,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     private let controlMapping: any PhysicalActionMappingProviding
     private let configurationStore: ConfigurationStore
     private let executor: HostActionExecutor
+    private let focusEpochClock: FocusEpochClock
     private let measurementRecorder: RuntimeMeasurementRecorder?
     private var configuration: Configuration?
     private var session: (any InputSessionHandle)?
@@ -66,6 +68,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     private let inputGate = AsyncActionGate()
     private let configurationMutationGate = AsyncActionGate()
     private var routingRevision: UInt64 = 0
+    private var currentFocusEpoch: FocusEpoch = .initial
     private var configurationMutationsInProgress = 0
     private var modeAdvanceStartGateForTesting: (@Sendable () async -> Void)?
 
@@ -78,6 +81,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         configurationStore: ConfigurationStore,
         actionService: any HostActionServicing,
         executionLimits: ActionExecutionLimits = .init(),
+        focusEpochClock: FocusEpochClock = FocusEpochClock(),
         lightingProgrammer: (any DeviceLightingProgramming)? = nil,
         keyAssignmentProgrammer: (any DeviceKeyAssignmentProgramming)? = nil,
         measurementRecorder: RuntimeMeasurementRecorder? = nil
@@ -91,6 +95,8 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         self.controlMapping = controlMapping
         self.configurationStore = configurationStore
         self.executor = HostActionExecutor(service: actionService, limits: executionLimits)
+        self.focusEpochClock = focusEpochClock
+        self.currentFocusEpoch = focusEpochClock.snapshot()
         self.measurementRecorder = measurementRecorder
     }
 
@@ -245,6 +251,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     /// including when no keypad event is arriving. It invalidates pending routes
     /// and releases every synthetic input owned by the previous route.
     public func foregroundContextDidChange() async {
+        currentFocusEpoch = focusEpochClock.advance()
         routingRevision &+= 1
         foregroundBundleIdentifier = nil
         activeProfileID = nil
@@ -260,12 +267,31 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         control: PhysicalControlID,
         generation eventGeneration: SessionGeneration
     ) async -> ActionExecutionResult {
+        await dialPressed(
+            control: control,
+            generation: eventGeneration,
+            focusEpoch: focusEpochClock.snapshot()
+        )
+    }
+
+    @discardableResult
+    public func dialPressed(
+        control: PhysicalControlID,
+        generation eventGeneration: SessionGeneration,
+        focusEpoch: FocusEpoch
+    ) async -> ActionExecutionResult {
         let receivedAt = ContinuousClock.now
         let observation = makeObservation(receivedAt: receivedAt, inputClass: .dialPress)
         await inputGate.acquire()
+        let gateAcquiredAt = ContinuousClock.now
+        observation?.recordInputQueueWait(at: gateAcquiredAt)
+        defer {
+            observation?.record(.eventHandling, duration: gateAcquiredAt.duration(to: .now))
+        }
         let result = await performDialPressed(
             control: control,
             generation: eventGeneration,
+            focusEpoch: focusEpoch,
             observation: observation
         )
         await inputGate.release()
@@ -275,12 +301,13 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
     private func performDialPressed(
         control: PhysicalControlID,
         generation eventGeneration: SessionGeneration,
+        focusEpoch: FocusEpoch,
         observation: RuntimeDispatchObservation?
     ) async -> ActionExecutionResult {
         guard control.kind == .dial else {
             return ActionExecutionResult(outcome: .failed(.invalidInput))
         }
-        guard let permit = routePermit(for: eventGeneration) else {
+        guard let permit = routePermit(for: eventGeneration, focusEpoch: focusEpoch) else {
             return ActionExecutionResult(outcome: .ignored)
         }
         do {
@@ -323,7 +350,14 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         }
         let observation = makeObservation(receivedAt: receivedAt, inputClass: inputClass)
         await inputGate.acquire()
+        let gateAcquiredAt = ContinuousClock.now
+        observation?.recordInputQueueWait(at: gateAcquiredAt)
+        defer {
+            observation?.record(.eventHandling, duration: gateAcquiredAt.duration(to: .now))
+        }
         guard event.generation == generation,
+              event.focusEpoch == currentFocusEpoch,
+              event.focusEpoch == focusEpochClock.snapshot(),
               case .running(let runningGeneration) = status,
               runningGeneration == event.generation,
               !isEditing else {
@@ -417,7 +451,11 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         generation = newGeneration
         status = .starting
         do {
-            let newSession = try await inputProducer.start(generation: newGeneration, consumer: self)
+            let newSession = try await inputProducer.start(
+                generation: newGeneration,
+                consumer: self,
+                focusEpochClock: focusEpochClock
+            )
             guard generation == newGeneration else {
                 await newSession.cancel()
                 return
@@ -468,7 +506,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         _ event: NormalizedInputEvent,
         observation: RuntimeDispatchObservation?
     ) async {
-        guard let permit = routePermit(for: event.generation) else { return }
+        guard let permit = routePermit(for: event.generation, focusEpoch: event.focusEpoch) else { return }
         guard let target = await controlMapping.actionTarget(for: event.control) else {
             guard routeIsCurrent(permit) else { return }
             setActionResult(ActionExecutionResult(outcome: .ignored))
@@ -520,7 +558,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         delta: Int,
         observation: RuntimeDispatchObservation?
     ) async {
-        guard let permit = routePermit(for: event.generation) else { return }
+        guard let permit = routePermit(for: event.generation, focusEpoch: event.focusEpoch) else { return }
         guard delta != 0, absSafely(delta) <= 100 else {
             if delta != 0 { setActionResult(ActionExecutionResult(outcome: .failed(.invalidInput))) }
             return
@@ -659,18 +697,29 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         }
     }
 
-    private func routePermit(for eventGeneration: SessionGeneration) -> RoutePermit? {
+    private func routePermit(
+        for eventGeneration: SessionGeneration,
+        focusEpoch: FocusEpoch
+    ) -> RoutePermit? {
         guard generation == eventGeneration,
+              focusEpoch == currentFocusEpoch,
+              focusEpoch == focusEpochClock.snapshot(),
               case .running(let runningGeneration) = status,
               runningGeneration == eventGeneration,
               !isEditing,
               configurationMutationsInProgress == 0 else { return nil }
-        return RoutePermit(generation: eventGeneration, revision: routingRevision)
+        return RoutePermit(
+            generation: eventGeneration,
+            revision: routingRevision,
+            focusEpoch: focusEpoch
+        )
     }
 
     private func routeIsCurrent(_ permit: RoutePermit) -> Bool {
         routingRevision == permit.revision
             && generation == permit.generation
+            && currentFocusEpoch == permit.focusEpoch
+            && focusEpochClock.snapshot() == permit.focusEpoch
             && !isEditing
             && configurationMutationsInProgress == 0
             && status == .running(generation: permit.generation)
@@ -695,7 +744,11 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         let currentPermit: RoutePermit
         if focusChanged {
             routingRevision &+= 1
-            currentPermit = RoutePermit(generation: permit.generation, revision: routingRevision)
+            currentPermit = RoutePermit(
+                generation: permit.generation,
+                revision: routingRevision,
+                focusEpoch: permit.focusEpoch
+            )
             await cancelExecutorAndRecordCleanupFailure()
             guard routeIsCurrent(currentPermit) else { return nil }
         } else {

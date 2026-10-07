@@ -55,7 +55,10 @@ public enum RuntimeInputClass: String, Equatable, Sendable {
 /// Runtime timings keep dispatch, adapter response, sequence work, and pauses
 /// separate so configured delays are not mistaken for dispatch latency.
 public enum RuntimeTimingKind: String, Equatable, Sendable {
+    case inputQueueWait
+    case preDispatchRouting
     case receiptToDispatch
+    case eventHandling
     case serviceCall
     case sequenceAction
     case sequencePause
@@ -101,12 +104,40 @@ public struct RuntimeTimingPercentiles: Equatable, Sendable {
     }
 }
 
+/// Paired durations for the pre-dispatch interval. This lets diagnostics
+/// decompose the same event's receipt-to-dispatch tail without retaining an
+/// event identifier or input value.
+public struct RuntimeDispatchDecomposition: Equatable, Sendable {
+    public let inputClass: RuntimeInputClass
+    public let inputQueueWaitNanoseconds: UInt64
+    public let preDispatchRoutingNanoseconds: UInt64
+    public let receiptToDispatchNanoseconds: UInt64
+
+    public init(
+        inputClass: RuntimeInputClass,
+        inputQueueWaitNanoseconds: UInt64,
+        preDispatchRoutingNanoseconds: UInt64,
+        receiptToDispatchNanoseconds: UInt64
+    ) {
+        self.inputClass = inputClass
+        self.inputQueueWaitNanoseconds = inputQueueWaitNanoseconds
+        self.preDispatchRoutingNanoseconds = preDispatchRoutingNanoseconds
+        self.receiptToDispatchNanoseconds = receiptToDispatchNanoseconds
+    }
+}
+
 public struct RuntimeTimingSnapshot: Equatable, Sendable {
     public let samples: [RuntimeTimingSample]
+    public let dispatchDecompositions: [RuntimeDispatchDecomposition]
     public let droppedSampleCount: Int
 
-    public init(samples: [RuntimeTimingSample], droppedSampleCount: Int) {
+    public init(
+        samples: [RuntimeTimingSample],
+        dispatchDecompositions: [RuntimeDispatchDecomposition] = [],
+        droppedSampleCount: Int
+    ) {
         self.samples = samples
+        self.dispatchDecompositions = dispatchDecompositions
         self.droppedSampleCount = droppedSampleCount
     }
 
@@ -124,6 +155,7 @@ public final class RuntimeMeasurementRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private let capacity: Int
     private var samples: [RuntimeTimingSample] = []
+    private var dispatchDecompositions: [RuntimeDispatchDecomposition] = []
     private var droppedSampleCount = 0
     private var receivedEventCount = 0
 
@@ -133,7 +165,11 @@ public final class RuntimeMeasurementRecorder: @unchecked Sendable {
 
     public func snapshot() -> RuntimeTimingSnapshot {
         lock.withLock {
-            RuntimeTimingSnapshot(samples: samples, droppedSampleCount: droppedSampleCount)
+            RuntimeTimingSnapshot(
+                samples: samples,
+                dispatchDecompositions: dispatchDecompositions,
+                droppedSampleCount: droppedSampleCount
+            )
         }
     }
 
@@ -179,6 +215,38 @@ public final class RuntimeMeasurementRecorder: @unchecked Sendable {
             samples.append(sample)
         }
     }
+
+    fileprivate func recordDispatchDecomposition(
+        inputClass: RuntimeInputClass,
+        queueWait: Duration,
+        preDispatchRouting: Duration,
+        receiptToDispatch: Duration
+    ) {
+        let sample = RuntimeDispatchDecomposition(
+            inputClass: inputClass,
+            inputQueueWaitNanoseconds: Self.durationNanoseconds(queueWait),
+            preDispatchRoutingNanoseconds: Self.durationNanoseconds(preDispatchRouting),
+            receiptToDispatchNanoseconds: Self.durationNanoseconds(receiptToDispatch)
+        )
+        lock.withLock {
+            if dispatchDecompositions.count == capacity {
+                dispatchDecompositions.removeFirst()
+                droppedSampleCount += 1
+            }
+            dispatchDecompositions.append(sample)
+        }
+    }
+
+    private static func durationNanoseconds(_ duration: Duration) -> UInt64 {
+        let components = duration.components
+        let seconds = max(0, components.seconds)
+        let attoseconds = max(0, components.attoseconds)
+        let secondsNanos = UInt64(seconds).multipliedReportingOverflow(by: 1_000_000_000)
+        guard !secondsNanos.overflow else { return UInt64.max }
+        let addition = UInt64(attoseconds / 1_000_000_000)
+        let total = secondsNanos.partialValue.addingReportingOverflow(addition)
+        return total.overflow ? UInt64.max : total.partialValue
+    }
 }
 
 final class RuntimeDispatchObservation: @unchecked Sendable {
@@ -187,6 +255,7 @@ final class RuntimeDispatchObservation: @unchecked Sendable {
     private let receivedAt: ContinuousClock.Instant
     private let inputClass: RuntimeInputClass
     private var didRecordDispatch = false
+    private var gateAcquiredAt: ContinuousClock.Instant?
 
     init(
         recorder: RuntimeMeasurementRecorder,
@@ -198,14 +267,39 @@ final class RuntimeDispatchObservation: @unchecked Sendable {
         self.inputClass = inputClass
     }
 
-    func recordDispatch(at instant: ContinuousClock.Instant = .now) {
-        let shouldRecord = lock.withLock { () -> Bool in
-            guard !didRecordDispatch else { return false }
-            didRecordDispatch = true
+    func recordInputQueueWait(at instant: ContinuousClock.Instant = .now) {
+        let didRecord = lock.withLock { () -> Bool in
+            guard gateAcquiredAt == nil else { return false }
+            gateAcquiredAt = instant
             return true
         }
-        guard shouldRecord else { return }
-        recorder.record(kind: .receiptToDispatch, inputClass: inputClass, duration: receivedAt.duration(to: instant))
+        guard didRecord else { return }
+        recorder.record(
+            kind: .inputQueueWait,
+            inputClass: inputClass,
+            duration: receivedAt.duration(to: instant)
+        )
+    }
+
+    func recordDispatch(at instant: ContinuousClock.Instant = .now) {
+        let values = lock.withLock { () -> (ContinuousClock.Instant, ContinuousClock.Instant?)? in
+            guard !didRecordDispatch else { return nil }
+            didRecordDispatch = true
+            return (instant, gateAcquiredAt)
+        }
+        guard let (dispatchInstant, gateInstant) = values else { return }
+        let receiptToDispatch = receivedAt.duration(to: dispatchInstant)
+        recorder.record(kind: .receiptToDispatch, inputClass: inputClass, duration: receiptToDispatch)
+        guard let gateInstant else { return }
+        let queueWait = receivedAt.duration(to: gateInstant)
+        let preDispatchRouting = gateInstant.duration(to: dispatchInstant)
+        recorder.record(kind: .preDispatchRouting, inputClass: inputClass, duration: preDispatchRouting)
+        recorder.recordDispatchDecomposition(
+            inputClass: inputClass,
+            queueWait: queueWait,
+            preDispatchRouting: preDispatchRouting,
+            receiptToDispatch: receiptToDispatch
+        )
     }
 
     func record(_ kind: RuntimeTimingKind, duration: Duration) {

@@ -196,6 +196,23 @@ struct KeyboardHIDRawValue: Equatable, Sendable {
     let elementUsage: UInt32
     let isArray: Bool
     let integerValue: Int64
+    let focusEpoch: FocusEpoch
+
+    init(
+        cookie: UInt64,
+        usagePage: UInt32,
+        elementUsage: UInt32,
+        isArray: Bool,
+        integerValue: Int64,
+        focusEpoch: FocusEpoch = .initial
+    ) {
+        self.cookie = cookie
+        self.usagePage = usagePage
+        self.elementUsage = elementUsage
+        self.isArray = isArray
+        self.integerValue = integerValue
+        self.focusEpoch = focusEpoch
+    }
 }
 
 struct KeyboardHIDRawReportDecoder: Sendable {
@@ -206,7 +223,11 @@ struct KeyboardHIDRawReportDecoder: Sendable {
 
     private(set) var activeUsages: Set<UInt32> = []
 
-    mutating func consume(reportID: UInt32, bytes: [UInt8]) -> [KeyboardHIDRawValue] {
+    mutating func consume(
+        reportID: UInt32,
+        bytes: [UInt8],
+        focusEpoch: FocusEpoch = .initial
+    ) -> [KeyboardHIDRawValue] {
         guard reportID == Self.expectedReportID,
               bytes.count == Self.expectedReportLength,
               bytes[0] == UInt8(Self.expectedReportID) else {
@@ -228,23 +249,30 @@ struct KeyboardHIDRawReportDecoder: Sendable {
         let released = activeUsages.subtracting(nextUsages).sorted()
         let pressed = nextUsages.subtracting(activeUsages).sorted()
         activeUsages = nextUsages
-        return released.map { rawValue(for: $0, pressed: false) }
-            + pressed.map { rawValue(for: $0, pressed: true) }
+        return released.map { rawValue(for: $0, pressed: false, focusEpoch: focusEpoch) }
+            + pressed.map { rawValue(for: $0, pressed: true, focusEpoch: focusEpoch) }
     }
 
-    mutating func releaseHeldInputs() -> [KeyboardHIDRawValue] {
-        let released = activeUsages.sorted().map { rawValue(for: $0, pressed: false) }
+    mutating func releaseHeldInputs(focusEpoch: FocusEpoch = .initial) -> [KeyboardHIDRawValue] {
+        let released = activeUsages.sorted().map {
+            rawValue(for: $0, pressed: false, focusEpoch: focusEpoch)
+        }
         activeUsages.removeAll()
         return released
     }
 
-    private func rawValue(for usage: UInt32, pressed: Bool) -> KeyboardHIDRawValue {
+    private func rawValue(
+        for usage: UInt32,
+        pressed: Bool,
+        focusEpoch: FocusEpoch
+    ) -> KeyboardHIDRawValue {
         KeyboardHIDRawValue(
             cookie: UInt64(usage),
             usagePage: KeyboardHIDTarget.keyboardUsagePage,
             elementUsage: usage,
             isArray: false,
-            integerValue: pressed ? 1 : 0
+            integerValue: pressed ? 1 : 0,
+            focusEpoch: focusEpoch
         )
     }
 }
@@ -262,7 +290,9 @@ protocol KeyboardHIDCaptureConnection: Sendable {
 }
 
 protocol KeyboardHIDCaptureTransport: Sendable {
-    func connectToUniqueTarget() async throws -> any KeyboardHIDCaptureConnection
+    func connectToUniqueTarget(
+        focusEpochClock: FocusEpochClock
+    ) async throws -> any KeyboardHIDCaptureConnection
 }
 
 enum KeyboardHIDCaptureError: Error, Equatable, Sendable, LocalizedError {
@@ -310,7 +340,7 @@ enum KeyboardHIDCaptureError: Error, Equatable, Sendable, LocalizedError {
 
 enum KeyboardHIDDelivery: Equatable, Sendable {
     case event(NormalizedInputEvent)
-    case dialPress(PhysicalControlID)
+    case dialPress(PhysicalControlID, focusEpoch: FocusEpoch)
 }
 
 struct KeyboardHIDUsageDecoder {
@@ -358,7 +388,7 @@ struct KeyboardHIDUsageDecoder {
 
         var deliveries: [KeyboardHIDDelivery] = []
         if let priorUsage, sourceCountByUsage[priorUsage] == nil {
-            deliveries.append(contentsOf: releaseDelivery(for: priorUsage))
+            deliveries.append(contentsOf: releaseDelivery(for: priorUsage, focusEpoch: input.focusEpoch))
         }
 
         if let newUsage {
@@ -366,41 +396,50 @@ struct KeyboardHIDUsageDecoder {
             sourceCountByUsage[newUsage] = priorCount + 1
             activeUsageByCookie[input.cookie] = newUsage
             if priorCount == 0 {
-                deliveries.append(contentsOf: pressDelivery(for: newUsage))
+                deliveries.append(contentsOf: pressDelivery(for: newUsage, focusEpoch: input.focusEpoch))
             }
         }
         return deliveries
     }
 
-    mutating func releaseHeldInputs() -> [KeyboardHIDDelivery] {
+    mutating func releaseHeldInputs(focusEpoch: FocusEpoch = .initial) -> [KeyboardHIDDelivery] {
         let heldUsages = sourceCountByUsage.keys.sorted()
         activeUsageByCookie.removeAll()
         sourceCountByUsage.removeAll()
-        return heldUsages.flatMap(releaseDelivery(for:))
+        return heldUsages.flatMap { releaseDelivery(for: $0, focusEpoch: focusEpoch) }
     }
 
-    private func pressDelivery(for usage: UInt32) -> [KeyboardHIDDelivery] {
+    private func pressDelivery(for usage: UInt32, focusEpoch: FocusEpoch) -> [KeyboardHIDDelivery] {
         if let key = Self.keyControl(for: usage),
-           let event = NormalizedInputEvent.keyDown(control: key, generation: generation) {
+           let event = NormalizedInputEvent.keyDown(
+            control: key,
+            generation: generation,
+            focusEpoch: focusEpoch
+           ) {
             return [.event(event)]
         }
         if usage == 0x72 {
-            return [.dialPress(Self.knobControl)]
+            return [.dialPress(Self.knobControl, focusEpoch: focusEpoch)]
         }
         if let direction = Self.rotation(for: usage),
            let event = NormalizedInputEvent.dialRotation(
                control: Self.knobControl,
                delta: direction,
-               generation: generation
+               generation: generation,
+               focusEpoch: focusEpoch
            ) {
             return [.event(event)]
         }
         return []
     }
 
-    private func releaseDelivery(for usage: UInt32) -> [KeyboardHIDDelivery] {
+    private func releaseDelivery(for usage: UInt32, focusEpoch: FocusEpoch) -> [KeyboardHIDDelivery] {
         guard let key = Self.keyControl(for: usage),
-              let event = NormalizedInputEvent.keyUp(control: key, generation: generation) else {
+              let event = NormalizedInputEvent.keyUp(
+                control: key,
+                generation: generation,
+                focusEpoch: focusEpoch
+              ) else {
             return []
         }
         return [.event(event)]
@@ -449,7 +488,8 @@ public actor KeyboardHIDInputEventProducer: InputEventProducing {
 
     public func start(
         generation: SessionGeneration,
-        consumer: any NormalizedInputConsumer
+        consumer: any NormalizedInputConsumer,
+        focusEpochClock: FocusEpochClock
     ) async throws -> any InputSessionHandle {
         await startGate.acquire()
         do {
@@ -460,7 +500,8 @@ public actor KeyboardHIDInputEventProducer: InputEventProducing {
             let newSession = KeyboardHIDInputSession(
                 generation: generation,
                 consumer: consumer,
-                transport: transport
+                transport: transport,
+                focusEpochClock: focusEpochClock
             )
             try await newSession.start()
             activeSession = newSession
@@ -489,6 +530,7 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
     nonisolated let generation: SessionGeneration
     private let consumer: any NormalizedInputConsumer
     private let transport: any KeyboardHIDCaptureTransport
+    private let focusEpochClock: FocusEpochClock
     private var decoder: KeyboardHIDUsageDecoder?
     private var activeConnection: ActiveConnection?
     private var reconnectTask: Task<Void, Never>?
@@ -508,15 +550,17 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
     init(
         generation: SessionGeneration,
         consumer: any NormalizedInputConsumer,
-        transport: any KeyboardHIDCaptureTransport
+        transport: any KeyboardHIDCaptureTransport,
+        focusEpochClock: FocusEpochClock
     ) {
         self.generation = generation
         self.consumer = consumer
         self.transport = transport
+        self.focusEpochClock = focusEpochClock
     }
 
     func start() async throws {
-        let connection = try await transport.connectToUniqueTarget()
+        let connection = try await transport.connectToUniqueTarget(focusEpochClock: focusEpochClock)
         guard !isClosed else {
             if let closeError = await connection.cancel() { throw closeError }
             throw CancellationError()
@@ -745,7 +789,7 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
     private func attemptReconnect(taskID: UUID) async -> Bool {
         guard !isClosed, !isPaused, activeConnection == nil else { return false }
         do {
-            let connection = try await transport.connectToUniqueTarget()
+            let connection = try await transport.connectToUniqueTarget(focusEpochClock: focusEpochClock)
             guard reconnectTaskID == taskID, !isClosed, !isPaused, activeConnection == nil else {
                 if let closeError = await connection.cancel() {
                     await terminate(
@@ -790,7 +834,7 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
 
     private func releaseHeldInputs() async {
         guard var decoder else { return }
-        let outputs = decoder.releaseHeldInputs()
+        let outputs = decoder.releaseHeldInputs(focusEpoch: focusEpochClock.snapshot())
         self.decoder = decoder
         await deliver(outputs)
     }
@@ -808,8 +852,12 @@ private actor KeyboardHIDInputSession: InputSessionHandle {
             switch output {
             case .event(let event):
                 await consumer.consume(event)
-            case .dialPress(let control):
-                _ = await consumer.dialPressed(control: control, generation: generation)
+            case .dialPress(let control, let focusEpoch):
+                _ = await consumer.dialPressed(
+                    control: control,
+                    generation: generation,
+                    focusEpoch: focusEpoch
+                )
             }
         }
         isDrainingDeliveries = false

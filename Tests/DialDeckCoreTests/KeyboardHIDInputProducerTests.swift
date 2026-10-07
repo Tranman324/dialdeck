@@ -33,7 +33,12 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         XCTAssertTrue(decoder.consume(variableValue(usage: 0x71, value: 0)).isEmpty)
 
         let pressDown = decoder.consume(variableValue(usage: 0x72, value: 1))
-        XCTAssertEqual(pressDown, [.dialPress(try XCTUnwrap(PhysicalControlID(rawValue: "knob", kind: .dial)))])
+        XCTAssertEqual(pressDown, [
+            .dialPress(
+                try XCTUnwrap(PhysicalControlID(rawValue: "knob", kind: .dial)),
+                focusEpoch: .initial
+            ),
+        ])
         XCTAssertTrue(decoder.consume(variableValue(usage: 0x72, value: 1)).isEmpty)
         XCTAssertTrue(decoder.consume(variableValue(usage: 0x72, value: 0)).isEmpty)
 
@@ -122,7 +127,10 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
             .event(try rotationEvent(1, generation: 31)),
             .event(try rotationEvent(1, generation: 31)),
             .event(try rotationEvent(-1, generation: 31)),
-            .dialPress(try XCTUnwrap(PhysicalControlID(rawValue: "knob", kind: .dial))),
+            .dialPress(
+                try XCTUnwrap(PhysicalControlID(rawValue: "knob", kind: .dial)),
+                focusEpoch: .initial
+            ),
         ]
         XCTAssertEqual(deliveries, expected)
     }
@@ -705,6 +713,32 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         XCTAssertEqual(intents.filter { $0 == .zoom(.in, steps: 1, application: nil) }.count, 1)
 
         _ = await runtime.submit(.stop)
+    }
+
+    func testProducerStampsEachInputCallbackWithTheCurrentFocusEpoch() async throws {
+        let focusEpochClock = FocusEpochClock()
+        let connection = TestKeyboardHIDConnection(plan: try variablePlan())
+        let producer = KeyboardHIDInputEventProducer(
+            transport: TestKeyboardHIDTransport(connections: [connection])
+        )
+        let consumer = RecordingInputConsumer()
+        let generation = SessionGeneration(151)
+        let session = try await producer.start(
+            generation: generation,
+            consumer: consumer,
+            focusEpochClock: focusEpochClock
+        )
+
+        connection.send(.value(variableValue(usage: 0x6b, value: 1)))
+        await assertEventually { await consumer.events.count == 1 }
+        _ = focusEpochClock.advance()
+        connection.send(.value(variableValue(usage: 0x6b, value: 0)))
+        await assertEventually { await consumer.events.count == 2 }
+
+        let events = await consumer.snapshot().events
+        XCTAssertEqual(events.map(\.focusEpoch), [.initial, FocusEpoch(1)])
+        XCTAssertEqual(events.map(\.payload), [.keyDown, .keyUp])
+        await session.cancel()
     }
 
     func testPhysicalVerificationHarnessIsDisabledUnlessExplicitlyEnabled() {
@@ -1290,29 +1324,52 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         )
     }
 
-    private func variableValue(usage: UInt32, value: Int64) -> KeyboardHIDRawValue {
+    private func variableValue(
+        usage: UInt32,
+        value: Int64,
+        focusEpoch: FocusEpoch = .initial
+    ) -> KeyboardHIDRawValue {
         KeyboardHIDRawValue(
             cookie: UInt64(usage - 0x6b + 1),
             usagePage: KeyboardHIDTarget.keyboardUsagePage,
             elementUsage: usage,
             isArray: false,
-            integerValue: value
+            integerValue: value,
+            focusEpoch: focusEpoch
         )
     }
 
-    private func keyEvent(_ identifier: String, down: Bool, generation: UInt64) throws -> NormalizedInputEvent {
+    private func keyEvent(
+        _ identifier: String,
+        down: Bool,
+        generation: UInt64,
+        focusEpoch: FocusEpoch = .initial
+    ) throws -> NormalizedInputEvent {
         let control = try XCTUnwrap(PhysicalControlID(rawValue: identifier, kind: .key))
         let sessionGeneration = SessionGeneration(generation)
         return try XCTUnwrap(down
-            ? NormalizedInputEvent.keyDown(control: control, generation: sessionGeneration)
-            : NormalizedInputEvent.keyUp(control: control, generation: sessionGeneration))
+            ? NormalizedInputEvent.keyDown(
+                control: control,
+                generation: sessionGeneration,
+                focusEpoch: focusEpoch
+            )
+            : NormalizedInputEvent.keyUp(
+                control: control,
+                generation: sessionGeneration,
+                focusEpoch: focusEpoch
+            ))
     }
 
-    private func rotationEvent(_ delta: Int, generation: UInt64) throws -> NormalizedInputEvent {
+    private func rotationEvent(
+        _ delta: Int,
+        generation: UInt64,
+        focusEpoch: FocusEpoch = .initial
+    ) throws -> NormalizedInputEvent {
         try XCTUnwrap(NormalizedInputEvent.dialRotation(
             control: XCTUnwrap(PhysicalControlID(rawValue: "knob", kind: .dial)),
             delta: delta,
-            generation: SessionGeneration(generation)
+            generation: SessionGeneration(generation),
+            focusEpoch: focusEpoch
         ))
     }
 
@@ -1358,13 +1415,16 @@ private actor TestKeyboardHIDTransport: KeyboardHIDCaptureTransport {
         self.errorsByAttempt = errorsByAttempt
     }
 
-    func connectToUniqueTarget() async throws -> any KeyboardHIDCaptureConnection {
+    func connectToUniqueTarget(
+        focusEpochClock: FocusEpochClock
+    ) async throws -> any KeyboardHIDCaptureConnection {
         let attempt = connectionAttempts
         connectionAttempts += 1
         if let gate = gatedAttempts[attempt] { await gate.wait() }
         if let error = errorsByAttempt[attempt] { throw error }
         guard !connections.isEmpty else { throw KeyboardHIDCaptureError.targetUnavailable }
         let connection = connections.removeFirst()
+        connection.setFocusEpochClock(focusEpochClock)
         return connection
     }
 }
@@ -1397,6 +1457,7 @@ private final class TestKeyboardHIDConnection: KeyboardHIDCaptureConnection, @un
     private let cancelEntered: TestAsyncBarrier?
     private let cancelBarrier: TestAsyncBarrier?
     private var cancelled = false
+    private var focusEpochClock: FocusEpochClock?
 
     init(
         plan: KeyboardHIDElementPlan,
@@ -1414,7 +1475,23 @@ private final class TestKeyboardHIDConnection: KeyboardHIDCaptureConnection, @un
     }
 
     func send(_ event: KeyboardHIDTransportEvent) {
-        continuation.yield(event)
+        if case .value(let value) = event {
+            let callbackFocusEpoch = lock.withLock { focusEpochClock?.snapshot() } ?? value.focusEpoch
+            continuation.yield(.value(KeyboardHIDRawValue(
+                cookie: value.cookie,
+                usagePage: value.usagePage,
+                elementUsage: value.elementUsage,
+                isArray: value.isArray,
+                integerValue: value.integerValue,
+                focusEpoch: callbackFocusEpoch
+            )))
+        } else {
+            continuation.yield(event)
+        }
+    }
+
+    func setFocusEpochClock(_ focusEpochClock: FocusEpochClock) {
+        lock.withLock { self.focusEpochClock = focusEpochClock }
     }
 
     var wasCancelled: Bool { lock.withLock { cancelled } }
@@ -1604,14 +1681,16 @@ private struct PhysicalVerificationRecordingProducer: InputEventProducing {
 
     func start(
         generation: SessionGeneration,
-        consumer: any NormalizedInputConsumer
+        consumer: any NormalizedInputConsumer,
+        focusEpochClock: FocusEpochClock
     ) async throws -> any InputSessionHandle {
         try await base.start(
             generation: generation,
             consumer: PhysicalVerificationRecordingConsumer(
                 recorder: recorder,
                 downstream: consumer
-            )
+            ),
+            focusEpochClock: focusEpochClock
         )
     }
 }
@@ -1648,11 +1727,23 @@ private actor PhysicalVerificationRecordingConsumer: NormalizedInputConsumer {
         control: PhysicalControlID,
         generation: SessionGeneration
     ) async -> ActionExecutionResult {
+        await dialPressed(control: control, generation: generation, focusEpoch: .initial)
+    }
+
+    func dialPressed(
+        control: PhysicalControlID,
+        generation: SessionGeneration,
+        focusEpoch: FocusEpoch
+    ) async -> ActionExecutionResult {
         await recorder.record(
             .init(controlID: control.rawValue, kind: .dialPress),
             generation: generation.rawValue
         )
-        return await downstream.dialPressed(control: control, generation: generation)
+        return await downstream.dialPressed(
+            control: control,
+            generation: generation,
+            focusEpoch: focusEpoch
+        )
     }
 }
 
@@ -1664,7 +1755,8 @@ private struct PhysicalVerificationReplayProducer: InputEventProducing {
 
     func start(
         generation: SessionGeneration,
-        consumer: any NormalizedInputConsumer
+        consumer: any NormalizedInputConsumer,
+        focusEpochClock: FocusEpochClock
     ) async throws -> any InputSessionHandle {
         await consumer.sessionLifecycleChanged(.started(generation))
         for event in eventsBeforeReconnect { await consumer.consume(event) }

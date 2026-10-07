@@ -1,76 +1,36 @@
-# Runtime recovery and measurement guide
+# Runtime recovery and measurement
 
-## Instrumentation boundary
+## Timing boundaries
 
-`RuntimeMeasurementRecorder` keeps a bounded ring of monotonic durations and normalized input classes only. It records the interval from entry to `ActionRuntime.consume` (or `dialPressed`) until the first call to `HostActionServicing.perform`. It excludes hardware callback, report decoding, and producer queue time. One event contributes only one receipt-to-dispatch sample, even when a configured sequence dispatches several actions.
+`RuntimeMeasurementRecorder` stores a bounded set of monotonic durations and normalized event classes. It retains no control IDs, key values, shortcuts, text, clipboard data, or app content.
 
-The recorder reports these timing categories separately:
+For each input event, the runtime reports:
 
-- `receiptToDispatch`: runtime receipt to first service dispatch.
-- `serviceCall`: one injected host-action adapter call, from invocation through return.
-- `sequenceAction`: one configured sequence action step.
-- `sequencePause`: one configured sequence pause.
+- `inputQueueWait`: event receipt until it acquires the serialized input gate.
+- `preDispatchRouting`: gate acquisition until the first `HostActionServicing.perform` call, including configuration, focus, and route checks.
+- `receiptToDispatch`: the combined interval from receipt to that first service call. The recorder also stores a paired decomposition for the same dispatched event.
+- `eventHandling`: gate acquisition through completion of the runtime's event handler, including action execution and configured pauses.
+- `serviceCall`: each injected host-action adapter call, from invocation through return.
+- `sequenceAction` and `sequencePause`: configured sequence action and pause durations.
 
-The service call duration is an adapter duration, not an observed target-application response. This repository currently has no production host-action adapter or app composition root, so target-application response remains unmeasured. Instrumentation contains no control IDs, key values, shortcut names, clipboard contents, or app content.
+`receiptToDispatch` ends when service execution begins. It does not include the service call itself or prove when a target app visibly responds. The repository has no production host-action adapter or completed app composition root, so target-app response remains unmeasured.
 
 ## Deterministic offline workload
 
-Run the synthetic runtime workload with:
+Run the simulated timing and focus-contract workload with:
 
 ```sh
-swift test --package-path . --arch arm64 --filter ActionRuntimeTests/testRuntimeMeasurementHarnessSeparatesDispatchServiceAndSequenceTiming
+swift test --package-path . --arch arm64 --filter ActionRuntimeTests
 ```
 
-It submits 50 dial-rotation events with 10 ms spacing for the normal workload. For the burst, it suspends the first host-action service call, queues 49 additional event deliveries without awaiting action completion, and verifies all 50 events reached `ActionRuntime` while only the first event had dispatched. After releasing the barrier, it waits for all deliveries and reports receipt-to-first-dispatch latency, including input-gate queueing time. Each event runs two service actions with a configured 2 ms pause. The test checks 50 receipt-to-dispatch samples, 100 adapter calls, 100 sequence action steps, and 50 pause samples for each workload. Its output is labeled `SIMULATED_RUNTIME_METRICS`; it measures only the runtime and test double, and cannot establish HID, host input, target-app, CPU, memory, or energy acceptance.
+`testRuntimeMeasurementHarnessSeparatesDispatchServiceAndSequenceTiming` reports p50, p95, and maximum queue wait, pre-dispatch routing, full event handling, and service-call timings for a no-gap backlog and a 40-event, 20 Hz simulated knob spin. The backlog result decomposes its slowest receipt-to-dispatch sample into queue wait and routing time. Output is labeled `SIMULATED_RUNTIME_METRICS`; it measures the runtime and test doubles, not HID callback latency, host input, target-app behavior, CPU, memory, or energy.
 
-## Five-minute process windows
+## Final supervised hardware session
 
-Use a built, integrated candidate on the same Mac used for the supervised target-app checks. The application must be composed with the production producer and host-action adapter before these windows can represent connected/disconnected runtime behavior. `scripts/build-app.sh` refuses staged, modified, or untracked working-tree changes and also refuses untracked or linked files under `Sources`, including ignored files. It creates a Git archive of the clean `HEAD` and compiles that snapshot, so edits made and reverted in the checkout during compilation cannot change the source being built. It rechecks worktree cleanliness and `HEAD` after compilation. Every build receives a random 32-character build ID and a unique bundle path under `.build/candidates/<commit-sha>/<build-id>/DialDeck.app`; the script refuses to replace an existing bundle path. It stamps the source commit SHA, build ID, and copied executable's SHA-256 digest into the bundle. Record both the commit SHA and build ID printed by the script. Warm up for at least two minutes after building and launching that exact bundle, then identify its PID in Activity Monitor. Before and during sampling, the script verifies through macOS `libproc` that the PID executable is inside `DialDeck.app/Contents/MacOS/DialDeckApp` and checks its bundle `Info.plist` for `CFBundleExecutable=DialDeckApp`, `CFBundleIdentifier=com.dialdeck.app`, the requested `DialDeckBuildSHA`, and the requested `DialDeckBuildID`; it recomputes the executable digest and compares it to `DialDeckExecutableSHA256`. Because each build has its own path and is never replaced by the build script, a process from a prior build cannot inherit a later build's bundle metadata. The sampler checks the same process start-time identity throughout the sample window only to detect PID reuse, rejects decreasing CPU counters, and keeps process start time out of evidence. It records the canonical app identity, verified build ID and executable digest, and aggregate counters; it never records the user's full executable path, process name arguments, PID, or process start time. A different process, mismatched commit SHA, build ID or executable digest, reused PID, nonmonotonic CPU counter, or unverifiable identity is rejected before evidence is written. A concrete 40-character candidate SHA and 32-character build ID are required.
+During the final supervised hardware session, use Activity Monitor for one manual idle check: observe the app for five minutes with the keypad plugged in, then five minutes with it unplugged. The pass criterion is CPU near 0% while idle and memory remaining flat across both periods. Record only the observed result. This manual check replaces the previously planned formal energy samples and scripted five-minute resource windows.
 
-Run separate five-minute windows for the connected and disconnected idle scenarios:
+The same final session must separately cover the approved user-visible recovery checks: sleep/wake, missing or revoked permissions, unplug/replug, held keys, and repeated knob rotation. Confirm there are no stuck or duplicate actions. These checks require the production app composition, host-action adapter, and supervised user interaction; simulated tests do not establish physical behavior.
 
-```sh
-python3 scripts/measure-runtime-process.py --pid <DialDeck-PID> --scenario idle-connected --candidate-sha <40-character-SHA> --candidate-build-id <32-character-build-ID> --output evidence/idle-connected.csv
-python3 scripts/measure-runtime-process.py --pid <DialDeck-PID> --scenario idle-disconnected --candidate-sha <40-character-SHA> --candidate-build-id <32-character-build-ID> --output evidence/idle-disconnected.csv
-```
+When the production adapter and target-only environment are ready, verify the configured actions with a blank or disposable target document: Command-C and Command-V, sustained Control+Option speech in Wispr Flow, the clipboard-manager shortcut, application launch, an Apple Shortcut, horizontal scrolling, application-appropriate zoom, and dial mode changes with restoration after restart. Keep target-app response time distinct from runtime receipt-to-dispatch and use aggregate outcomes only.
 
-The sampler records 301 observations and schedules the last counter read at least 300 seconds after the first counter read was observed. It writes the actual first-to-last monotonic sample span and refuses to write evidence if it is shorter. CPU time is the delta in the process CPU-time counter divided by that observed elapsed span. `100%` means one logical CPU fully occupied; the script reports that percentage and a host-normalized value divided by the logical CPU count. An idle result is labeled `COUNTER_ONLY_PASS` or `COUNTER_ONLY_FAIL`; `Application acceptance: NOT_ASSESSED` is always reported because process counters do not establish user-visible behavior. RSS baseline is the first sample, peak is the maximum, and settled memory is the median of the final 30 observations. Record whether the run actually had the keypad connected; the script cannot detect that state.
-
-Run focus and reconnect cycle windows separately while an operator performs 20 cycles of the named type:
-
-```sh
-python3 scripts/measure-runtime-process.py --pid <DialDeck-PID> --scenario focus-cycles --cycle-count 20 --candidate-sha <40-character-SHA> --candidate-build-id <32-character-build-ID> --output evidence/focus-cycles.csv
-python3 scripts/measure-runtime-process.py --pid <DialDeck-PID> --scenario reconnect-cycles --cycle-count 20 --candidate-sha <40-character-SHA> --candidate-build-id <32-character-build-ID> --output evidence/reconnect-cycles.csv
-```
-
-`--cycle-count` is operator-reported; this process sampler does not verify the focus changes or physical reconnects. Save only the aggregate session count, RSS baseline/peak/settled values, and whether growth remained after settling. Do not record foreground window titles, user content, HID reports, or unrelated input.
-
-## Energy observation
-
-When the candidate and target-only environment are ready, run an idle energy sample in each matching connected/disconnected scenario without concurrent compilation or UI automation. The wrapper captures the macOS `cpu_power` sampler at one-second intervals for five minutes and does not enable per-process energy listings:
-
-```sh
-sudo scripts/measure-runtime-energy.sh evidence/energy-connected.txt <40-character-SHA>
-sudo scripts/measure-runtime-energy.sh evidence/energy-disconnected.txt <40-character-SHA>
-```
-
-The result is system-wide estimated subsystem power, not an attribution to DialDeck. Keep the two scenarios, host, power source, and warm-up procedure consistent. If the sampler is unavailable or access is denied, record it as blocked. Do not infer application energy from the process CPU or RSS samples.
-
-## Supervised physical and target-app checks
-
-The fixed live checklist requires actual keypad input and target-app observation. With a supervised session, a no-op runtime fixture may first verify the capture path without synthesizing host input. Then, using the production adapter and a blank or disposable target document, separately observe and record outcome/duration for:
-
-1. Command-C and Command-V.
-2. Sustained Control+Option speech in Wispr Flow.
-3. The configured clipboard-manager shortcut.
-4. Application launch.
-5. An Apple Shortcut.
-6. Horizontal scrolling.
-7. Application-appropriate zoom.
-8. Dial mode changes and restoration after restart.
-
-For latency, report runtime receipt-to-dispatch, sequence action/pause durations, and target-app response as distinct measurements. Target-app response begins when the intended action is dispatched and ends at a predefined visible result in the target app. Use only aggregate timings and outcomes; do not retain text, clipboard data, or screenshots containing personal content.
-
-## Current environment limits
-
-`Sources/DialDeckApp/main.swift` currently shows only a placeholder window. The production app does not instantiate `KeyboardHIDInputEventProducer` or `ActionRuntime`, and there is no concrete foreground, mapping, capability, or `HostActionServicing` implementation. No physical capture, user permission change, device write, target-app check, five-minute CPU window, memory-cycle run, or energy sample was performed for this candidate. Those results must remain blocked until the UI composition and production action adapters exist and a supervised keypad session is available.
+At this candidate, `Sources/DialDeckApp/main.swift` remains a placeholder. The app does not instantiate `KeyboardHIDInputEventProducer` or `ActionRuntime`, and no production foreground, mapping, capability, or host-action service is connected. Physical and target-app checks remain pending; no device writes, permission changes, or hardware measurements were made for the runtime-recovery change.

@@ -27,9 +27,14 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
         self.diagnosticHandler = diagnosticHandler
     }
 
-    func connectToUniqueTarget() async throws -> any KeyboardHIDCaptureConnection {
+    func connectToUniqueTarget(
+        focusEpochClock: FocusEpochClock
+    ) async throws -> any KeyboardHIDCaptureConnection {
         let openingTask = Task.detached(priority: .userInitiated) {
-            try Self.openCurrentTarget(diagnosticHandler: diagnosticHandler)
+            try Self.openCurrentTarget(
+                diagnosticHandler: diagnosticHandler,
+                focusEpochClock: focusEpochClock
+            )
         }
         return try await withTaskCancellationHandler {
             let connection = try await openingTask.value
@@ -44,7 +49,8 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
     }
 
     private static func openCurrentTarget(
-        diagnosticHandler: (@Sendable (KeyboardHIDCaptureDiagnostic) -> Void)?
+        diagnosticHandler: (@Sendable (KeyboardHIDCaptureDiagnostic) -> Void)?,
+        focusEpochClock: FocusEpochClock
     ) throws -> any KeyboardHIDCaptureConnection {
         guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
             throw KeyboardHIDCaptureError.permissionUnavailable
@@ -68,6 +74,7 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
             registryEntryID: currentSelection.registryEntryID,
             reportDescriptor: currentSelection.reportDescriptor,
             elementPlan: KeyboardHIDElementPlan.observedArrayControlPlan,
+            focusEpochClock: focusEpochClock,
             diagnosticHandler: diagnosticHandler
         )
         try connection.openReadOnly()
@@ -195,6 +202,7 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
     private let device: IOHIDDevice
     private let registryEntryID: UInt64
     private let reportDescriptor: Data
+    private let focusEpochClock: FocusEpochClock
     private let reportBuffer: UnsafeMutablePointer<UInt8>
     private let continuation: AsyncStream<KeyboardHIDTransportEvent>.Continuation
     private let callbackQueue: DispatchQueue
@@ -216,12 +224,14 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
         registryEntryID: UInt64,
         reportDescriptor: Data,
         elementPlan: KeyboardHIDElementPlan,
+        focusEpochClock: FocusEpochClock,
         diagnosticHandler: (@Sendable (KeyboardHIDCaptureDiagnostic) -> Void)?
     ) {
         self.device = device
         self.registryEntryID = registryEntryID
         self.reportDescriptor = reportDescriptor
         self.elementPlan = elementPlan
+        self.focusEpochClock = focusEpochClock
         self.diagnosticHandler = diagnosticHandler
         reportBuffer = .allocate(capacity: Self.inputReportBufferCapacity)
         reportBuffer.initialize(repeating: 0, count: Self.inputReportBufferCapacity)
@@ -398,12 +408,17 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
         let connection = Unmanaged<MacOSKeyboardHIDCaptureConnection>
             .fromOpaque(context)
             .takeUnretainedValue()
+        let focusEpoch = connection.focusEpochClock.snapshot()
         guard result == kIOReturnSuccess, reportType == kIOHIDReportTypeInput, reportLength >= 0 else {
             connection.yield(.disconnected)
             return
         }
         let bytes = Array(UnsafeBufferPointer(start: report, count: Int(reportLength)))
-        for value in connection.reportDecoder.consume(reportID: reportID, bytes: bytes) {
+        for value in connection.reportDecoder.consume(
+            reportID: reportID,
+            bytes: bytes,
+            focusEpoch: focusEpoch
+        ) {
             connection.yield(.value(value))
         }
     }
