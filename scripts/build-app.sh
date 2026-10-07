@@ -2,6 +2,7 @@
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+BUILD_SHA=$(git -C "$ROOT_DIR" rev-parse HEAD)
 swift build --package-path "$ROOT_DIR" --configuration debug --arch arm64 --product DialDeckApp
 BIN_DIR=$(swift build --package-path "$ROOT_DIR" --configuration debug --arch arm64 --show-bin-path)
 APP_DIR="$ROOT_DIR/.build/DialDeck.app"
@@ -27,6 +28,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>DialDeckBuildSHA</key>
+    <string>$BUILD_SHA</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
@@ -35,4 +38,4 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-printf 'Built %s\n' "$APP_DIR"
+printf 'Built DialDeck.app for commit %s\n' "$BUILD_SHA"

@@ -8,6 +8,7 @@ import ctypes
 import csv
 import math
 import os
+import plistlib
 import statistics
 import subprocess
 import sys
@@ -18,7 +19,7 @@ from typing import Callable
 
 WINDOW_SECONDS = 300
 SAMPLE_INTERVAL_SECONDS = 1
-DIALDECK_PROCESS_IDENTITY = "DialDeck.app/Contents/MacOS/DialDeck"
+DIALDECK_PROCESS_IDENTITY = "com.dialdeck.app (DialDeck.app/Contents/MacOS/DialDeckApp)"
 _proc_pidpath: Callable[..., int] | None = None
 _libproc: ctypes.CDLL | None = None
 
@@ -61,19 +62,37 @@ def process_executable_path(pid: int) -> str:
     return os.fsdecode(buffer.value)
 
 
-def verify_dialdeck_process(pid: int, path_reader: Callable[[int], str] | None = None) -> str:
+def verify_dialdeck_process(
+    pid: int,
+    candidate_sha: str,
+    path_reader: Callable[[int], str] | None = None,
+) -> str:
     reader = path_reader or process_executable_path
     try:
         executable_path = Path(reader(pid))
     except (OSError, RuntimeError, ValueError) as error:
         raise RuntimeError("DialDeck process identity could not be verified") from error
-    if tuple(executable_path.parts[-4:]) != ("DialDeck.app", "Contents", "MacOS", "DialDeck"):
+    if tuple(executable_path.parts[-4:]) != ("DialDeck.app", "Contents", "MacOS", "DialDeckApp"):
         raise RuntimeError("Selected process is not the DialDeck.app executable")
+    info_path = executable_path.parent.parent / "Info.plist"
+    try:
+        with info_path.open("rb") as bundle_info:
+            info = plistlib.load(bundle_info)
+    except (OSError, plistlib.InvalidFileException, ValueError) as error:
+        raise RuntimeError("DialDeck app bundle identity could not be verified") from error
+    if (
+        not isinstance(info, dict)
+        or info.get("CFBundleExecutable") != "DialDeckApp"
+        or info.get("CFBundleIdentifier") != "com.dialdeck.app"
+    ):
+        raise RuntimeError("Selected process does not match the DialDeck app bundle identity")
+    if info.get("DialDeckBuildSHA") != candidate_sha.lower():
+        raise RuntimeError("Selected process does not match the requested candidate SHA")
     return DIALDECK_PROCESS_IDENTITY
 
 
-def read_process_sample(pid: int) -> tuple[float, int]:
-    identity_before = verify_dialdeck_process(pid)
+def read_process_sample(pid: int, candidate_sha: str) -> tuple[float, int]:
+    identity_before = verify_dialdeck_process(pid, candidate_sha)
     result = subprocess.run(
         ["/bin/ps", "-p", str(pid), "-o", "cputime=", "-o", "rss="],
         check=False,
@@ -86,7 +105,7 @@ def read_process_sample(pid: int) -> tuple[float, int]:
     if len(fields) != 2:
         raise RuntimeError("The process sampler returned an unexpected counter format")
     cpu_seconds, rss_kib = parse_cpu_seconds(fields[0]), int(fields[1])
-    identity_after = verify_dialdeck_process(pid)
+    identity_after = verify_dialdeck_process(pid, candidate_sha)
     if identity_after != identity_before:
         raise RuntimeError("The selected process identity changed during sampling")
     return cpu_seconds, rss_kib
@@ -94,10 +113,11 @@ def read_process_sample(pid: int) -> tuple[float, int]:
 
 def collect_samples(
     pid: int,
+    candidate_sha: str,
     *,
     window_seconds: float = WINDOW_SECONDS,
     sample_interval_seconds: float = SAMPLE_INTERVAL_SECONDS,
-    read_sample: Callable[[int], tuple[float, int]] = read_process_sample,
+    read_sample: Callable[[int, str], tuple[float, int]] = read_process_sample,
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
     sleep: Callable[[float], None] = time.sleep,
 ) -> list[tuple[float, float, int]]:
@@ -106,7 +126,7 @@ def collect_samples(
     window_ns = math.ceil(window_seconds * 1_000_000_000)
     interval_ns = max(1, math.ceil(sample_interval_seconds * 1_000_000_000))
 
-    first_cpu, first_rss = read_sample(pid)
+    first_cpu, first_rss = read_sample(pid, candidate_sha)
     first_observed_ns = monotonic_ns()
     samples = [(0.0, first_cpu, first_rss)]
     interval_count = math.ceil(window_ns / interval_ns)
@@ -118,7 +138,7 @@ def collect_samples(
             if remaining_ns <= 0:
                 break
             sleep(remaining_ns / 1_000_000_000)
-        cpu_seconds, rss_kib = read_sample(pid)
+        cpu_seconds, rss_kib = read_sample(pid, candidate_sha)
         observed_ns = monotonic_ns()
         elapsed_seconds = (observed_ns - first_observed_ns) / 1_000_000_000
         samples.append((elapsed_seconds, cpu_seconds, rss_kib))
@@ -177,14 +197,14 @@ def run() -> int:
     if args.output.exists():
         parser.error("--output must not already exist")
     try:
-        process_identity = verify_dialdeck_process(args.pid)
+        process_identity = verify_dialdeck_process(args.pid, args.candidate_sha)
     except RuntimeError as error:
         parser.error(str(error))
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     logical_cpu_count = os.cpu_count() or 1
     try:
-        samples = collect_samples(args.pid)
+        samples = collect_samples(args.pid, args.candidate_sha)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"Measurement stopped: {error}", file=sys.stderr)
         return 2
