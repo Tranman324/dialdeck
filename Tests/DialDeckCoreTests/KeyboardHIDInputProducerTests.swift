@@ -78,11 +78,12 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         }
     }
 
-    func testChildSelectionFailsWhenCandidateCombinesMultipleKeyboardCollections() {
-        let candidate = childIdentity(keyboardApplicationCollectionCount: 2)
-
-        XCTAssertThrowsError(try KeyboardHIDChildSelection.uniqueEligibleIndex(in: [candidate])) { error in
-            XCTAssertEqual(error as? KeyboardHIDCaptureError, .interfaceMismatch)
+    func testChildSelectionRequiresExactlyOneKeyboardApplicationCollection() {
+        for collectionCount in [0, 2] {
+            let candidate = childIdentity(keyboardApplicationCollectionCount: collectionCount)
+            XCTAssertThrowsError(try KeyboardHIDChildSelection.uniqueEligibleIndex(in: [candidate])) { error in
+                XCTAssertEqual(error as? KeyboardHIDCaptureError, .interfaceMismatch)
+            }
         }
     }
 

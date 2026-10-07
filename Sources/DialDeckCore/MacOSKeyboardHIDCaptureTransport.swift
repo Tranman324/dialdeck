@@ -137,7 +137,10 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
             throw KeyboardHIDCaptureError.interfaceMismatch
         }
         let elements = rawElements as! [IOHIDElement]
-        let keyboardApplicationCollectionCount = keyboardApplicationCollectionCookies(in: elements).count
+        // A nil element match returns all device elements; count collection nodes directly to include empty ones.
+        let keyboardApplicationCollectionCount = Set(
+            elements.filter(isKeyboardApplicationCollection).map { UInt32(IOHIDElementGetCookie($0)) }
+        ).count
         var descriptors: [KeyboardHIDElementDescriptor] = []
 
         for element in elements where isInputElement(element) && belongsToUniqueKeyboardCollection(element) {
@@ -175,20 +178,6 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
             && IOHIDElementGetCollectionType(element) == kIOHIDElementCollectionTypeApplication
             && IOHIDElementGetUsagePage(element) == KeyboardHIDTarget.genericDesktopUsagePage
             && IOHIDElementGetUsage(element) == KeyboardHIDTarget.keyboardApplicationUsage
-    }
-
-    private static func keyboardApplicationCollectionCookies(in elements: [IOHIDElement]) -> Set<UInt32> {
-        var cookies: Set<UInt32> = []
-        for element in elements {
-            var current = IOHIDElementGetParent(element)
-            while let parent = current {
-                if isKeyboardApplicationCollection(parent) {
-                    cookies.insert(UInt32(IOHIDElementGetCookie(parent)))
-                }
-                current = IOHIDElementGetParent(parent)
-            }
-        }
-        return cookies
     }
 
     private static func belongsToUniqueKeyboardCollection(_ element: IOHIDElement) -> Bool {
