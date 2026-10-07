@@ -246,17 +246,19 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
         IOHIDDeviceSetInputValueMatchingMultiple(device, matches as CFArray)
         IOHIDDeviceSetDispatchQueue(device, callbackQueue)
 
+        guard IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
+            // No callbacks or cancel handler retain this connection's context on failure.
+            throw KeyboardHIDCaptureError.openFailed
+        }
+        isOpen = true
+
+        // Install unretained callback context only once open succeeds, and before activation.
         let context = Unmanaged.passUnretained(self).toOpaque()
         IOHIDDeviceRegisterInputValueCallback(device, Self.inputValueCallback, context)
         IOHIDDeviceRegisterRemovalCallback(device, Self.deviceRemovalCallback, context)
         IOHIDDeviceSetCancelHandler(device) { [weak self] in
             self?.finishCancellation()
         }
-
-        guard IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
-            throw KeyboardHIDCaptureError.openFailed
-        }
-        isOpen = true
         IOHIDDeviceActivate(device)
 
         permissionMonitor = Task.detached(priority: .utility) { [weak self] in
