@@ -852,17 +852,17 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         ])
     }
 
-    /// Opt-in supervised check: press and release each of six keys, rotate the
-    /// dial once counterclockwise then once clockwise, press it once, unplug/
-    /// reconnect the keypad, then press and release bottom-left once more. The
-    /// recorder stores normalized control IDs, event kinds, and signed dial
-    /// deltas, never raw HID values or text.
-    /// Read-only monitoring does not suppress normal macOS keyboard delivery;
-    /// any later supervised run must use a safe foreground context.
+    /// One supervised production-path capture. It is opt-in, non-seizing, and
+    /// the injected ActionRuntime service never synthesizes host input. Evidence
+    /// contains normalized events and lifecycle/close diagnostics, not raw HID
+    /// reports or text. macOS may still receive the keypad's ordinary F-key events.
     func testOptInPhysicalKeyboardHIDVerificationRoutesToNoOpRuntime() async throws {
         guard PhysicalVerificationHarness.isEnabled(environment: ProcessInfo.processInfo.environment) else {
             throw XCTSkip("Set DIALDECK_RUN_PHYSICAL_HID_VERIFICATION=1 for supervised physical verification.")
         }
+        let reconnectConfirmationOnly = ProcessInfo.processInfo.environment[
+            PhysicalVerificationHarness.confirmationOnlyEnvironmentKey
+        ] == "1"
 
         let actionService = PhysicalVerificationNoOpActionService()
         let profileID = ProfileID()
@@ -903,9 +903,16 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         let mapping = Dictionary(uniqueKeysWithValues: try keyTargets.map { identifier, target in
             (try XCTUnwrap(PhysicalControlID(rawValue: identifier, kind: .key)), target)
         })
-        let recorder = PhysicalVerificationEventRecorder()
+        let recorder = PhysicalVerificationEventRecorder(
+            maximumEvents: PhysicalVerificationHarness.maximumSupervisedEvents + 32
+        )
+        let diagnosticLog = PhysicalVerificationDiagnosticLog()
         let producer = PhysicalVerificationRecordingProducer(
-            base: KeyboardHIDInputEventProducer(),
+            base: KeyboardHIDInputEventProducer(
+                transport: MacOSKeyboardHIDCaptureTransport { diagnostic in
+                    diagnosticLog.record(diagnostic)
+                }
+            ),
             recorder: recorder
         )
         let runtime = ActionRuntime(
@@ -918,60 +925,157 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
             actionService: actionService
         )
 
+        let captureStartedAt = Date()
+        var captureFailure: String?
         do {
             _ = await runtime.submit(.start)
             let startupStatus = await runtime.currentStatus()
             guard case .running = startupStatus else {
                 throw PhysicalVerificationHarnessError.sessionDidNotStart(status: startupStatus)
             }
-
-            let recorded = try await PhysicalVerificationHarness.waitForReconnectSequence(
-                from: recorder,
-                timeout: .seconds(120)
-            )
-            _ = await runtime.submit(.stop)
-
-            XCTAssertEqual(recorded.events.count, PhysicalVerificationHarness.maximumEvents)
-            XCTAssertEqual(recorded.reconnectEventCount, 15)
-            for (identifier, _) in keyTargets {
-                let expectedPairs = identifier == "bottom-left" ? 2 : 1
-                XCTAssertEqual(
-                    recorded.events.filter { $0 == .init(controlID: identifier, kind: .keyDown) }.count,
-                    expectedPairs
+            try PhysicalVerificationEvidenceWriter.signalCaptureArmed()
+            if reconnectConfirmationOnly {
+                print("PHYSICAL_HID_CAPTURE_ARMED: unplug and reconnect the keypad once, then press and release bottom-left once.")
+                let completedSequence = try await PhysicalVerificationHarness.waitForReconnectConfirmation(
+                    from: recorder,
+                    timeout: .seconds(90)
                 )
-                XCTAssertEqual(
-                    recorded.events.filter { $0 == .init(controlID: identifier, kind: .keyUp) }.count,
-                    expectedPairs
+                if completedSequence.events.count != 2 || completedSequence.reconnectEventCount != 0 {
+                    captureFailure = "Timed out before the reconnect confirmation completed; observed \(completedSequence.events.count) normalized events and reconnect boundary \(completedSequence.reconnectEventCount.map(String.init) ?? "none")."
+                }
+            } else {
+                print("PHYSICAL_HID_CAPTURE_ARMED: top-left, top-right, middle-left, middle-right, bottom-left, bottom-right; knob clockwise one click, counterclockwise one click, press; hold top-left and top-right together, then release top-left and top-right one at a time; unplug/replug once; press/release bottom-left once.")
+                let completedSequence = try await PhysicalVerificationHarness.waitForSupervisedSequence(
+                    from: recorder,
+                    timeout: .seconds(240)
                 )
+                if completedSequence.events.count < PhysicalVerificationHarness.maximumSupervisedEvents
+                    || completedSequence.reconnectEventCount != 19 {
+                    captureFailure = "Timed out before the requested physical sequence completed; observed \(completedSequence.events.count) normalized events and reconnect boundary \(completedSequence.reconnectEventCount.map(String.init) ?? "none")."
+                }
             }
-            XCTAssertEqual(
-                recorded.events.filter { $0 == .init(controlID: "knob", kind: .dialPress) }.count,
-                1
-            )
-            XCTAssertEqual(
-                recorded.events.filter { $0 == .init(controlID: "knob", kind: .dialRotation(delta: -1)) }.count,
-                1
-            )
-            XCTAssertEqual(
-                recorded.events.filter { $0 == .init(controlID: "knob", kind: .dialRotation(delta: 1)) }.count,
-                1
-            )
-            XCTAssertEqual(
-                Array(recorded.events.suffix(5)),
-                [
-                    .init(controlID: "knob", kind: .dialRotation(delta: -1)),
-                    .init(controlID: "knob", kind: .dialRotation(delta: 1)),
-                    .init(controlID: "knob", kind: .dialPress),
-                    .init(controlID: "bottom-left", kind: .keyDown),
-                    .init(controlID: "bottom-left", kind: .keyUp),
-                ]
-            )
-            let serviceCalls = await actionService.callCount
-            XCTAssertEqual(serviceCalls, 0, "The injected service must not synthesize host actions.")
         } catch {
-            _ = await runtime.submit(.stop)
-            throw error
+            captureFailure = error.localizedDescription
         }
+
+        _ = await runtime.submit(.stop)
+        let captureFinishedAt = Date()
+        let recorded = await recorder.snapshot()
+        let diagnostics = diagnosticLog.snapshot()
+        let runtimeStatusAfterStop = await runtime.currentStatus()
+        let serviceCalls = await actionService.callCount
+        let expectedInitial = Set(keyTargets.flatMap { identifier, _ in
+            [
+                PhysicalVerificationRecordedEvent(controlID: identifier, kind: .keyDown),
+                PhysicalVerificationRecordedEvent(controlID: identifier, kind: .keyUp),
+            ]
+        } + [
+            .init(controlID: "knob", kind: .dialRotation(delta: -1)),
+            .init(controlID: "knob", kind: .dialRotation(delta: 1)),
+            .init(controlID: "knob", kind: .dialPress),
+        ])
+        let overlapEvents = Array(recorded.events.dropFirst(15).prefix(4))
+        let reconnectEvents = Array(recorded.events.dropFirst(19).prefix(2))
+        let expectedOverlap: [PhysicalVerificationRecordedEvent] = [
+            .init(controlID: "top-left", kind: .keyDown),
+            .init(controlID: "top-right", kind: .keyDown),
+            .init(controlID: "top-left", kind: .keyUp),
+            .init(controlID: "top-right", kind: .keyUp),
+        ]
+        let expectedReconnect: [PhysicalVerificationRecordedEvent] = [
+            .init(controlID: "bottom-left", kind: .keyDown),
+            .init(controlID: "bottom-left", kind: .keyUp),
+        ]
+        let reconnectConfirmationEvents: [PhysicalVerificationRecordedEvent] = [
+            .init(controlID: "bottom-left", kind: .keyDown),
+            .init(controlID: "bottom-left", kind: .keyUp),
+        ]
+        let managerCloseResults = diagnostics.compactMap { entry -> Int32? in
+            guard case .managerClosed(_, let result) = entry else { return nil }
+            return result
+        }
+        let deviceCloseResults = diagnostics.compactMap { entry -> Int32? in
+            guard case .deviceClosed(_, let result) = entry else { return nil }
+            return result
+        }
+        let deviceCancelCount = diagnostics.filter {
+            if case .deviceCancelIssued = $0 { return true }
+            return false
+        }.count
+        let removedDeviceIDs = diagnostics.compactMap { entry -> UInt64? in
+            guard case .deviceRemoved(let registryEntryID) = entry else { return nil }
+            return registryEntryID
+        }
+        let skippedRemovedDeviceCloseIDs = diagnostics.compactMap { entry -> UInt64? in
+            guard case .deviceCloseSkippedRemoved(let registryEntryID) = entry else { return nil }
+            return registryEntryID
+        }
+        let selectedIDs = diagnostics.compactMap { entry -> UInt64? in
+            guard case .selectedChild(let registryEntryID) = entry else { return nil }
+            return registryEntryID
+        }
+        let lifecycleGenerations = recorded.lifecycleEvents.map { event -> UInt64 in
+            switch event {
+            case .started(let generation), .stopping(let generation), .stopped(let generation):
+                generation.rawValue
+            case .failed(let generation, _):
+                generation.rawValue
+            }
+        }
+        let allOneGeneration = Set(recorded.eventGenerations + lifecycleGenerations).count == 1
+            && recorded.eventGenerations.count == recorded.events.count
+            && !lifecycleGenerations.isEmpty
+        let closeResultsAreSuccess = !managerCloseResults.isEmpty
+            && !deviceCloseResults.isEmpty
+            && managerCloseResults.allSatisfy { $0 == 0 }
+            && deviceCloseResults.allSatisfy { $0 == 0 }
+            && deviceCancelCount == deviceCloseResults.count + skippedRemovedDeviceCloseIDs.count
+            && removedDeviceIDs == skippedRemovedDeviceCloseIDs
+            && removedDeviceIDs.count == 1
+        let sequencePassed: Bool
+        if reconnectConfirmationOnly {
+            sequencePassed = recorded.events == reconnectConfirmationEvents
+                && recorded.reconnectEventCount == 0
+        } else {
+            sequencePassed = recorded.events.count == PhysicalVerificationHarness.maximumSupervisedEvents
+                && recorded.reconnectEventCount == 19
+                && Set(recorded.events.prefix(15)) == expectedInitial
+                && recorded.events.prefix(15).count == expectedInitial.count
+                && overlapEvents == expectedOverlap
+                && reconnectEvents == expectedReconnect
+        }
+        let passed = captureFailure == nil
+            && sequencePassed
+            && allOneGeneration
+            && selectedIDs.count >= 4
+            && Set(selectedIDs.prefix(2)).count == 1
+            && Set(selectedIDs.suffix(2)).count == 1
+            && closeResultsAreSuccess
+            && serviceCalls == 0
+
+        try PhysicalVerificationEvidenceWriter.write(
+            events: recorded.events,
+            eventGenerations: recorded.eventGenerations,
+            lifecycleEvents: recorded.lifecycleEvents,
+            reconnectEventCount: recorded.reconnectEventCount,
+            diagnostics: diagnostics,
+            captureStartedAt: captureStartedAt,
+            captureFinishedAt: captureFinishedAt,
+            runtimeStatusAfterStop: runtimeStatusAfterStop,
+            actionServiceCallCount: serviceCalls,
+            captureFailure: captureFailure,
+            passed: passed,
+            captureScenario: reconnectConfirmationOnly ? "short committed-SHA reconnect confirmation" : "full supervised sequence"
+        )
+
+        XCTAssertNil(captureFailure)
+        XCTAssertTrue(sequencePassed, "The recorded event sequence must match the selected supervised capture mode.")
+        XCTAssertTrue(allOneGeneration, "All normalized input and reconnect lifecycle events must keep one generation.")
+        XCTAssertGreaterThanOrEqual(selectedIDs.count, 4, "Initial and reconnect selections must be recorded.")
+        XCTAssertEqual(Set(selectedIDs.prefix(2)).count, 1, "Initial double-selection must agree.")
+        XCTAssertEqual(Set(selectedIDs.suffix(2)).count, 1, "Reconnect double-selection must agree.")
+        XCTAssertTrue(closeResultsAreSuccess, "Every manager/device close must return 0x00000000 after device cancel.")
+        XCTAssertEqual(serviceCalls, 0, "The injected service must not synthesize host actions.")
     }
 
     func testElementPlanFailsClosedForMissingOrAmbiguousInputLayouts() throws {
@@ -1439,22 +1543,33 @@ private struct PhysicalVerificationRecordedEvent: Hashable, Sendable {
 
 private struct PhysicalVerificationRecorderSnapshot: Sendable {
     let events: [PhysicalVerificationRecordedEvent]
+    let eventGenerations: [UInt64]
+    let lifecycleEvents: [SessionLifecycleEvent]
     /// Number of normalized input summaries observed before the reconnect start.
     let reconnectEventCount: Int?
 }
 
 private actor PhysicalVerificationEventRecorder {
+    private let maximumEvents: Int
     private(set) var events: [PhysicalVerificationRecordedEvent] = []
+    private(set) var eventGenerations: [UInt64] = []
+    private(set) var lifecycleEvents: [SessionLifecycleEvent] = []
     private var startCount = 0
     private var stoppingSeenSinceStart = false
     private var reconnectEventCount: Int?
 
-    func record(_ event: PhysicalVerificationRecordedEvent) {
-        guard events.count < PhysicalVerificationHarness.maximumEvents else { return }
+    init(maximumEvents: Int = PhysicalVerificationHarness.maximumEvents) {
+        self.maximumEvents = maximumEvents
+    }
+
+    func record(_ event: PhysicalVerificationRecordedEvent, generation: UInt64) {
+        guard events.count < maximumEvents else { return }
         events.append(event)
+        eventGenerations.append(generation)
     }
 
     func recordLifecycle(_ event: SessionLifecycleEvent) {
+        lifecycleEvents.append(event)
         switch event {
         case .started:
             if startCount > 0, stoppingSeenSinceStart, reconnectEventCount == nil {
@@ -1470,7 +1585,12 @@ private actor PhysicalVerificationEventRecorder {
     }
 
     func snapshot() -> PhysicalVerificationRecorderSnapshot {
-        PhysicalVerificationRecorderSnapshot(events: events, reconnectEventCount: reconnectEventCount)
+        PhysicalVerificationRecorderSnapshot(
+            events: events,
+            eventGenerations: eventGenerations,
+            lifecycleEvents: lifecycleEvents,
+            reconnectEventCount: reconnectEventCount
+        )
     }
 }
 
@@ -1508,7 +1628,10 @@ private actor PhysicalVerificationRecordingConsumer: NormalizedInputConsumer {
         case .keyUp: kind = .keyUp
         case .dialRotation(let delta): kind = .dialRotation(delta: delta)
         }
-        await recorder.record(.init(controlID: event.control.rawValue, kind: kind))
+        await recorder.record(
+            .init(controlID: event.control.rawValue, kind: kind),
+            generation: event.generation.rawValue
+        )
         await downstream.consume(event)
     }
 
@@ -1521,7 +1644,10 @@ private actor PhysicalVerificationRecordingConsumer: NormalizedInputConsumer {
         control: PhysicalControlID,
         generation: SessionGeneration
     ) async -> ActionExecutionResult {
-        await recorder.record(.init(controlID: control.rawValue, kind: .dialPress))
+        await recorder.record(
+            .init(controlID: control.rawValue, kind: .dialPress),
+            generation: generation.rawValue
+        )
         return await downstream.dialPressed(control: control, generation: generation)
     }
 }
@@ -1568,13 +1694,15 @@ private actor PhysicalVerificationNoOpActionService: HostActionServicing {
 
 private enum PhysicalVerificationHarness {
     static let environmentKey = "DIALDECK_RUN_PHYSICAL_HID_VERIFICATION"
+    static let confirmationOnlyEnvironmentKey = "DIALDECK_PHYSICAL_HID_CONFIRMATION_ONLY"
     static let maximumEvents = 17
+    static let maximumSupervisedEvents = 21
 
     static func isEnabled(environment: [String: String]) -> Bool {
         environment[environmentKey] == "1"
     }
 
-    static func waitForReconnectSequence(
+    static func waitForSupervisedSequence(
         from recorder: PhysicalVerificationEventRecorder,
         timeout: Duration
     ) async throws -> PhysicalVerificationRecorderSnapshot {
@@ -1583,13 +1711,191 @@ private enum PhysicalVerificationHarness {
         while true {
             try Task.checkCancellation()
             let snapshot = await recorder.snapshot()
-            if snapshot.events.count >= maximumEvents, snapshot.reconnectEventCount != nil {
+            if snapshot.events.count >= maximumSupervisedEvents,
+               snapshot.reconnectEventCount == 19 {
                 return snapshot
             }
             let now = clock.now
             guard now < deadline else { return snapshot }
             try await Task.sleep(for: min(.milliseconds(50), now.duration(to: deadline)))
         }
+    }
+
+    static func waitForReconnectConfirmation(
+        from recorder: PhysicalVerificationEventRecorder,
+        timeout: Duration
+    ) async throws -> PhysicalVerificationRecorderSnapshot {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while true {
+            try Task.checkCancellation()
+            let snapshot = await recorder.snapshot()
+            if let reconnectEventCount = snapshot.reconnectEventCount,
+               snapshot.events.count >= reconnectEventCount + 2 {
+                return snapshot
+            }
+            let now = clock.now
+            guard now < deadline else { return snapshot }
+            try await Task.sleep(for: min(.milliseconds(50), now.duration(to: deadline)))
+        }
+    }
+}
+
+private final class PhysicalVerificationDiagnosticLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [KeyboardHIDCaptureDiagnostic] = []
+
+    func record(_ diagnostic: KeyboardHIDCaptureDiagnostic) {
+        lock.lock()
+        entries.append(diagnostic)
+        lock.unlock()
+    }
+
+    func snapshot() -> [KeyboardHIDCaptureDiagnostic] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
+    }
+}
+
+private enum PhysicalVerificationEvidenceWriter {
+    static let pathEnvironmentKey = "DIALDECK_PHYSICAL_HID_EVIDENCE_PATH"
+    static let readyPathEnvironmentKey = "DIALDECK_PHYSICAL_HID_READY_PATH"
+
+    static func signalCaptureArmed() throws {
+        guard let path = ProcessInfo.processInfo.environment[readyPathEnvironmentKey] else { return }
+        let url = URL(fileURLWithPath: path)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("capture armed\n".utf8).write(to: url, options: .atomic)
+    }
+
+    static func write(
+        events: [PhysicalVerificationRecordedEvent],
+        eventGenerations: [UInt64],
+        lifecycleEvents: [SessionLifecycleEvent],
+        reconnectEventCount: Int?,
+        diagnostics: [KeyboardHIDCaptureDiagnostic],
+        captureStartedAt: Date,
+        captureFinishedAt: Date,
+        runtimeStatusAfterStop: RuntimeStatus,
+        actionServiceCallCount: Int,
+        captureFailure: String?,
+        passed: Bool,
+        captureScenario: String
+    ) throws {
+        let environment = ProcessInfo.processInfo.environment
+        let output = environment[pathEnvironmentKey]
+            ?? ".apm/evidence/hardware/hid-production-capture-2026-10-07.md"
+        let currentDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let url = URL(fileURLWithPath: output, relativeTo: currentDirectory).standardizedFileURL
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        let selectedIDs = diagnostics.compactMap { entry -> UInt64? in
+            guard case .selectedChild(let registryEntryID) = entry else { return nil }
+            return registryEntryID
+        }
+        let managerCloseCount = diagnostics.filter {
+            if case .managerClosed = $0 { return true }
+            return false
+        }.count
+        let deviceCloseCount = diagnostics.filter {
+            if case .deviceClosed = $0 { return true }
+            return false
+        }.count
+        let deviceCloseSkippedCount = diagnostics.filter {
+            if case .deviceCloseSkippedRemoved = $0 { return true }
+            return false
+        }.count
+        let candidateSHA = environment["DIALDECK_CANDIDATE_SHA"] ?? "not supplied"
+        var lines = [
+            "# Supervised production HID capture",
+            "",
+            "- Candidate source revision: `\(candidateSHA)`",
+            "- Capture scenario: \(captureScenario)",
+            "- Diagnostics are collected by the opt-in test harness through an injected observer; the production default has no diagnostic output.",
+            "- Result: **\(passed ? "PASS" : "FAIL")**",
+            "- Started: `\(timestamp(captureStartedAt))`",
+            "- Finished: `\(timestamp(captureFinishedAt))`",
+            "- Selected registryEntryID values: `\(selectedIDs.map(String.init).joined(separator: ", "))`",
+            "- Reconnect boundary: `\(reconnectEventCount.map(String.init) ?? "not observed")` normalized events before the reconnect start",
+            "- Normalized event count: `\(events.count)`",
+            "- Action service calls: `\(actionServiceCallCount)` (expected 0)",
+            "- Runtime status after stop: `\(String(describing: runtimeStatusAfterStop))`",
+            "- Close calls recorded: `\(managerCloseCount)` manager, `\(deviceCloseCount)` device",
+            "- Removed-device close skips: `\(deviceCloseSkippedCount)` (service had already been removed)",
+            "",
+            "## Normalized events",
+            "",
+        ]
+        for (index, event) in events.enumerated() {
+            let generation = index < eventGenerations.count ? String(eventGenerations[index]) : "missing"
+            lines.append("\(index + 1). `\(event.controlID)` — `\(eventKind(event.kind))` — generation `\(generation)`")
+        }
+        lines.append(contentsOf: ["", "## Session lifecycle", ""])
+        for (index, event) in lifecycleEvents.enumerated() {
+            lines.append("\(index + 1). `\(lifecycleDescription(event))`")
+        }
+        lines.append(contentsOf: ["", "## HID manager and device teardown", ""])
+        for (index, diagnostic) in diagnostics.enumerated() {
+            lines.append("\(index + 1). `\(diagnosticDescription(diagnostic))`")
+        }
+        if let captureFailure {
+            lines.append(contentsOf: ["", "## Capture failure", "", captureFailure])
+        }
+        lines.append("")
+
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        print("PHYSICAL_HID_EVIDENCE_WRITTEN=\(url.path)")
+    }
+
+    private static func timestamp(_ date: Date) -> String {
+        ISO8601DateFormatter().string(from: date)
+    }
+
+    private static func eventKind(_ kind: PhysicalVerificationEventKind) -> String {
+        switch kind {
+        case .keyDown: "keyDown"
+        case .keyUp: "keyUp"
+        case .dialRotation(let delta): "dialRotation(\(delta))"
+        case .dialPress: "dialPress"
+        }
+    }
+
+    private static func lifecycleDescription(_ event: SessionLifecycleEvent) -> String {
+        switch event {
+        case .started(let generation): "started generation \(generation.rawValue)"
+        case .stopping(let generation): "stopping generation \(generation.rawValue)"
+        case .stopped(let generation): "stopped generation \(generation.rawValue)"
+        case .failed(let generation, let reason): "failed generation \(generation.rawValue): \(reason)"
+        }
+    }
+
+    private static func diagnosticDescription(_ diagnostic: KeyboardHIDCaptureDiagnostic) -> String {
+        switch diagnostic {
+        case .selectedChild(let registryEntryID):
+            return "selected registryEntryID=\(registryEntryID)"
+        case .managerClosed(let selectedRegistryEntryID, let result):
+            let target = selectedRegistryEntryID.map(String.init) ?? "unavailable"
+            return "IOHIDManagerClose selectedRegistryEntryID=\(target) IOReturn=\(formatIOReturn(result))"
+        case .deviceRemoved(let registryEntryID):
+            return "device removal callback registryEntryID=\(registryEntryID)"
+        case .deviceCancelIssued(let registryEntryID):
+            return "IOHIDDeviceCancel registryEntryID=\(registryEntryID)"
+        case .deviceClosed(let registryEntryID, let result):
+            return "IOHIDDeviceClose registryEntryID=\(registryEntryID) IOReturn=\(formatIOReturn(result))"
+        case .deviceCloseSkippedRemoved(let registryEntryID):
+            return "IOHIDDeviceClose skipped registryEntryID=\(registryEntryID): removed service"
+        }
+    }
+
+    private static func formatIOReturn(_ result: Int32) -> String {
+        String(format: "0x%08X", UInt32(bitPattern: result))
     }
 }
 

@@ -9,10 +9,27 @@ private struct SelectedKeyboardCollection {
     let reportDescriptor: Data
 }
 
+enum KeyboardHIDCaptureDiagnostic: Sendable {
+    case selectedChild(registryEntryID: UInt64)
+    case managerClosed(selectedRegistryEntryID: UInt64?, result: Int32)
+    case deviceRemoved(registryEntryID: UInt64)
+    case deviceCancelIssued(registryEntryID: UInt64)
+    case deviceClosed(registryEntryID: UInt64, result: Int32)
+    case deviceCloseSkippedRemoved(registryEntryID: UInt64)
+}
+
 struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
+    private let diagnosticHandler: (@Sendable (KeyboardHIDCaptureDiagnostic) -> Void)?
+
+    init(
+        diagnosticHandler: (@Sendable (KeyboardHIDCaptureDiagnostic) -> Void)? = nil
+    ) {
+        self.diagnosticHandler = diagnosticHandler
+    }
+
     func connectToUniqueTarget() async throws -> any KeyboardHIDCaptureConnection {
         let openingTask = Task.detached(priority: .userInitiated) {
-            try Self.openCurrentTarget()
+            try Self.openCurrentTarget(diagnosticHandler: diagnosticHandler)
         }
         return try await withTaskCancellationHandler {
             let connection = try await openingTask.value
@@ -26,14 +43,16 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
         }
     }
 
-    private static func openCurrentTarget() throws -> any KeyboardHIDCaptureConnection {
+    private static func openCurrentTarget(
+        diagnosticHandler: (@Sendable (KeyboardHIDCaptureDiagnostic) -> Void)?
+    ) throws -> any KeyboardHIDCaptureConnection {
         guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
             throw KeyboardHIDCaptureError.permissionUnavailable
         }
 
-        let firstSelection = try selectCurrentTarget()
+        let firstSelection = try selectCurrentTarget(diagnosticHandler: diagnosticHandler)
         try Task.checkCancellation()
-        let currentSelection = try selectCurrentTarget()
+        let currentSelection = try selectCurrentTarget(diagnosticHandler: diagnosticHandler)
         try Task.checkCancellation()
         guard firstSelection.registryEntryID == currentSelection.registryEntryID,
               firstSelection.reportDescriptor == currentSelection.reportDescriptor else {
@@ -48,7 +67,8 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
             device: currentSelection.device,
             registryEntryID: currentSelection.registryEntryID,
             reportDescriptor: currentSelection.reportDescriptor,
-            elementPlan: KeyboardHIDElementPlan.observedArrayControlPlan
+            elementPlan: KeyboardHIDElementPlan.observedArrayControlPlan,
+            diagnosticHandler: diagnosticHandler
         )
         try connection.openReadOnly()
         return connection
@@ -57,7 +77,9 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
     /// Selects only the target child whose complete ReportDescriptor matches
     /// the captured keyboard-array descriptor. The manager is non-seizing and
     /// is closed before the selected device is opened directly.
-    private static func selectCurrentTarget() throws -> SelectedKeyboardCollection {
+    private static func selectCurrentTarget(
+        diagnosticHandler: (@Sendable (KeyboardHIDCaptureDiagnostic) -> Void)?
+    ) throws -> SelectedKeyboardCollection {
         guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
             throw KeyboardHIDCaptureError.permissionUnavailable
         }
@@ -81,13 +103,19 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
             selected = try selectMatchingKeyboardChild(from: manager)
         } catch {
             let closeResult = IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+            diagnosticHandler?(.managerClosed(selectedRegistryEntryID: nil, result: Int32(closeResult)))
             guard closeResult == kIOReturnSuccess else {
                 throw KeyboardHIDCaptureError.managerCloseFailed(Int32(closeResult))
             }
             throw error
         }
 
+        diagnosticHandler?(.selectedChild(registryEntryID: selected.registryEntryID))
         let closeResult = IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        diagnosticHandler?(.managerClosed(
+            selectedRegistryEntryID: selected.registryEntryID,
+            result: Int32(closeResult)
+        ))
         guard closeResult == kIOReturnSuccess else {
             throw KeyboardHIDCaptureError.managerCloseFailed(Int32(closeResult))
         }
@@ -112,11 +140,12 @@ struct MacOSKeyboardHIDCaptureTransport: KeyboardHIDCaptureTransport, Sendable {
         guard let descriptor = descriptors[selectedIndex] else {
             throw KeyboardHIDCaptureError.interfaceMismatch
         }
-        return SelectedKeyboardCollection(
+        let selection = SelectedKeyboardCollection(
             device: device,
             registryEntryID: try registryID(for: device),
             reportDescriptor: descriptor
         )
+        return selection
     }
 
     private static func isTargetKeyboard(_ device: IOHIDDevice) -> Bool {
@@ -169,9 +198,11 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
     private let reportBuffer: UnsafeMutablePointer<UInt8>
     private let continuation: AsyncStream<KeyboardHIDTransportEvent>.Continuation
     private let callbackQueue: DispatchQueue
+    private let diagnosticHandler: (@Sendable (KeyboardHIDCaptureDiagnostic) -> Void)?
     private let lock = NSLock()
     private var reportDecoder = KeyboardHIDRawReportDecoder()
     private var hasOpenHandle = false
+    private var deviceWasRemoved = false
     private var isClosing = false
     private var cancellationHandlerFinished = false
     private var cancellationFinished = false
@@ -184,12 +215,14 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
         device: IOHIDDevice,
         registryEntryID: UInt64,
         reportDescriptor: Data,
-        elementPlan: KeyboardHIDElementPlan
+        elementPlan: KeyboardHIDElementPlan,
+        diagnosticHandler: (@Sendable (KeyboardHIDCaptureDiagnostic) -> Void)?
     ) {
         self.device = device
         self.registryEntryID = registryEntryID
         self.reportDescriptor = reportDescriptor
         self.elementPlan = elementPlan
+        self.diagnosticHandler = diagnosticHandler
         reportBuffer = .allocate(capacity: Self.inputReportBufferCapacity)
         reportBuffer.initialize(repeating: 0, count: Self.inputReportBufferCapacity)
         callbackQueue = DispatchQueue(label: "DialDeck.keyboardHIDCapture")
@@ -271,12 +304,27 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
 
         switch action {
         case .begin:
+            diagnosticHandler?(.deviceCancelIssued(registryEntryID: registryEntryID))
             IOHIDDeviceCancel(device)
             await waitForCancellationHandler()
-            let closeResult = IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
-            let closeError = closeResult == kIOReturnSuccess
-                ? nil
-                : KeyboardHIDCaptureError.deviceCloseFailed(Int32(closeResult))
+            let wasRemoved = lock.withLock { deviceWasRemoved }
+            let closeError: KeyboardHIDCaptureError?
+            if wasRemoved {
+                // Removal terminates the service-side link. Closing that retired
+                // IOHIDDevice can return kIOReturnBadArgument; cancellation and
+                // its handler are the cleanup boundary for the removed object.
+                diagnosticHandler?(.deviceCloseSkippedRemoved(registryEntryID: registryEntryID))
+                closeError = nil
+            } else {
+                let closeResult = IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+                diagnosticHandler?(.deviceClosed(
+                    registryEntryID: registryEntryID,
+                    result: Int32(closeResult)
+                ))
+                closeError = closeResult == kIOReturnSuccess
+                    ? nil
+                    : KeyboardHIDCaptureError.deviceCloseFailed(Int32(closeResult))
+            }
             finishCancellation(with: closeError)
         case .wait:
             await waitForCancellation()
@@ -365,7 +413,18 @@ private final class MacOSKeyboardHIDCaptureConnection: KeyboardHIDCaptureConnect
         let connection = Unmanaged<MacOSKeyboardHIDCaptureConnection>
             .fromOpaque(context)
             .takeUnretainedValue()
-        connection.yield(.disconnected)
+        connection.deviceWasRemovedFromRegistry()
+    }
+
+    private func deviceWasRemovedFromRegistry() {
+        let firstNotification = lock.withLock { () -> Bool in
+            guard !deviceWasRemoved else { return false }
+            deviceWasRemoved = true
+            return true
+        }
+        guard firstNotification else { return }
+        diagnosticHandler?(.deviceRemoved(registryEntryID: registryEntryID))
+        yield(.disconnected)
     }
 
     private static func registryEntryID(for device: IOHIDDevice) -> UInt64? {
