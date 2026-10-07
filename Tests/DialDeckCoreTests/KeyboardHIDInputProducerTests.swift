@@ -579,14 +579,20 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         let generation = SessionGeneration(91)
         let key = try XCTUnwrap(PhysicalControlID(rawValue: "bottom-left", kind: .key))
         let dial = try XCTUnwrap(PhysicalControlID(rawValue: "knob", kind: .dial))
-        let replayEvents = try (0..<20).map { _ in
-            try XCTUnwrap(NormalizedInputEvent.keyDown(control: key, generation: generation))
-        }
+        let keyDown = try XCTUnwrap(NormalizedInputEvent.keyDown(control: key, generation: generation))
+        let keyUp = try XCTUnwrap(NormalizedInputEvent.keyUp(control: key, generation: generation))
+        let rotation = try XCTUnwrap(NormalizedInputEvent.dialRotation(
+            control: dial,
+            delta: 7,
+            generation: generation
+        ))
+        let replayEvents = Array(repeating: keyDown, count: 16) + [keyUp, rotation]
         let downstream = RecordingInputConsumer()
         let recorder = PhysicalVerificationEventRecorder()
         let producer = PhysicalVerificationRecordingProducer(
             base: PhysicalVerificationReplayProducer(
                 events: replayEvents,
+                reconnectAfterEventCount: 16,
                 dialPress: dial
             ),
             recorder: recorder
@@ -597,21 +603,33 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
         let forwarded = await downstream.snapshot()
         await session.cancel()
 
-        XCTAssertEqual(recorded.count, PhysicalVerificationHarness.maximumEvents)
+        XCTAssertEqual(recorded.events.count, PhysicalVerificationHarness.maximumEvents)
+        XCTAssertEqual(recorded.reconnectEventCount, 16)
         XCTAssertEqual(
-            Set(recorded),
-            [PhysicalVerificationRecordedEvent(controlID: "bottom-left", kind: .keyDown)]
+            Set(recorded.events),
+            [
+                PhysicalVerificationRecordedEvent(controlID: "bottom-left", kind: .keyDown),
+                PhysicalVerificationRecordedEvent(controlID: "bottom-left", kind: .keyUp),
+                PhysicalVerificationRecordedEvent(controlID: "knob", kind: .dialRotation),
+            ]
         )
         XCTAssertEqual(forwarded.events, replayEvents)
         XCTAssertEqual(forwarded.dialPresses.count, 1)
         XCTAssertEqual(forwarded.dialPresses.first?.0, dial)
         XCTAssertEqual(forwarded.dialPresses.first?.1, generation)
-        XCTAssertEqual(forwarded.lifecycle, [.started(generation)])
+        XCTAssertEqual(forwarded.lifecycle, [
+            .started(generation),
+            .stopping(generation),
+            .started(generation),
+        ])
     }
 
     /// Opt-in supervised check: press and release each of six keys, press the
-    /// dial once, then rotate it three detents. The recorder stores only
+    /// dial once, rotate it three detents, unplug/reconnect the keypad, then
+    /// press and release bottom-left once more. The recorder stores only
     /// normalized control IDs and event kinds, never report values or direction.
+    /// Read-only monitoring does not suppress normal macOS keyboard delivery;
+    /// any later supervised run must use a safe foreground context.
     func testOptInPhysicalKeyboardHIDVerificationRoutesToNoOpRuntime() async throws {
         guard PhysicalVerificationHarness.isEnabled(environment: ProcessInfo.processInfo.environment) else {
             throw XCTSkip("Set DIALDECK_RUN_PHYSICAL_HID_VERIFICATION=1 for supervised physical verification.")
@@ -677,24 +695,42 @@ final class KeyboardHIDInputProducerTests: XCTestCase {
                 throw PhysicalVerificationHarnessError.sessionDidNotStart
             }
 
-            let recorded = try await PhysicalVerificationHarness.waitForMaximumEvents(
+            let recorded = try await PhysicalVerificationHarness.waitForReconnectSequence(
                 from: recorder,
                 timeout: .seconds(120)
             )
             _ = await runtime.submit(.stop)
 
-            XCTAssertEqual(recorded.count, PhysicalVerificationHarness.maximumEvents)
+            XCTAssertEqual(recorded.events.count, PhysicalVerificationHarness.maximumEvents)
+            XCTAssertEqual(recorded.reconnectEventCount, 16)
             for (identifier, _) in keyTargets {
-                XCTAssertTrue(recorded.contains(.init(controlID: identifier, kind: .keyDown)))
-                XCTAssertTrue(recorded.contains(.init(controlID: identifier, kind: .keyUp)))
+                let expectedPairs = identifier == "bottom-left" ? 2 : 1
+                XCTAssertEqual(
+                    recorded.events.filter { $0 == .init(controlID: identifier, kind: .keyDown) }.count,
+                    expectedPairs
+                )
+                XCTAssertEqual(
+                    recorded.events.filter { $0 == .init(controlID: identifier, kind: .keyUp) }.count,
+                    expectedPairs
+                )
             }
-            XCTAssertTrue(recorded.contains(.init(controlID: "knob", kind: .dialPress)))
             XCTAssertEqual(
-                recorded.filter { $0 == .init(controlID: "knob", kind: .dialRotation) }.count,
+                recorded.events.filter { $0 == .init(controlID: "knob", kind: .dialPress) }.count,
+                1
+            )
+            XCTAssertEqual(
+                recorded.events.filter { $0 == .init(controlID: "knob", kind: .dialRotation) }.count,
                 3
             )
+            XCTAssertEqual(
+                Array(recorded.events.suffix(2)),
+                [
+                    .init(controlID: "bottom-left", kind: .keyDown),
+                    .init(controlID: "bottom-left", kind: .keyUp),
+                ]
+            )
             let serviceCalls = await actionService.callCount
-            XCTAssertEqual(serviceCalls, 0, "The no-op service must never synthesize host input.")
+            XCTAssertEqual(serviceCalls, 0, "The injected service must not synthesize host actions.")
         } catch {
             _ = await runtime.submit(.stop)
             throw error
@@ -1145,16 +1181,41 @@ private struct PhysicalVerificationRecordedEvent: Hashable, Sendable {
     let kind: PhysicalVerificationEventKind
 }
 
+private struct PhysicalVerificationRecorderSnapshot: Sendable {
+    let events: [PhysicalVerificationRecordedEvent]
+    /// Number of normalized input summaries observed before the reconnect start.
+    let reconnectEventCount: Int?
+}
+
 private actor PhysicalVerificationEventRecorder {
     private(set) var events: [PhysicalVerificationRecordedEvent] = []
+    private var startCount = 0
+    private var stoppingSeenSinceStart = false
+    private var reconnectEventCount: Int?
 
     func record(_ event: PhysicalVerificationRecordedEvent) {
         guard events.count < PhysicalVerificationHarness.maximumEvents else { return }
         events.append(event)
     }
 
-    func eventCount() -> Int { events.count }
-    func snapshot() -> [PhysicalVerificationRecordedEvent] { events }
+    func recordLifecycle(_ event: SessionLifecycleEvent) {
+        switch event {
+        case .started:
+            if startCount > 0, stoppingSeenSinceStart, reconnectEventCount == nil {
+                reconnectEventCount = events.count
+            }
+            startCount += 1
+            stoppingSeenSinceStart = false
+        case .stopping:
+            stoppingSeenSinceStart = true
+        case .stopped, .failed:
+            stoppingSeenSinceStart = false
+        }
+    }
+
+    func snapshot() -> PhysicalVerificationRecorderSnapshot {
+        PhysicalVerificationRecorderSnapshot(events: events, reconnectEventCount: reconnectEventCount)
+    }
 }
 
 private struct PhysicalVerificationRecordingProducer: InputEventProducing {
@@ -1196,6 +1257,7 @@ private actor PhysicalVerificationRecordingConsumer: NormalizedInputConsumer {
     }
 
     func sessionLifecycleChanged(_ event: SessionLifecycleEvent) async {
+        await recorder.recordLifecycle(event)
         await downstream.sessionLifecycleChanged(event)
     }
 
@@ -1210,6 +1272,7 @@ private actor PhysicalVerificationRecordingConsumer: NormalizedInputConsumer {
 
 private struct PhysicalVerificationReplayProducer: InputEventProducing {
     let events: [NormalizedInputEvent]
+    let reconnectAfterEventCount: Int?
     let dialPress: PhysicalControlID
 
     func start(
@@ -1217,7 +1280,13 @@ private struct PhysicalVerificationReplayProducer: InputEventProducing {
         consumer: any NormalizedInputConsumer
     ) async throws -> any InputSessionHandle {
         await consumer.sessionLifecycleChanged(.started(generation))
-        for event in events { await consumer.consume(event) }
+        for (index, event) in events.enumerated() {
+            await consumer.consume(event)
+            if let reconnectAfterEventCount, index + 1 == reconnectAfterEventCount {
+                await consumer.sessionLifecycleChanged(.stopping(generation))
+                await consumer.sessionLifecycleChanged(.started(generation))
+            }
+        }
         _ = await consumer.dialPressed(control: dialPress, generation: generation)
         return PhysicalVerificationReplaySession(generation: generation)
     }
@@ -1244,25 +1313,28 @@ private actor PhysicalVerificationNoOpActionService: HostActionServicing {
 
 private enum PhysicalVerificationHarness {
     static let environmentKey = "DIALDECK_RUN_PHYSICAL_HID_VERIFICATION"
-    static let maximumEvents = 16
+    static let maximumEvents = 18
 
     static func isEnabled(environment: [String: String]) -> Bool {
         environment[environmentKey] == "1"
     }
 
-    static func waitForMaximumEvents(
+    static func waitForReconnectSequence(
         from recorder: PhysicalVerificationEventRecorder,
         timeout: Duration
-    ) async throws -> [PhysicalVerificationRecordedEvent] {
+    ) async throws -> PhysicalVerificationRecorderSnapshot {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
-        while await recorder.eventCount() < maximumEvents {
+        while true {
             try Task.checkCancellation()
+            let snapshot = await recorder.snapshot()
+            if snapshot.events.count >= maximumEvents, snapshot.reconnectEventCount != nil {
+                return snapshot
+            }
             let now = clock.now
-            guard now < deadline else { break }
+            guard now < deadline else { return snapshot }
             try await Task.sleep(for: min(.milliseconds(50), now.duration(to: deadline)))
         }
-        return await recorder.snapshot()
     }
 }
 
