@@ -125,6 +125,7 @@ public final class RuntimeMeasurementRecorder: @unchecked Sendable {
     private let capacity: Int
     private var samples: [RuntimeTimingSample] = []
     private var droppedSampleCount = 0
+    private var receivedEventCount = 0
 
     public init(capacity: Int = 4_096) {
         self.capacity = max(1, capacity)
@@ -133,6 +134,18 @@ public final class RuntimeMeasurementRecorder: @unchecked Sendable {
     public func snapshot() -> RuntimeTimingSnapshot {
         lock.withLock {
             RuntimeTimingSnapshot(samples: samples, droppedSampleCount: droppedSampleCount)
+        }
+    }
+
+    /// Aggregate count of input events observed by the runtime since creation.
+    /// It stores no per-event identifiers or input values.
+    public var eventReceiptCount: Int {
+        lock.withLock { receivedEventCount }
+    }
+
+    func recordEventReceipt() {
+        lock.withLock {
+            if receivedEventCount < Int.max { receivedEventCount += 1 }
         }
     }
 

@@ -712,6 +712,7 @@ public actor ActionRuntime: NormalizedInputConsumer, RuntimeCommandHandling, Run
         inputClass: RuntimeInputClass
     ) -> RuntimeDispatchObservation? {
         guard let measurementRecorder else { return nil }
+        measurementRecorder.recordEventReceipt()
         return RuntimeDispatchObservation(
             recorder: measurementRecorder,
             receivedAt: receivedAt,

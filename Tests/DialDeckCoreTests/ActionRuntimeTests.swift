@@ -1871,10 +1871,9 @@ final class ActionRuntimeTests: XCTestCase {
             appButton: .inherit,
             clockwiseAction: .sequence(sequence)
         )
-        func runWorkload(
-            spaced: Bool
-        ) async throws -> (RuntimeTimingSnapshot, RuntimeMeasurementRecorder, RecordingActionService) {
-            let service = RecordingActionService()
+        func makeRuntimeForWorkload(
+            service: any HostActionServicing
+        ) async throws -> (ActionRuntime, ManualInputProducer, RuntimeMeasurementRecorder, NormalizedInputEvent) {
             let input = ManualInputProducer()
             let metrics = RuntimeMeasurementRecorder(capacity: 1_024)
             let runtime = try await makeRuntime(
@@ -1890,10 +1889,42 @@ final class ActionRuntimeTests: XCTestCase {
             let generation = try XCTUnwrap(generationValue)
             let dial = try XCTUnwrap(PhysicalControlID(rawValue: "fixture-dial", kind: .dial))
             let event = try XCTUnwrap(NormalizedInputEvent.dialRotation(control: dial, delta: 1, generation: generation))
+            return (runtime, input, metrics, event)
+        }
+        func runNormalWorkload() async throws -> (RuntimeTimingSnapshot, RuntimeMeasurementRecorder, any HostActionServicing) {
+            let service = RecordingActionService()
+            let (runtime, input, metrics, event) = try await makeRuntimeForWorkload(service: service)
             for index in 0..<50 {
                 await input.emit(event)
-                if spaced && index < 49 { try await Task.sleep(for: .milliseconds(10)) }
+                if index < 49 { try await Task.sleep(for: .milliseconds(10)) }
             }
+            let snapshot = metrics.snapshot()
+            _ = await runtime.submit(.stop)
+            return (snapshot, metrics, service)
+        }
+        func runBurstWorkload() async throws -> (RuntimeTimingSnapshot, RuntimeMeasurementRecorder, any HostActionServicing) {
+            let service = FirstCallBarrierActionService()
+            let (runtime, input, metrics, event) = try await makeRuntimeForWorkload(service: service)
+            var deliveries: [Task<Void, Never>] = [await input.enqueue(event)]
+            let firstActionReachedBarrier = await service.waitUntilFirstCallEntered()
+            XCTAssertTrue(firstActionReachedBarrier, "First event must be suspended in its service call")
+
+            for _ in 1..<50 {
+                deliveries.append(await input.enqueue(event))
+            }
+            let receiptDeadline = ContinuousClock.now + .seconds(3)
+            while metrics.eventReceiptCount < 50 && ContinuousClock.now < receiptDeadline {
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            XCTAssertEqual(metrics.eventReceiptCount, 50, "All burst events must enter the runtime while the first action is suspended")
+            XCTAssertEqual(
+                metrics.snapshot().percentiles(for: .receiptToDispatch, inputClass: .dialRotation).count,
+                1,
+                "The remaining events must still be queued before releasing the first action"
+            )
+
+            await service.releaseFirstCall()
+            for delivery in deliveries { await delivery.value }
             let snapshot = metrics.snapshot()
             _ = await runtime.submit(.stop)
             return (snapshot, metrics, service)
@@ -1918,8 +1949,8 @@ final class ActionRuntimeTests: XCTestCase {
                 "max=\(Double(sequencePauses.maximumNanoseconds) / 1_000_000)"
         }
 
-        let normal = try await runWorkload(spaced: true)
-        let burst = try await runWorkload(spaced: false)
+        let normal = try await runNormalWorkload()
+        let burst = try await runBurstWorkload()
         for snapshot in [normal.0, burst.0] {
             let dispatch = snapshot.percentiles(for: .receiptToDispatch, inputClass: .dialRotation)
             let adapter = snapshot.percentiles(for: .serviceCall, inputClass: .dialRotation)
@@ -1967,7 +1998,7 @@ final class ActionRuntimeTests: XCTestCase {
 
     private func makeRuntime(
         configuration: Configuration,
-        service: RecordingActionService,
+        service: any HostActionServicing,
         foreground: any ForegroundApplicationProviding,
         input: ManualInputProducer,
         mapping: [PhysicalControlID: ActionAssignmentTarget],
@@ -2132,6 +2163,27 @@ private actor RecordingActionService: HostActionServicing {
         intents.append(intent)
         timestamps.append(.now)
         return result
+    }
+}
+
+private actor FirstCallBarrierActionService: HostActionServicing {
+    private let gate = CancellationGate()
+    private var didBlockFirstCall = false
+
+    func waitUntilFirstCallEntered() async -> Bool {
+        await gate.waitUntilEntered()
+    }
+
+    func releaseFirstCall() async {
+        await gate.release()
+    }
+
+    func perform(_ intent: HostActionIntent) async -> HostActionServiceResult {
+        if !didBlockFirstCall {
+            didBlockFirstCall = true
+            await gate.suspend()
+        }
+        return .acceptedUnverified
     }
 }
 
@@ -2559,6 +2611,11 @@ private actor ManualInputProducer: InputEventProducing {
 
     func emit(_ event: NormalizedInputEvent) async {
         await consumer?.consume(event)
+    }
+
+    func enqueue(_ event: NormalizedInputEvent) -> Task<Void, Never> {
+        let consumer = self.consumer
+        return Task { await consumer?.consume(event) }
     }
 
     func disconnect(reason: String) async {

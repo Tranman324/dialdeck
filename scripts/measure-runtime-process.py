@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Sample DialDeck process CPU time and resident memory for a fixed 300s window."""
+"""Sample verified DialDeck process CPU time and RSS for a fixed 300s window."""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import csv
 import math
 import os
@@ -12,10 +13,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 
 WINDOW_SECONDS = 300
 SAMPLE_INTERVAL_SECONDS = 1
+DIALDECK_PROCESS_IDENTITY = "DialDeck.app/Contents/MacOS/DialDeck"
+_proc_pidpath: Callable[..., int] | None = None
+_libproc: ctypes.CDLL | None = None
 
 
 def parse_cpu_seconds(value: str) -> float:
@@ -35,7 +40,40 @@ def parse_cpu_seconds(value: str) -> float:
     return days * 86_400 + int(hours) * 3_600 + int(minutes) * 60 + float(seconds)
 
 
+def process_executable_path(pid: int) -> str:
+    """Return the executable path for validation only; callers must not persist it."""
+    global _libproc, _proc_pidpath
+    if sys.platform != "darwin":
+        raise RuntimeError("Process identity verification requires macOS libproc")
+    try:
+        if _proc_pidpath is None:
+            _libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+            function = _libproc.proc_pidpath
+            function.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+            function.restype = ctypes.c_int
+            _proc_pidpath = function
+        buffer = ctypes.create_string_buffer(4096)
+        result = _proc_pidpath(pid, buffer, len(buffer))
+    except (AttributeError, OSError) as error:
+        raise RuntimeError("DialDeck process identity could not be verified") from error
+    if result <= 0:
+        raise RuntimeError("DialDeck process identity could not be verified")
+    return os.fsdecode(buffer.value)
+
+
+def verify_dialdeck_process(pid: int, path_reader: Callable[[int], str] | None = None) -> str:
+    reader = path_reader or process_executable_path
+    try:
+        executable_path = Path(reader(pid))
+    except (OSError, RuntimeError, ValueError) as error:
+        raise RuntimeError("DialDeck process identity could not be verified") from error
+    if tuple(executable_path.parts[-4:]) != ("DialDeck.app", "Contents", "MacOS", "DialDeck"):
+        raise RuntimeError("Selected process is not the DialDeck.app executable")
+    return DIALDECK_PROCESS_IDENTITY
+
+
 def read_process_sample(pid: int) -> tuple[float, int]:
+    identity_before = verify_dialdeck_process(pid)
     result = subprocess.run(
         ["/bin/ps", "-p", str(pid), "-o", "cputime=", "-o", "rss="],
         check=False,
@@ -47,7 +85,53 @@ def read_process_sample(pid: int) -> tuple[float, int]:
     fields = result.stdout.split()
     if len(fields) != 2:
         raise RuntimeError("The process sampler returned an unexpected counter format")
-    return parse_cpu_seconds(fields[0]), int(fields[1])
+    cpu_seconds, rss_kib = parse_cpu_seconds(fields[0]), int(fields[1])
+    identity_after = verify_dialdeck_process(pid)
+    if identity_after != identity_before:
+        raise RuntimeError("The selected process identity changed during sampling")
+    return cpu_seconds, rss_kib
+
+
+def collect_samples(
+    pid: int,
+    *,
+    window_seconds: float = WINDOW_SECONDS,
+    sample_interval_seconds: float = SAMPLE_INTERVAL_SECONDS,
+    read_sample: Callable[[int], tuple[float, int]] = read_process_sample,
+    monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[tuple[float, float, int]]:
+    if window_seconds <= 0 or sample_interval_seconds <= 0:
+        raise ValueError("Sampling window and interval must be positive")
+    window_ns = math.ceil(window_seconds * 1_000_000_000)
+    interval_ns = max(1, math.ceil(sample_interval_seconds * 1_000_000_000))
+
+    first_cpu, first_rss = read_sample(pid)
+    first_observed_ns = monotonic_ns()
+    samples = [(0.0, first_cpu, first_rss)]
+    interval_count = math.ceil(window_ns / interval_ns)
+
+    for index in range(1, interval_count + 1):
+        target_ns = first_observed_ns + min(index * interval_ns, window_ns)
+        while True:
+            remaining_ns = target_ns - monotonic_ns()
+            if remaining_ns <= 0:
+                break
+            sleep(remaining_ns / 1_000_000_000)
+        cpu_seconds, rss_kib = read_sample(pid)
+        observed_ns = monotonic_ns()
+        elapsed_seconds = (observed_ns - first_observed_ns) / 1_000_000_000
+        samples.append((elapsed_seconds, cpu_seconds, rss_kib))
+
+    if samples[-1][0] < window_seconds:
+        raise RuntimeError("Observed process-counter samples did not span the required window")
+    return samples
+
+
+def validate_candidate_sha(value: str) -> str:
+    if len(value) != 40 or any(char not in "0123456789abcdefABCDEF" for char in value):
+        raise argparse.ArgumentTypeError("must be a concrete 40-character hexadecimal commit SHA")
+    return value.lower()
 
 
 def percentile(values: list[int], fraction: float) -> int:
@@ -55,14 +139,20 @@ def percentile(values: list[int], fraction: float) -> int:
     return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
 
 
+def cpu_counter_threshold_result(scenario: str, one_core_percent: float) -> str:
+    if scenario not in ("idle-connected", "idle-disconnected"):
+        return "NOT_APPLICABLE"
+    return "COUNTER_ONLY_PASS" if one_core_percent < 1.0 else "COUNTER_ONLY_FAIL"
+
+
 def run() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Sample one supplied DialDeck PID for exactly five minutes. "
+            "Sample a verified DialDeck.app PID for at least five minutes. "
             "Warm up the app and prepare the requested scenario before starting."
         )
     )
-    parser.add_argument("--pid", type=int, required=True, help="PID of the DialDeck.app process")
+    parser.add_argument("--pid", type=int, required=True, help="PID of DialDeck.app's executable")
     parser.add_argument(
         "--scenario",
         choices=("idle-connected", "idle-disconnected", "focus-cycles", "reconnect-cycles"),
@@ -73,16 +163,12 @@ def run() -> int:
         type=int,
         help="Operator-reported completed cycles for focus-cycles or reconnect-cycles scenarios",
     )
-    parser.add_argument("--candidate-sha", default="unknown", help="40-character candidate commit SHA")
+    parser.add_argument("--candidate-sha", type=validate_candidate_sha, required=True, help="Concrete 40-character candidate commit SHA")
     parser.add_argument("--output", type=Path, required=True, help="New CSV evidence file path")
     args = parser.parse_args()
 
     if args.pid <= 1:
         parser.error("--pid must identify a user process")
-    if args.candidate_sha != "unknown" and (
-        len(args.candidate_sha) != 40 or any(char not in "0123456789abcdefABCDEF" for char in args.candidate_sha)
-    ):
-        parser.error("--candidate-sha must be a 40-character hexadecimal SHA or omitted")
     is_cycle_scenario = args.scenario in ("focus-cycles", "reconnect-cycles")
     if is_cycle_scenario and (args.cycle_count is None or args.cycle_count < 1):
         parser.error("--cycle-count >= 1 is required for focus-cycles and reconnect-cycles")
@@ -90,47 +176,44 @@ def run() -> int:
         parser.error("--cycle-count is only valid for focus-cycles and reconnect-cycles")
     if args.output.exists():
         parser.error("--output must not already exist")
+    try:
+        process_identity = verify_dialdeck_process(args.pid)
+    except RuntimeError as error:
+        parser.error(str(error))
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     logical_cpu_count = os.cpu_count() or 1
-    samples: list[tuple[float, float, int]] = []
-    start_ns = time.monotonic_ns()
     try:
-        for index in range(WINDOW_SECONDS + 1):
-            target_ns = start_ns + index * SAMPLE_INTERVAL_SECONDS * 1_000_000_000
-            remaining_ns = target_ns - time.monotonic_ns()
-            if remaining_ns > 0:
-                time.sleep(remaining_ns / 1_000_000_000)
-            observed_ns = time.monotonic_ns()
-            cpu_seconds, rss_kib = read_process_sample(args.pid)
-            elapsed_seconds = (observed_ns - start_ns) / 1_000_000_000
-            samples.append((elapsed_seconds, cpu_seconds, rss_kib))
+        samples = collect_samples(args.pid)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"Measurement stopped: {error}", file=sys.stderr)
         return 2
 
     elapsed = samples[-1][0] - samples[0][0]
+    if elapsed < WINDOW_SECONDS:
+        print("Measurement stopped: observed counter samples did not span 300 seconds", file=sys.stderr)
+        return 2
     cpu_delta = max(0.0, samples[-1][1] - samples[0][1])
-    one_core_percent = 100.0 * cpu_delta / elapsed if elapsed > 0 else 0.0
+    one_core_percent = 100.0 * cpu_delta / elapsed
     host_percent = one_core_percent / logical_cpu_count
     rss_values = [sample[2] for sample in samples]
     settled_rss = int(statistics.median(rss_values[-30:]))
-    idle_scenario = args.scenario in ("idle-connected", "idle-disconnected")
-    threshold_result = "PASS" if idle_scenario and one_core_percent < 1.0 else (
-        "FAIL" if idle_scenario else "NOT_APPLICABLE"
-    )
+    threshold_result = cpu_counter_threshold_result(args.scenario, one_core_percent)
 
     with args.output.open("x", newline="", encoding="utf-8") as evidence:
         evidence.write(f"# candidate_sha={args.candidate_sha}\n")
+        evidence.write(f"# process_identity={process_identity} (verified; full executable path not retained)\n")
         evidence.write(f"# scenario={args.scenario}\n")
         if args.cycle_count is not None:
             evidence.write(f"# operator_reported_completed_cycles={args.cycle_count}\n")
         evidence.write(f"# required_window_seconds={WINDOW_SECONDS}\n")
+        evidence.write(f"# observed_counter_sample_span_seconds={elapsed:.3f}\n")
         evidence.write(f"# logical_cpu_count={logical_cpu_count}\n")
-        evidence.write("# cpu_counter=per-process ps cputime delta over monotonic elapsed wall time\n")
+        evidence.write("# cpu_counter=verified DialDeck PID ps cputime delta over monotonic first-to-last sample span\n")
         evidence.write("# denominator=100 percent is one logical CPU; host-normalized divides by logical CPU count\n")
         evidence.write("# rss_counter=ps resident set size in KiB, converted to MiB in samples\n")
-        evidence.write("# warmup=completed by operator before sampling; app and target app details are not recorded\n")
+        evidence.write("# warmup=completed by operator before sampling; target-app details are not recorded\n")
+        evidence.write("# application_acceptance=NOT_ASSESSED (process counters do not establish user-visible behavior)\n")
         writer = csv.writer(evidence)
         writer.writerow(("elapsed_seconds", "cumulative_cpu_seconds", "cpu_percent_one_core", "cpu_percent_host_normalized", "rss_mib"))
         previous_elapsed, previous_cpu, _ = samples[0]
@@ -156,15 +239,17 @@ def run() -> int:
         evidence.write("# energy=not captured by this process sampler; see docs/runtime-measurement.md\n")
 
     print(f"Scenario: {args.scenario}")
-    print(f"Window: {elapsed:.3f}s (required 300s)")
+    print(f"Process identity: {process_identity} (verified; full path omitted)")
+    print(f"Window: {elapsed:.3f}s (required >=300s)")
     print(f"CPU average: {one_core_percent:.4f}% of one logical CPU; {host_percent:.4f}% host-normalized")
-    print(f"CPU threshold (<1% of one logical CPU): {threshold_result}")
+    print(f"CPU counter threshold (<1% of one logical CPU): {threshold_result}")
+    print("Application acceptance: NOT_ASSESSED")
     print(
         "RSS MiB: "
         f"baseline={rss_values[0] / 1024:.2f}, peak={max(rss_values) / 1024:.2f}, "
         f"settled-median-last-30={settled_rss / 1024:.2f}"
     )
-    print(f"Evidence: {args.output}")
+    print(f"Evidence file name: {args.output.name}")
     return 0
 
 
